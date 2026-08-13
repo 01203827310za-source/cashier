@@ -1,0 +1,10 @@
+# التبعيات
+node_modules/
+
+# قاعدة البيانات المحلية
+data/
+
+# ملفات مؤقتة
+*.tmp
+.DS_Store
+npm-debug.log
