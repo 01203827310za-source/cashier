@@ -2912,9 +2912,14 @@ function deletePurchase(id){
    ============================================================ */
 function setOrderQ(v){ orderQ = v; renderViewInPlace(); }
 function setOrderStatus(v){ orderStatusFilter = v; renderViewInPlace(); }
+function orderCodDone(o){
+  // collectionStatus (النظام الموحّد) هو المصدر الأساسي؛ لو الأوردر لسه ما لمسوش النظام
+  // الجديد أبدًا (collectionStatus فاضي)، نرجع للعلم القديم collected كبديل آمن.
+  return o.collectionStatus === "collected" || (o.collectionStatus == null && !!o.collected);
+}
 function orderRowHTML(o){
   var sm = statusMeta(o.status);
-  var pay = o.paymentStatus==="cod" ? (o.collected ? '<span class="badge badge-green">COD ✓ '+esc(userById(o.collectedBy)?userById(o.collectedBy).name:"")+'</span>' : '<span class="badge badge-amber">COD معلق</span>') : (o.paymentStatus==="credit" ? '<span class="badge badge-red">آجل</span>' : '<span class="badge badge-blue">مدفوع</span>');
+  var pay = o.paymentStatus==="cod" ? (orderCodDone(o) ? '<span class="badge badge-green">COD ✓ '+esc(userById(o.collectedBy)?userById(o.collectedBy).name:"")+'</span>' : '<span class="badge badge-amber">COD معلق</span>') : (o.paymentStatus==="credit" ? '<span class="badge badge-red">آجل</span>' : '<span class="badge badge-blue">مدفوع</span>');
   var dest = o.governorate+(o.city?" - "+o.city:"");
   return '<tr>'+
     '<td class="bold">'+esc(o.number)+'<div class="small muted" dir="ltr">'+esc(o.awb||"")+'</div></td>'+
@@ -2926,7 +2931,7 @@ function orderRowHTML(o){
     '<td>'+pay+'</td>'+
     '<td><span class="badge '+sm.color+'">'+sm.label+'</span></td>'+
     '<td><div class="row" style="gap:2px;">'+
-      (o.paymentStatus==="cod" && !o.collected ? '<button class="icon-btn" title="تسجيل تحصيل COD" onclick="collectCod(\''+o.id+'\')">'+icon("banknote",16)+'</button>' : '')+
+      (o.paymentStatus==="cod" && orderRemaining(o)>0 ? '<button class="icon-btn" title="تسجيل تحصيل" onclick="openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+'</button>' : '')+
       '<button class="icon-btn primary" onclick="viewOrder(\''+o.id+'\')">'+icon("eye",16)+'</button>'+
       (ORDER_FLOW.indexOf(o.status)!==-1 && flowNext(o.status) ? '<button class="icon-btn primary" title="تقدم للحالة التالية" onclick="advanceOrder(\''+o.id+'\')">'+icon("check",16)+'</button>' : '')+
       '<button class="icon-btn" title="طباعة" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+'</button>'+
@@ -3162,42 +3167,13 @@ function cancelOrder(id){
     api("POST", "/api/order/" + id + "/cancel").then(function(r){ afterSync(r); renderViewInPlace(); toast("تم إلغاء الأوردر"); }).catch(function(e){ toast(e.message, "err"); });
   }, true);
 }
-function collectCod(id){
-  var o = DB.orders.find(function(x){ return x.id===id; });
-  if(!o) return;
-  if(o.collected){
-    confirmBox("إلغاء تسجيل تحصيل "+o.number+" ("+fmt(o.collectedAmount||o.total)+")؟", function(){
-      api("POST", "/api/order/" + o.id + "/cod", { collected: false }).then(function(r){ afterSync(r); renderViewInPlace(); toast("تم إلغاء التحصيل"); });
-    }, true);
-    return;
-  }
-  openModal(
-    '<div class="modal-head"><h3>'+icon("banknote",18)+' تسجيل تحصيل COD — '+esc(o.number)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
-    '<div class="modal-body">'+
-      '<div class="tot-row mb8"><span>قيمة الأوردر</span><b>'+fmt(o.total)+' '+esc(DB.settings.currency)+'</b></div>'+
-      '<div class="tot-row mb16"><span>العميل</span><b>'+esc(o.customerName)+'</b></div>'+
-      '<div class="field"><label>المبلغ المستلم *</label><input id="cod-amount" type="number" min="0" step="0.5" value="'+o.total+'"></div>'+
-      '<div class="field"><label>من استلم الفلوس</label><select id="cod-by">'+userOptionsHTML(currentUser()?currentUser().id:"", false)+'</select></div>'+
-      '<div class="field"><label>ملاحظات</label><input id="cod-note" placeholder="اختياري"></div>'+
-    '</div>'+
-    '<div class="modal-foot">'+
-      '<button class="btn btn-green" onclick="saveCodCollection(\''+o.id+'\')">'+icon("check",16)+' تأكيد الاستلام</button>'+
-      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
-    '</div>'
-  );
-}
-function saveCodCollection(id){
-  var o = DB.orders.find(function(x){ return x.id===id; });
-  if(!o) return;
-  var amount = num($("#cod-amount").value);
-  if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
-  var byId = $("#cod-by") ? $("#cod-by").value : (currentUser()?currentUser().id:null);
-  var by = userById(byId) || currentUser();
-  api("POST", "/api/order/" + id + "/cod", { collected: true, byId: byId, amount: amount }).then(function(r){
-    afterSync(r);
-    closeModal(); renderViewInPlace(); toast("تم تسجيل التحصيل باسم "+by.name);
-  }).catch(function(e){ toast(e.message, "err"); });
-}
+/* ملاحظة: تسجيل تحصيل COD كان له نظام مالي منفصل قديمًا (collectCod/saveCodCollection
+   → POST /api/order/:id/cod). تم توحيده بالكامل: كل التحصيلات (بما فيها COD) تمر الآن
+   عبر openOrderCollection/saveOrderCollection → POST /api/order/:id/collection، واللي
+   بيتطلب اختيار الحساب (مؤمن/عبدو) وينشئ OrderCollection + PartnerTransaction دائمًا.
+   نقطة /api/order/:id/cod القديمة نفسها اتحصّنت في السيرفر (partner إلزامي + نفس آلية
+   الدفتر) لأي استدعاء مباشر قديم، لكن الواجهة ما بقتش تستخدمها. السجلات التاريخية
+   (collected/collectedBy/collectedAt/collectedAmount) لسه بتتعرض عادي في تفاصيل الأوردر. */
 function openOrderCollection(id){
   var o = DB.orders.find(function(x){ return x.id===id; });
   if(!o) return;
@@ -3283,7 +3259,7 @@ function viewOrder(id){
     var opt = [it.size, it.color].filter(Boolean).join(" / ");
     return '<tr><td class="bold">'+esc(it.name)+(opt?'<div class="small muted">'+esc(opt)+'</div>':'')+'</td><td>'+it.qty+'</td><td>'+fmt(it.price)+'</td><td class="bold">'+fmt(it.qty*it.price)+'</td></tr>';
   }).join("");
-  var pay = o.paymentStatus==="cod" ? ("COD"+(o.collected?(" — تم التحصيل ("+fmt(o.collectedAmount||o.total)+") بواسطة "+(userById(o.collectedBy)?userById(o.collectedBy).name:"—")):" — لم يُحصَّل")) : (o.paymentStatus==="credit" ? "آجل (دين)" : "مدفوع مسبقاً");
+  var pay = o.paymentStatus==="cod" ? ("COD"+(orderCodDone(o)?(" — تم التحصيل ("+fmt(o.collectedAmount||o.total)+") بواسطة "+(userById(o.collectedBy)?userById(o.collectedBy).name:"—")):" — لم يُحصَّل بالكامل")) : (o.paymentStatus==="credit" ? "آجل (دين)" : "مدفوع مسبقاً");
   var addr = [o.governorate,o.city,o.street].filter(Boolean).join("، ");
   openModal(
     '<div class="modal-head"><h3>'+icon("send",18)+' أوردر '+esc(o.number)+' <span class="badge '+sm.color+'">'+sm.label+'</span></h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
@@ -3307,7 +3283,6 @@ function viewOrder(id){
     '</div>'+
     '<div class="modal-foot" style="flex-wrap:wrap;">'+
       (flowNext(o.status) ? '<button class="btn btn-primary" onclick="advanceOrder(\''+o.id+'\')">'+icon("check",16)+' '+statusMeta(flowNext(o.status)).label+'</button>' : '')+
-      (o.paymentStatus==="cod" ? '<button class="btn btn-ghost" onclick="collectCod(\''+o.id+'\')">'+icon("cash",16)+' '+(o.collected?"إلغاء التحصيل":"تسجيل التحصيل COD")+'</button>' : '')+
       (orderRemaining(o)>0 ? '<button class="btn btn-ghost" onclick="closeModal();openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+' تسجيل تحصيل</button>' : '')+
       '<button class="btn btn-ghost" onclick="setShipment(\''+o.id+'\')">'+icon("truck",16)+' الشحنة</button>'+
       '<button class="btn btn-ghost" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+' طباعة</button>'+

@@ -151,6 +151,23 @@ async function restoreOrderStock(tx, orderId){
     await recomputeProductStock(tx, it.productId);
   }
 }
+/* عند إرجاع/إلغاء أوردر: نعكس كل عربون/تحصيل مسجّل عليه (ORDER_DEPOSIT و
+   ORDER_COLLECTION) حتى لا يفضل رصيد أي شريك فيه فلوس تخص أوردر ملغي/مرتجع.
+   deleteMany على سجلات محذوفة بالفعل = no-op، فالعملية آمنة للتكرار. */
+async function reverseOrderLedger(tx, orderId){
+  const collections = await tx.orderCollection.findMany({ where: { orderId } });
+  for(const c of collections){
+    await tx.partnerTransaction.deleteMany({ where: { referenceType: "orderCollection", referenceId: c.id } });
+  }
+}
+async function restoreOrderStockAndLedger(tx, orderId){
+  await restoreOrderStock(tx, orderId);
+  await reverseOrderLedger(tx, orderId);
+  // بعد عكس كل قيود العربون/التحصيل، الأوردر الملغي/المرتجع ما بقاش مديون
+  // بحاجة ولا معاه فلوس محصّلة — نصفّر أعمدة الحالة المالية الحقيقية (الأعمدة
+  // تسبق JSON data في مسار القراءة buildStateFromDB، فهي المصدر الفعلي المعروض).
+  await tx.order.update({ where: { id: orderId }, data: { collectedTotal: 0, remaining: 0, collectionStatus: null } });
+}
 
 /* ---------- الاسترجاع والاستبدال ---------- */
 // افتراضي "مسموح": أي كاشير عنده صلاحية بيع أصلاً، إلا لو المدير عطّلها له
@@ -418,6 +435,7 @@ const server = http.createServer(async function(req, res){
         }
         await recomputeProductStock(tx, it.productId);
       }
+      await deletePartnerLedgerFor(tx, "sale", id);
       await tx.sale.delete({ where: { id } });
       await tx.auditLog.create({ data: auditEntry(req, "إرجاع فاتورة", existing.number || "") });
     }, { timeout: 30000 });
@@ -617,23 +635,89 @@ const server = http.createServer(async function(req, res){
     }, function(o){ return { action: "تحديث شحنة", detail: o.number + (o.awb ? " — "+o.awb : "") }; });
     return;
   }
+  /* ---------- تحصيل COD (نظام قديم — تم توحيده مع OrderCollection/PartnerTransaction) ----------
+     "إلغاء تحصيل" (collected:false) يعكس فقط الدفعة المرتبطة بـcodCollectionId المسجّلة في
+     data — وليس أي دفعة/عربون آخر على نفس الأوردر. "تسجيل تحصيل" (الافتراضي) بيمر إجبارياً
+     عبر نفس منطق /collection: يتطلب partner، يُنشئ OrderCollection + PartnerTransaction،
+     ويحدّث collectedTotal/remaining/collectionStatus الحقيقية — بدل الحقول القديمة المنفصلة
+     المستخدمة فقط للعرض التاريخي الآن. */
   if(method === "POST" && /^\/api\/order\/[^/]+\/cod$/.test(url)){
     const id = url.split("/")[3];
     const b = await readBody(req);
-    let byUser = null;
-    if(b.collected !== false){
-      byUser = await prisma.user.findUnique({ where: { id: b.byId || user.id } });
-    }
-    await orderPatch(id, req, res, function(o){
-      if(b.collected === false){
-        o.collected = false; o.collectedBy = null; o.collectedAt = null; o.collectedAmount = null;
-      } else {
-        o.collected = true; o.collectedBy = b.byId || user.id; o.collectedAt = Date.now(); o.collectedAmount = b.amount;
+    const existingOrder = await prisma.order.findUnique({ where: { id } });
+    if(!existingOrder){ send(res, 404, {ok:false}); return; }
+
+    if(b.collected === false){
+      try{
+        await prisma.$transaction(async function(tx){
+          const fresh = await tx.order.findUnique({ where: { id } });
+          const merged = { ...(fresh.data||{}) };
+          const codCollectionId = merged.codCollectionId || null;
+          if(codCollectionId){
+            const coll = await tx.orderCollection.findUnique({ where: { id: codCollectionId } });
+            if(coll){
+              await tx.partnerTransaction.deleteMany({ where: { referenceType: "orderCollection", referenceId: codCollectionId } });
+              await tx.orderCollection.delete({ where: { id: codCollectionId } });
+              const newCollected = Math.max(0, (fresh.collectedTotal||0) - (coll.amount||0));
+              const total = fresh.total || 0;
+              const remaining = Math.max(0, total - newCollected);
+              const collectionStatus = remaining <= 0.004 ? "collected" : "pending";
+              await tx.order.update({ where: { id }, data: { collectedTotal: newCollected, remaining, collectionStatus } });
+            }
+          }
+          merged.collected = false; merged.collectedBy = null; merged.collectedAt = null; merged.collectedAmount = null; merged.codCollectionId = null;
+          await tx.order.update({ where: { id }, data: { data: merged } });
+          await tx.auditLog.create({ data: auditEntry(req, "إلغاء تحصيل COD", fresh.number || "") });
+        }, { timeout: 30000 });
+      }catch(err){
+        if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+        throw err;
       }
-    }, function(o){
-      if(b.collected === false) return { action: "إلغاء تحصيل COD", detail: o.number };
-      return { action: "تحصيل COD", detail: o.number + " — " + b.amount + " (" + (byUser?byUser.name:"") + ")" };
-    });
+      await db.trimAuditLog();
+      const state = await db.buildStateFromDB();
+      send(res, 200, { ok:true, db: state });
+      return;
+    }
+
+    const amount = Number(b.amount);
+    const partner = b.partner === "abdo" ? "abdo" : (b.partner === "moamen" ? "moamen" : null);
+    if(!(amount > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
+    if(!partner){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
+    const byUser = await prisma.user.findUnique({ where: { id: b.byId || user.id } });
+
+    const collId = uid();
+    try{
+      await prisma.$transaction(async function(tx){
+        const fresh = await tx.order.findUnique({ where: { id } });
+        const total = fresh.total || 0;
+        const currentCollected = fresh.collectedTotal || 0;
+        const newCollected = currentCollected + amount;
+        if(newCollected > total + 0.004) throw httpError(400, "إجمالي المحصَّل ("+newCollected+") يتجاوز إجمالي الفاتورة ("+total+")");
+        const remaining = Math.max(0, total - newCollected);
+        const collectionStatus = remaining <= 0.004 ? "collected" : "pending";
+
+        const merged = { ...(fresh.data||{}) };
+        merged.collected = true; merged.collectedBy = b.byId || user.id; merged.collectedAt = Date.now(); merged.collectedAmount = amount; merged.codCollectionId = collId;
+
+        await tx.order.update({ where: { id }, data: { collectedTotal: newCollected, remaining, collectionStatus, data: merged } });
+
+        const payDate = Date.now();
+        await tx.orderCollection.create({ data: {
+          id: collId, orderId: id, kind: "collection", amount: amount, date: new Date(payDate),
+          paymentMethod: "cod", partner: partner, notes: "تحصيل COD", userId: user.id, data: {}
+        }});
+        await upsertPartnerLedger(tx, { partner, type: "ORDER_COLLECTION", direction: "in", amount,
+          referenceType: "orderCollection", referenceId: collId, date: payDate, userId: user.id, notes: "تحصيل COD — " + (fresh.number||"") });
+
+        await tx.auditLog.create({ data: auditEntry(req, "تحصيل COD", (fresh.number||"") + " — " + amount + " (" + (byUser?byUser.name:"") + ")") });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
   if(method === "POST" && /^\/api\/order\/[^/]+\/collection$/.test(url)){
@@ -680,12 +764,12 @@ const server = http.createServer(async function(req, res){
   }
   if(method === "POST" && /^\/api\/order\/[^/]+\/return$/.test(url)){
     const id = url.split("/")[3];
-    await orderPatch(id, req, res, function(o){ o.status = "returned"; }, function(o){ return { action: "مرتجع أوردر", detail: o.number }; }, restoreOrderStock);
+    await orderPatch(id, req, res, function(o){ o.status = "returned"; }, function(o){ return { action: "مرتجع أوردر", detail: o.number }; }, restoreOrderStockAndLedger);
     return;
   }
   if(method === "POST" && /^\/api\/order\/[^/]+\/cancel$/.test(url)){
     const id = url.split("/")[3];
-    await orderPatch(id, req, res, function(o){ o.status = "cancelled"; }, function(o){ return { action: "إلغاء أوردر", detail: o.number }; }, restoreOrderStock);
+    await orderPatch(id, req, res, function(o){ o.status = "cancelled"; }, function(o){ return { action: "إلغاء أوردر", detail: o.number }; }, restoreOrderStockAndLedger);
     return;
   }
 
@@ -838,11 +922,14 @@ const server = http.createServer(async function(req, res){
         if(existing.type === "financial" && b.total !== undefined){
           const total = Number(b.total);
           if(!(total > 0)) throw httpError(400, "إجمالي الفاتورة يجب أن يكون أكبر من صفر");
-          const paid = Math.min(existing.paid||0, total);
+          const alreadyPaid = existing.paid || 0;
+          if(total < alreadyPaid - 0.004){
+            throw httpError(400, "لا يمكن تقليل إجمالي الفاتورة إلى ("+total+") لأن المبلغ المدفوع بالفعل ("+alreadyPaid+") أكبر من ذلك — قم بتصحيح/استرداد الدفعة أولاً قبل تقليل الإجمالي");
+          }
           data.total = total;
-          data.paid = paid;
-          data.remaining = total - paid;
-          data.paymentStatus = (paid >= total) ? "paid" : (paid > 0 ? "partial" : "unpaid");
+          data.paid = alreadyPaid;
+          data.remaining = total - alreadyPaid;
+          data.paymentStatus = (alreadyPaid >= total) ? "paid" : (alreadyPaid > 0 ? "partial" : "unpaid");
         }
 
         if(data.number !== existing.number){
