@@ -634,7 +634,7 @@ function afterSync(r){
   if(r && r.db){ DB = r.db; }
 }
 function migrateDB(){
-  ["users","categories","products","customers","sales","suppliers","purchases","purchasePayments","audit","shippingCompanies","shipPrices","orders","orderCollections","expenseCategories","expenses","otherIncome","paymentsIn","paymentsOut","cashClosings","transfers","partnerTransactions"].forEach(function(k){ if(!DB[k]) DB[k] = []; });
+  ["users","categories","products","customers","sales","suppliers","purchases","purchasePayments","audit","shippingCompanies","shipPrices","orders","orderCollections","orderExchanges","expenseCategories","expenses","otherIncome","paymentsIn","paymentsOut","cashClosings","transfers","partnerTransactions"].forEach(function(k){ if(!DB[k]) DB[k] = []; });
   migrateProducts();
   DB.customers.forEach(function(c){ if(!c.addresses) c.addresses = []; });
 }
@@ -669,7 +669,13 @@ var auditFrom = "";
 var auditTo = "";
 var orderQ = "";
 var orderStatusFilter = "all";
+var orderCompanyFilter = "all";
+var orderPayFilter = "all";
+var orderFrom = "";
+var orderTo = "";
+var ordersTab = "list";
 var orderDraft = null;
+var orderExchangeDraft = null;
 var custAddrDraft = [];
 var expQ = "";
 var expCat = "الكل";
@@ -693,11 +699,13 @@ var ORDER_STATUSES = [
   {id:"preparing", label:"قيد التجهيز", color:"badge-purple"},
   {id:"ready", label:"جاهز للشحن", color:"badge-amber"},
   {id:"shipped", label:"تم الشحن", color:"badge-cyan"},
+  {id:"transit", label:"في الطريق", color:"badge-cyan"},
   {id:"delivered", label:"تم التسليم", color:"badge-green"},
   {id:"returned", label:"مرتجع", color:"badge-red"},
+  {id:"exchanged", label:"مستبدل", color:"badge-purple"},
   {id:"cancelled", label:"ملغي", color:"badge-gray"}
 ];
-var ORDER_FLOW = ["new","preparing","ready","shipped","delivered"];
+var ORDER_FLOW = ["new","preparing","ready","shipped","transit","delivered"];
 function statusMeta(id){
   for(var i=0;i<ORDER_STATUSES.length;i++){ if(ORDER_STATUSES[i].id===id) return ORDER_STATUSES[i]; }
   return ORDER_STATUSES[0];
@@ -2912,6 +2920,11 @@ function deletePurchase(id){
    ============================================================ */
 function setOrderQ(v){ orderQ = v; renderViewInPlace(); }
 function setOrderStatus(v){ orderStatusFilter = v; renderViewInPlace(); }
+function setOrderCompanyFilter(v){ orderCompanyFilter = v; renderViewInPlace(); }
+function setOrderPayFilter(v){ orderPayFilter = v; renderViewInPlace(); }
+function setOrderFrom(v){ orderFrom = v; renderViewInPlace(); }
+function setOrderTo(v){ orderTo = v; renderViewInPlace(); }
+function setOrdersTab(t){ ordersTab = t; renderViewInPlace(); }
 function orderCodDone(o){
   // collectionStatus (النظام الموحّد) هو المصدر الأساسي؛ لو الأوردر لسه ما لمسوش النظام
   // الجديد أبدًا (collectionStatus فاضي)، نرجع للعلم القديم collected كبديل آمن.
@@ -2919,54 +2932,146 @@ function orderCodDone(o){
 }
 function orderRowHTML(o){
   var sm = statusMeta(o.status);
-  var pay = o.paymentStatus==="cod" ? (orderCodDone(o) ? '<span class="badge badge-green">COD ✓ '+esc(userById(o.collectedBy)?userById(o.collectedBy).name:"")+'</span>' : '<span class="badge badge-amber">COD معلق</span>') : (o.paymentStatus==="credit" ? '<span class="badge badge-red">آجل</span>' : '<span class="badge badge-blue">مدفوع</span>');
-  var dest = o.governorate+(o.city?" - "+o.city:"");
+  var comp = o.companyId ? DB.shippingCompanies.find(function(c){ return c.id===o.companyId; }) : null;
+  var payMethodBadge = o.paymentStatus==="cod" ? (orderCodDone(o) ? '<span class="badge badge-green">COD ✓</span>' : '<span class="badge badge-amber">COD معلق</span>') : (o.paymentStatus==="credit" ? '<span class="badge badge-red">آجل</span>' : '<span class="badge badge-blue">مدفوع مسبقاً</span>');
+  var payStatus = orderPaymentStatus(o);
+  var collected = orderCollectedTotal(o), remaining = orderRemaining(o);
+  var canCollect = remaining>0 && ["cancelled","returned"].indexOf(o.status)===-1;
   return '<tr>'+
-    '<td class="bold">'+esc(o.number)+'<div class="small muted" dir="ltr">'+esc(o.awb||"")+'</div></td>'+
+    '<td class="bold">'+esc(o.number)+(o.awb?'<div class="small muted" dir="ltr">'+esc(o.awb)+'</div>':'')+'</td>'+
     '<td>'+dateStr(o.date)+'</td>'+
-    '<td>'+esc(o.customerName)+'<div class="small muted" dir="ltr">'+esc(o.phone||"")+'</div></td>'+
-    '<td>'+esc(dest)+'</td>'+
-    '<td>'+o.items.reduce(function(a,it){ return a+it.qty; },0)+'</td>'+
+    '<td>'+esc(o.customerName)+'</td>'+
+    '<td dir="ltr" class="small">'+esc(o.phone||"—")+'</td>'+
+    '<td>'+esc(o.governorate||"")+(o.city?' - '+esc(o.city):'')+'</td>'+
+    '<td>'+(comp?esc(comp.name):'<span class="muted">—</span>')+'</td>'+
     '<td class="bold">'+fmt(o.total)+'</td>'+
-    '<td>'+pay+'</td>'+
+    '<td>'+fmt(o.deposit||0)+'</td>'+
+    '<td>'+fmt(collected)+'</td>'+
+    '<td class="bold" style="color:'+(remaining>0?'var(--red)':'var(--green)')+';">'+fmt(remaining)+'</td>'+
+    '<td>'+payMethodBadge+'</td>'+
     '<td><span class="badge '+sm.color+'">'+sm.label+'</span></td>'+
+    '<td><span class="badge '+payStatus.cls+'">'+payStatus.label+'</span></td>'+
     '<td><div class="row" style="gap:2px;">'+
-      (o.paymentStatus==="cod" && orderRemaining(o)>0 ? '<button class="icon-btn" title="تسجيل تحصيل" onclick="openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+'</button>' : '')+
+      (canCollect ? '<button class="icon-btn" title="تسجيل تحصيل" onclick="openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+'</button>' : '')+
       '<button class="icon-btn primary" onclick="viewOrder(\''+o.id+'\')">'+icon("eye",16)+'</button>'+
       (ORDER_FLOW.indexOf(o.status)!==-1 && flowNext(o.status) ? '<button class="icon-btn primary" title="تقدم للحالة التالية" onclick="advanceOrder(\''+o.id+'\')">'+icon("check",16)+'</button>' : '')+
       '<button class="icon-btn" title="طباعة" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+'</button>'+
     '</div></td>'+
   '</tr>';
 }
+function shippingCompanyStats(){
+  var buckets = DB.shippingCompanies.map(function(c){ return {id:c.id, name:c.name, orders:[]}; });
+  buckets.push({id:null, name:"بدون شركة شحن", orders:[]});
+  DB.orders.forEach(function(o){
+    var b = buckets.find(function(x){ return x.id===(o.companyId||null); }) || buckets[buckets.length-1];
+    b.orders.push(o);
+  });
+  return buckets.filter(function(b){ return b.orders.length>0; }).map(function(b){
+    var orders = b.orders;
+    return {
+      id: b.id, name: b.name, count: orders.length,
+      delivered: orders.filter(function(o){ return o.status==="delivered"; }).length,
+      returned: orders.filter(function(o){ return o.status==="returned"; }).length,
+      exchanged: orders.filter(function(o){ return o.status==="exchanged"; }).length,
+      cancelled: orders.filter(function(o){ return o.status==="cancelled"; }).length,
+      pending: orders.filter(function(o){ return ["new","preparing","ready","shipped","transit"].indexOf(o.status)!==-1; }).length,
+      totalValue: orders.reduce(function(a,o){ return a+(o.total||0); },0),
+      totalDeposit: orders.reduce(function(a,o){ return a+(o.deposit||0); },0),
+      totalCollected: orders.reduce(function(a,o){ return a+orderCollectedTotal(o); },0),
+      totalRemaining: orders.reduce(function(a,o){ return a+orderRemaining(o); },0),
+      returnedValue: orders.filter(function(o){ return o.status==="returned"; }).reduce(function(a,o){ return a+(o.total||0); },0)
+    };
+  }).sort(function(a,b){ return b.count-a.count; });
+}
+function viewShippingReconciliation(){
+  var stats = shippingCompanyStats();
+  var rows = stats.map(function(s){
+    return '<tr><td class="bold">'+esc(s.name)+'</td><td>'+s.count+'</td>'+
+      '<td>'+s.delivered+'</td><td>'+s.returned+'</td><td>'+s.exchanged+'</td><td>'+s.cancelled+'</td><td>'+s.pending+'</td>'+
+      '<td class="bold">'+fmt(s.totalValue)+'</td><td>'+fmt(s.totalDeposit)+'</td><td>'+fmt(s.totalCollected)+'</td>'+
+      '<td style="color:'+(s.totalRemaining>0?'var(--red)':'var(--green)')+';">'+fmt(s.totalRemaining)+'</td>'+
+      '<td style="color:var(--red);">'+fmt(s.returnedValue)+'</td></tr>';
+  }).join("");
+  return '<div class="card"><h3>'+icon("truck",17)+' مطابقة شركات الشحن</h3>'+
+    '<div class="table-wrap"><table><thead><tr><th>الشركة</th><th>عدد الأوردرات</th><th>تم التسليم</th><th>مرتجع</th><th>مستبدل</th><th>ملغي</th><th>معلّق</th>'+
+    '<th>إجمالي القيمة</th><th>إجمالي العربون</th><th>إجمالي المحصل</th><th>إجمالي المتبقي</th><th>قيمة المرتجع</th></tr></thead>'+
+    '<tbody>'+(rows || '<tr><td colspan="12" class="muted" style="text-align:center;padding:24px;">لا توجد بيانات</td></tr>')+'</tbody></table></div>'+
+    '<p class="muted small mt8">💡 استخدم فلتر "شركة الشحن" في تبويب قائمة الأوردرات للتعمق في أوردرات شركة بعينها.</p></div>';
+}
 function viewOrders(){
   var q = orderQ.toLowerCase();
+  var from = orderFrom ? new Date(orderFrom+"T00:00:00").getTime() : 0;
+  var to = orderTo ? new Date(orderTo+"T23:59:59").getTime() : Date.now()+86400000;
   var list = DB.orders.slice().sort(function(a,b){ return b.date-a.date; }).filter(function(o){
-    var hay = (o.number+" "+o.customerName+" "+(o.phone||"")+" "+(o.awb||"")).toLowerCase();
+    var comp = o.companyId ? DB.shippingCompanies.find(function(c){ return c.id===o.companyId; }) : null;
+    var hay = (o.number+" "+o.customerName+" "+(o.phone||"")+" "+(o.awb||"")+" "+(o.governorate||"")+" "+(comp?comp.name:"")).toLowerCase();
     var okQ = !q || hay.indexOf(q)!==-1;
     var okS = orderStatusFilter==="all" || o.status===orderStatusFilter;
-    return okQ && okS;
+    var okC = orderCompanyFilter==="all" || (orderCompanyFilter==="none" ? !o.companyId : o.companyId===orderCompanyFilter);
+    var okP = orderPayFilter==="all" || orderPaymentStatus(o).key===orderPayFilter;
+    var okD = o.date>=from && o.date<=to;
+    return okQ && okS && okC && okP && okD;
   });
-  var tKey = todayKey();
-  var todayOrders = DB.orders.filter(function(o){ return dayKey(o.date)===tKey; });
-  var active = DB.orders.filter(function(o){ return ["new","preparing","ready","shipped"].indexOf(o.status)!==-1; });
-  var codPending = DB.orders.filter(function(o){ return o.paymentStatus==="cod" && !o.collected && ["new","preparing","ready","shipped","delivered"].indexOf(o.status)!==-1; });
+
+  var totalOrders = list.length;
+  var totalValue = list.reduce(function(a,o){ return a+(o.total||0); },0);
+  var totalDeposit = list.reduce(function(a,o){ return a+(o.deposit||0); },0);
+  var totalCollected = list.reduce(function(a,o){ return a+orderCollectedTotal(o); },0);
+  var totalRemaining = list.reduce(function(a,o){ return a+orderRemaining(o); },0);
+  var shippingCount = list.filter(function(o){ return ["shipped","transit"].indexOf(o.status)!==-1; }).length;
+  var deliveredCount = list.filter(function(o){ return o.status==="delivered"; }).length;
+  var returnedCount = list.filter(function(o){ return o.status==="returned"; }).length;
+  var exchangedCount = list.filter(function(o){ return o.status==="exchanged"; }).length;
+  var codPendingCount = list.filter(function(o){ return o.paymentStatus==="cod" && ["cancelled","returned"].indexOf(o.status)===-1 && !orderCodDone(o); }).length;
+
   var statusOpts = '<option value="all">كل الحالات</option>' + ORDER_STATUSES.map(function(s){ return '<option value="'+s.id+'" '+(orderStatusFilter===s.id?"selected":"")+'>'+s.label+'</option>'; }).join("");
-  return '<div class="filterbar">'+
-    '<input placeholder="ابحث برقم الأوردر / العميل / التليفون / AWB..." style="flex:1;min-width:200px;padding:9px 12px;border:1px solid var(--border);border-radius:10px;" value="'+esc(orderQ)+'" oninput="setOrderQ(this.value)">'+
+  var companyOpts = '<option value="all">كل شركات الشحن</option>' + DB.shippingCompanies.map(function(c){ return '<option value="'+c.id+'" '+(orderCompanyFilter===c.id?"selected":"")+'>'+esc(c.name)+'</option>'; }).join("") + '<option value="none" '+(orderCompanyFilter==="none"?"selected":"")+'>بدون شركة شحن</option>';
+  var payOpts = '<option value="all">كل حالات الدفع</option>'+
+    '<option value="paid" '+(orderPayFilter==="paid"?"selected":"")+'>مدفوعة</option>'+
+    '<option value="partial" '+(orderPayFilter==="partial"?"selected":"")+'>مدفوعة جزئياً</option>'+
+    '<option value="unpaid" '+(orderPayFilter==="unpaid"?"selected":"")+'>غير مدفوعة</option>';
+  var hasFilters = orderQ || orderStatusFilter!=="all" || orderCompanyFilter!=="all" || orderPayFilter!=="all" || orderFrom || orderTo;
+
+  var filterBar = '<div class="filterbar">'+
+    '<input placeholder="ابحث برقم الأوردر / العميل / التليفون / شركة الشحن / المحافظة / AWB..." style="flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--border);border-radius:10px;" value="'+esc(orderQ)+'" oninput="setOrderQ(this.value)">'+
     '<select onchange="setOrderStatus(this.value)">'+statusOpts+'</select>'+
+    '<select onchange="setOrderCompanyFilter(this.value)">'+companyOpts+'</select>'+
+    '<select onchange="setOrderPayFilter(this.value)">'+payOpts+'</select>'+
+    '<input type="date" value="'+orderFrom+'" onchange="setOrderFrom(this.value)">'+
+    '<input type="date" value="'+orderTo+'" onchange="setOrderTo(this.value)">'+
+    (hasFilters ? '<button class="btn btn-ghost" onclick="orderQ=\'\';orderStatusFilter=\'all\';orderCompanyFilter=\'all\';orderPayFilter=\'all\';orderFrom=\'\';orderTo=\'\';renderViewInPlace()">مسح الفلترة</button>' : '')+
     '<button class="btn btn-primary" onclick="openOrderForm()">'+icon("plus",16)+' أوردر جديد</button>'+
     '<button class="btn btn-ghost" onclick="printDailySheet()">'+icon("print",16)+' شيت الشحن</button>'+
     (isAdmin() ? '<button class="btn btn-ghost" onclick="openShipCompanies()">'+icon("truck",16)+' شركات الشحن</button>'+
     '<button class="btn btn-ghost" onclick="openShipPrices()">'+icon("cash",16)+' أسعار الشحن</button>' : '')+
-  '</div>'+
-  '<div class="stats">'+
-    statCard("send","var(--primary)", fmtInt(todayOrders.length), "أوردرات اليوم")+
-    statCard("box","#0ea5e9", fmtInt(active.length), "أوردرات نشطة")+
-    statCard("cash","var(--amber)", fmtInt(codPending.length), "COD لم يُحصَّل")+
-  '</div>'+
-  '<div class="card"><h3>'+icon("send",17)+' الأوردرات ('+list.length+')</h3>'+
-    '<div class="table-wrap"><table><thead><tr><th>الأوردر</th><th>التاريخ</th><th>العميل</th><th>الوجهة</th><th>القطع</th><th>الإجمالي</th><th>الدفع</th><th>الحالة</th><th></th></tr></thead>'+
-    '<tbody>'+(list.length ? list.map(orderRowHTML).join("") : '<tr><td colspan="9" class="muted" style="text-align:center;padding:30px;">لا توجد أوردرات</td></tr>')+'</tbody></table></div></div>';
+  '</div>';
+
+  var stats = '<div class="stats">'+
+    statCard("send","var(--primary)", fmtInt(totalOrders), "إجمالي الأوردرات")+
+    statCard("cash","var(--green)", fmt(totalValue), "قيمة الأوردرات")+
+    statCard("wallet","#8b5cf6", fmt(totalDeposit), "إجمالي العربون المحصل")+
+    statCard("banknote","var(--green)", fmt(totalCollected), "إجمالي المبالغ المحصلة")+
+    statCard("scale","var(--red)", fmt(totalRemaining), "إجمالي المتبقي")+
+    statCard("truck","#0ea5e9", fmtInt(shippingCount), "أوردرات قيد الشحن")+
+    statCard("check","var(--green)", fmtInt(deliveredCount), "أوردرات تم التسليم")+
+    statCard("return","var(--red)", fmtInt(returnedCount), "أوردرات مرتجعة")+
+    statCard("return","#8b5cf6", fmtInt(exchangedCount), "أوردرات مستبدلة")+
+    statCard("cash","var(--amber)", fmtInt(codPendingCount), "COD غير محصل")+
+  '</div>';
+
+  var tabs = '<div class="row mb16" style="gap:8px;">'+
+    '<button class="btn '+(ordersTab==="list"?"btn-primary":"btn-ghost")+'" onclick="setOrdersTab(\'list\')">قائمة الأوردرات</button>'+
+    '<button class="btn '+(ordersTab==="companies"?"btn-primary":"btn-ghost")+'" onclick="setOrdersTab(\'companies\')">'+icon("truck",15)+' مطابقة شركات الشحن</button>'+
+  '</div>';
+
+  var listSection = '<div class="card"><h3>'+icon("send",17)+' الأوردرات ('+list.length+')</h3>'+
+    '<div class="table-wrap"><table><thead><tr>'+
+      '<th>الأوردر</th><th>التاريخ</th><th>العميل</th><th>الهاتف</th><th>المحافظة/المدينة</th><th>شركة الشحن</th>'+
+      '<th>قيمة الأوردر</th><th>العربون</th><th>المحصل</th><th>المتبقي</th><th>طريقة الدفع</th><th>الحالة</th><th>حالة الدفع</th><th></th>'+
+    '</tr></thead>'+
+    '<tbody>'+(list.length ? list.map(orderRowHTML).join("") : '<tr><td colspan="14" class="muted" style="text-align:center;padding:30px;">لا توجد أوردرات مطابقة</td></tr>')+'</tbody></table></div></div>';
+
+  return filterBar + stats + tabs + (ordersTab==="companies" ? viewShippingReconciliation() : listSection);
 }
 function blankOrderLine(){
   var p = DB.products[0];
@@ -3230,16 +3335,29 @@ function saveShipment(id){
     closeModal(); renderViewInPlace(); toast("تم تحديث بيانات الشحن");
   }).catch(function(e){ toast(e.message, "err"); });
 }
+/* أوردر قديم من قبل نظام التحصيل الموحّد (collectedTotal فاضي)؟ نرجع لعلم collected
+   القديم كبديل آمن بدل ما نخترع صفر مش دقيق — نفس مبدأ "لا تخترع، لا تفقد بيانات". */
+function orderCollectedTotal(o){
+  if(o.collectedTotal!=null) return o.collectedTotal;
+  return o.collected ? (o.collectedAmount!=null?o.collectedAmount:(o.total||0)) : 0;
+}
 function orderRemaining(o){
-  return o.remaining != null ? o.remaining : Math.max(0, (o.total||0) - (o.collectedTotal||0));
+  return o.remaining != null ? o.remaining : Math.max(0, (o.total||0) - orderCollectedTotal(o));
+}
+function orderPaymentStatus(o){
+  var collected = orderCollectedTotal(o), total = o.total||0;
+  if(collected <= 0) return {label:"غير مدفوعة", cls:"badge-red", key:"unpaid"};
+  if(collected >= total - 0.004) return {label:"مدفوعة", cls:"badge-green", key:"paid"};
+  return {label:"مدفوعة جزئياً", cls:"badge-amber", key:"partial"};
 }
 function orderFinancialBlockHTML(o){
   if(o.deposit==null && o.collectionStatus==null) return "";
-  var collectedTotal = o.collectedTotal||0;
+  var collectedTotal = orderCollectedTotal(o);
   var remaining = orderRemaining(o);
   var laterCollected = Math.max(0, collectedTotal - (o.deposit||0));
   var statusLabel = (o.collectionStatus==="collected") ? "تم التحصيل" : "لم يتم التحصيل";
   var statusColor = (o.collectionStatus==="collected") ? "var(--green)" : "var(--amber)";
+  var payStatus = orderPaymentStatus(o);
   return '<div class="card mt16" style="background:#f8fafc;padding:12px;">'+
       '<h3 style="margin-bottom:8px;">'+icon("wallet",17)+' الملخص المالي</h3>'+
       '<div class="tot-row"><span>إجمالي الفاتورة</span><b>'+fmt(o.total)+'</b></div>'+
@@ -3247,8 +3365,51 @@ function orderFinancialBlockHTML(o){
       '<div class="tot-row"><span>المحصَّل لاحقاً</span><b>'+fmt(laterCollected)+'</b></div>'+
       '<div class="tot-row"><span>إجمالي المحصَّل</span><b>'+fmt(collectedTotal)+'</b></div>'+
       '<div class="tot-row"><span>المتبقي</span><b style="color:'+(remaining>0?'var(--red)':'var(--green)')+';">'+fmt(remaining)+'</b></div>'+
+      '<div class="tot-row"><span>حالة الدفع</span><span class="badge '+payStatus.cls+'">'+payStatus.label+'</span></div>'+
       '<div class="tot-row"><span>حالة التحصيل</span><b style="color:'+statusColor+';">'+statusLabel+'</b></div>'+
     '</div>';
+}
+function orderCollectionKindLabel(c){
+  if(c.kind==="deposit") return "عربون";
+  if(c.paymentMethod==="cod") return "تحصيل COD";
+  return "تحصيل لاحق";
+}
+function orderCollectionHistoryHTML(o){
+  var list = (DB.orderCollections||[]).filter(function(c){ return c.orderId===o.id; }).sort(function(a,b){ return a.date-b.date; });
+  if(!list.length) return "";
+  var rows = list.map(function(c){
+    return '<tr><td>'+dateStr(c.date)+' '+timeStr(c.date)+'</td>'+
+      '<td>'+esc(orderCollectionKindLabel(c))+'</td>'+
+      '<td class="bold">'+fmt(c.amount)+'</td>'+
+      '<td>'+(c.partner?esc(partnerLabel(c.partner)):'<span class="muted">غير محدد</span>')+'</td>'+
+      '<td>'+payMethodLabel(c.paymentMethod)+'</td>'+
+      '<td>'+esc(userById(c.userId)?userById(c.userId).name:"—")+'</td>'+
+      '<td class="muted">'+esc(c.notes||"—")+'</td></tr>';
+  }).join("");
+  return '<div class="card mt16"><h3>'+icon("banknote",17)+' التحصيلات</h3>'+
+    '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>النوع</th><th>المبلغ</th><th>الحساب</th><th>طريقة الدفع</th><th>بواسطة</th><th>ملاحظات</th></tr></thead>'+
+    '<tbody>'+rows+'</tbody></table></div></div>';
+}
+function orderExchangeHistoryHTML(o){
+  var list = (DB.orderExchanges||[]).filter(function(e){ return e.orderId===o.id; }).sort(function(a,b){ return a.date-b.date; });
+  if(!list.length) return "";
+  var blocks = list.map(function(ex){
+    var retRows = (ex.items||[]).map(function(it){
+      var repProd = it.replacementProductId ? DB.products.find(function(p){ return p.id===it.replacementProductId; }) : null;
+      return '<tr><td>'+esc([it.size,it.color].filter(Boolean).join(" / ")||"—")+'</td><td>'+it.qty+'</td><td>'+fmt(it.unitPrice)+'</td>'+
+        '<td>'+(repProd? (esc(repProd.name)+' × '+it.replacementQty+' — '+fmt(it.replacementPrice)) : '<span class="muted">بدون بديل</span>')+'</td></tr>';
+    }).join("");
+    return '<div class="mb8">'+
+      '<div class="tot-row"><span>تاريخ الاستبدال</span><b>'+dateStr(ex.date)+'</b></div>'+
+      '<div class="table-wrap"><table><thead><tr><th>الصنف المرتجع</th><th>الكمية</th><th>السعر</th><th>البديل</th></tr></thead><tbody>'+retRows+'</tbody></table></div>'+
+      '<div class="tot-row"><span>قيمة المرتجع</span><span>'+fmt(ex.returnedTotal)+'</span></div>'+
+      '<div class="tot-row"><span>قيمة البديل</span><span>'+fmt(ex.replacementTotal)+'</span></div>'+
+      '<div class="tot-row grand"><span>الفرق المالي</span><span style="color:'+((ex.difference||0)>=0?'var(--green)':'var(--red)')+';">'+((ex.difference||0)>=0?'+':'')+fmt(ex.difference)+'</span></div>'+
+      (ex.refundAmount>0 ? '<div class="tot-row"><span>استرداد للعميل</span><span>'+fmt(ex.refundAmount)+' — '+esc(partnerLabel(ex.refundPartner))+'</span></div>' : '')+
+      (ex.reason ? '<div class="tot-row"><span>السبب</span><span>'+esc(ex.reason)+'</span></div>' : '')+
+    '</div>';
+  }).join('<hr style="margin:10px 0;border:none;border-top:1px solid var(--border);">');
+  return '<div class="card mt16"><h3>'+icon("return",17)+' سجل الاستبدال</h3>'+blocks+'</div>';
 }
 function viewOrder(id){
   var o = DB.orders.find(function(x){ return x.id===id; });
@@ -3261,6 +3422,7 @@ function viewOrder(id){
   }).join("");
   var pay = o.paymentStatus==="cod" ? ("COD"+(orderCodDone(o)?(" — تم التحصيل ("+fmt(o.collectedAmount||o.total)+") بواسطة "+(userById(o.collectedBy)?userById(o.collectedBy).name:"—")):" — لم يُحصَّل بالكامل")) : (o.paymentStatus==="credit" ? "آجل (دين)" : "مدفوع مسبقاً");
   var addr = [o.governorate,o.city,o.street].filter(Boolean).join("، ");
+  var canExchange = ["new","preparing","ready","shipped","transit","delivered"].indexOf(o.status)!==-1;
   openModal(
     '<div class="modal-head"><h3>'+icon("send",18)+' أوردر '+esc(o.number)+' <span class="badge '+sm.color+'">'+sm.label+'</span></h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
     '<div class="modal-body">'+
@@ -3268,8 +3430,10 @@ function viewOrder(id){
         '<div class="tot-row"><span>العميل</span><b>'+esc(o.customerName)+'</b></div>'+
         '<div class="tot-row"><span>التليفون</span><b dir="ltr">'+esc(o.phone||"—")+'</b></div>'+
         '<div class="tot-row"><span>العنوان</span><b>'+esc(addr||"—")+'</b></div>'+
-        '<div class="tot-row"><span>الشحن</span><b>'+(comp?esc(comp.name):"—")+' '+(o.awb?'<span dir="ltr">'+esc(o.awb)+'</span>':'')+'</b></div>'+
-        '<div class="tot-row"><span>الدفع</span><b>'+pay+'</b></div>'+
+        '<div class="tot-row"><span>شركة الشحن</span><b>'+(comp?esc(comp.name):"—")+' '+(o.awb?'<span dir="ltr">'+esc(o.awb)+'</span>':'')+'</b></div>'+
+        (o.shippedDate ? '<div class="tot-row"><span>تاريخ الشحن</span><b>'+dateStr(o.shippedDate)+'</b></div>' : '')+
+        (o.deliveredDate ? '<div class="tot-row"><span>تاريخ التسليم</span><b>'+dateStr(o.deliveredDate)+'</b></div>' : '')+
+        '<div class="tot-row"><span>طريقة الدفع</span><b>'+pay+'</b></div>'+
         (o.note ? '<div class="tot-row"><span>ملاحظات</span><b>'+esc(o.note)+'</b></div>' : '')+
       '</div>'+
       '<div class="table-wrap mb16"><table><thead><tr><th>الصنف</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
@@ -3280,16 +3444,173 @@ function viewOrder(id){
         '<div class="tot-row grand"><span>الإجمالي</span><span>'+fmt(o.total)+' '+esc(DB.settings.currency)+'</span></div>'+
       '</div>'+
       orderFinancialBlockHTML(o)+
+      orderCollectionHistoryHTML(o)+
+      orderExchangeHistoryHTML(o)+
     '</div>'+
     '<div class="modal-foot" style="flex-wrap:wrap;">'+
       (flowNext(o.status) ? '<button class="btn btn-primary" onclick="advanceOrder(\''+o.id+'\')">'+icon("check",16)+' '+statusMeta(flowNext(o.status)).label+'</button>' : '')+
-      (orderRemaining(o)>0 ? '<button class="btn btn-ghost" onclick="closeModal();openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+' تسجيل تحصيل</button>' : '')+
+      (orderRemaining(o)>0 && ["cancelled","returned"].indexOf(o.status)===-1 ? '<button class="btn btn-ghost" onclick="closeModal();openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+' تسجيل تحصيل</button>' : '')+
       '<button class="btn btn-ghost" onclick="setShipment(\''+o.id+'\')">'+icon("truck",16)+' الشحنة</button>'+
       '<button class="btn btn-ghost" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+' طباعة</button>'+
-      (["new","preparing","ready","shipped","delivered"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="returnOrder(\''+o.id+'\')">'+icon("return",16)+' مرتجع</button>' : '')+
+      (canExchange ? '<button class="btn btn-ghost" onclick="closeModal();openOrderExchange(\''+o.id+'\')">'+icon("return",16)+' استبدال</button>' : '')+
+      (["new","preparing","ready","shipped","transit","delivered"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="returnOrder(\''+o.id+'\')">'+icon("return",16)+' مرتجع</button>' : '')+
       (["new","preparing","ready"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="cancelOrder(\''+o.id+'\')">إلغاء</button>' : '')+
     '</div>'
   , true);
+}
+
+/* ---------- استبدال أوردر (مرآة لنموذج الاسترجاع والاستبدال الخاص بنقطة البيع) ---------- */
+function orderItemExchangedQty(orderItemId){
+  var used = 0;
+  (DB.orderExchanges||[]).forEach(function(e){ (e.items||[]).forEach(function(it){ if(it.orderItemId===orderItemId) used += (it.qty||0); }); });
+  return used;
+}
+function openOrderExchange(id){
+  var o = DB.orders.find(function(x){ return x.id===id; });
+  if(!o) return;
+  orderExchangeDraft = {
+    orderId: id, reason: "", refundPartner: "",
+    lines: o.items.map(function(it){
+      var already = orderItemExchangedQty(it.id);
+      var remaining = Math.max(0, (it.qty||0) - already);
+      return {
+        orderItemId: it.id, name: it.name, size: it.size, color: it.color, price: it.price,
+        orderedQty: it.qty||0, remaining: remaining,
+        checked: false, qty: remaining>0?1:0,
+        replacementProductId: "", replacementVariantId: "", replacementQty: 1
+      };
+    })
+  };
+  openModal(orderExchangeModalHTML(), true);
+}
+function refreshOrderExchangeModal(){ var m = $("#modal"); if(m) m.innerHTML = orderExchangeModalHTML(); }
+function onOrderExchLineCheck(i, checked){
+  var l = orderExchangeDraft.lines[i]; l.checked = checked;
+  if(checked && l.qty<1) l.qty = 1;
+  refreshOrderExchangeModal();
+}
+function onOrderExchLineQty(i, v){
+  var l = orderExchangeDraft.lines[i];
+  l.qty = Math.max(1, Math.min(l.remaining, parseInt(v,10)||1));
+  refreshOrderExchangeModal();
+}
+function onOrderExchReplacementProduct(i, pid){
+  var l = orderExchangeDraft.lines[i];
+  l.replacementProductId = pid;
+  var p = DB.products.find(function(x){ return x.id===pid; });
+  l.replacementVariantId = (p && p.variants && p.variants.length) ? p.variants[0].id : "";
+  refreshOrderExchangeModal();
+}
+function onOrderExchReplacementVariant(i, vid){ orderExchangeDraft.lines[i].replacementVariantId = vid; refreshOrderExchangeModal(); }
+function onOrderExchReplacementQty(i, v){ orderExchangeDraft.lines[i].replacementQty = Math.max(1, parseInt(v,10)||1); refreshOrderExchangeModal(); }
+function computeOrderExchangeTotals(){
+  var returnedTotal = 0, replacementTotal = 0;
+  orderExchangeDraft.lines.forEach(function(l){
+    if(!l.checked || l.qty<=0) return;
+    returnedTotal += l.price * l.qty;
+    if(l.replacementVariantId){
+      var p = DB.products.find(function(x){ return x.id===l.replacementProductId; });
+      replacementTotal += (p?p.price:0) * (l.replacementQty||0);
+    }
+  });
+  return { returnedTotal: returnedTotal, replacementTotal: replacementTotal, difference: replacementTotal - returnedTotal };
+}
+function orderExchLineHTML(l, i){
+  var prodOpts = '<option value="">— اختر منتج —</option>' + DB.products.map(function(p){ return '<option value="'+p.id+'" '+(l.replacementProductId===p.id?"selected":"")+'>'+esc(p.name)+(p.modelCode?' — '+esc(p.modelCode):'')+'</option>'; }).join("");
+  var repProd = DB.products.find(function(p){ return p.id===l.replacementProductId; });
+  var varOpts = '<option value="">—</option>' + ((repProd&&repProd.variants)?repProd.variants:[]).map(function(v){ return '<option value="'+v.id+'" '+(l.replacementVariantId===v.id?"selected":"")+'>'+esc(variantLabel(v))+' ('+v.stock+')</option>'; }).join("");
+  var repHTML = '<td><div class="row" style="gap:4px;flex-wrap:wrap;">'+
+    '<select onchange="onOrderExchReplacementProduct('+i+',this.value)" style="min-width:130px;">'+prodOpts+'</select>'+
+    '<select onchange="onOrderExchReplacementVariant('+i+',this.value)" style="min-width:110px;">'+varOpts+'</select>'+
+    '<input type="number" min="1" value="'+l.replacementQty+'" style="width:60px;" oninput="onOrderExchReplacementQty('+i+',this.value)">'+
+  '</div></td>';
+  return '<tr>'+
+    '<td><input type="checkbox" '+(l.checked?"checked":"")+' '+(l.remaining<=0?"disabled":"")+' onchange="onOrderExchLineCheck('+i+',this.checked)"></td>'+
+    '<td>'+esc(l.name||"")+'</td>'+
+    '<td>'+esc([l.size,l.color].filter(Boolean).join(" / ")||"—")+'</td>'+
+    '<td>'+fmt(l.price)+'</td>'+
+    '<td>'+l.orderedQty+'</td>'+
+    '<td>'+l.remaining+'</td>'+
+    '<td><input type="number" min="1" max="'+l.remaining+'" value="'+l.qty+'" style="width:60px;" '+(l.remaining<=0?"disabled":"")+' oninput="onOrderExchLineQty('+i+',this.value)"></td>'+
+    repHTML+
+  '</tr>';
+}
+function orderExchangeModalHTML(){
+  var o = DB.orders.find(function(x){ return x.id===orderExchangeDraft.orderId; });
+  var rows = orderExchangeDraft.lines.map(orderExchLineHTML).join("");
+  var table = '<div class="table-wrap"><table><thead><tr><th></th><th>الصنف</th><th>المقاس/اللون</th><th>سعر الوحدة</th><th>الكمية بالأوردر</th><th>المتاح للاستبدال</th><th>الكمية المرتجعة</th><th>المنتج البديل</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+
+  var totals = computeOrderExchangeTotals();
+  var diffLine;
+  if(totals.difference > 0.004) diffLine = '<div class="ttl bold" style="color:var(--red);"><span>المبلغ المطلوب تحصيله لاحقاً</span><span>'+fmt(totals.difference)+' '+esc(DB.settings.currency)+'</span></div>';
+  else if(totals.difference < -0.004) diffLine = '<div class="ttl bold" style="color:var(--green);"><span>الفرق لصالح العميل</span><span>'+fmt(-totals.difference)+' '+esc(DB.settings.currency)+'</span></div>';
+  else diffLine = '<div class="ttl bold"><span>الفرق</span><span>لا يوجد فرق</span></div>';
+
+  var summary = '<div class="card mt16" style="background:#f8fafc;padding:12px;">'+
+    '<div class="ttl"><span>قيمة الأصناف المرتجعة</span><span class="bold">'+fmt(totals.returnedTotal)+' '+esc(DB.settings.currency)+'</span></div>'+
+    '<div class="ttl"><span>قيمة الأصناف البديلة</span><span class="bold">'+fmt(totals.replacementTotal)+' '+esc(DB.settings.currency)+'</span></div>'+
+    diffLine+
+  '</div>';
+
+  var collected = orderCollectedTotal(o);
+  var newTotal = Math.max(0, (o.total||0) + totals.difference);
+  var refundAmount = Math.max(0, collected - newTotal);
+  var refundBlock = "";
+  if(refundAmount > 0.004){
+    refundBlock = '<div class="warn-banner" style="margin:10px 0;">⚠️ هذا الاستبدال يترتب عليه استرداد '+fmt(refundAmount)+' '+esc(DB.settings.currency)+' للعميل من رصيد أحد الشريكين — اختر الحساب.</div>'+
+      '<div class="field"><label>الحساب الذي سيتحمّل الاسترداد (مؤمن/عبدو) *</label>'+partnerSelectHTML("oex-refund-partner", orderExchangeDraft.refundPartner).replace('<select ','<select onchange="orderExchangeDraft.refundPartner=this.value" ')+'</div>';
+  }
+
+  var body = '<div class="modal-body">'+
+    '<div class="row" style="gap:16px;flex-wrap:wrap;margin-bottom:10px;">'+
+      '<div><span class="muted small">الأوردر</span><div class="bold">'+esc(o.number)+'</div></div>'+
+      '<div><span class="muted small">العميل</span><div class="bold">'+esc(o.customerName)+'</div></div>'+
+      '<div><span class="muted small">إجمالي الأوردر الحالي</span><div class="bold">'+fmt(o.total)+'</div></div>'+
+    '</div>'+
+    table+
+    '<div class="field full mt16"><label>سبب الاستبدال (اختياري)</label><input id="oex-reason" value="'+esc(orderExchangeDraft.reason||"")+'" onchange="orderExchangeDraft.reason=this.value"></div>'+
+    summary+refundBlock+
+  '</div>';
+  var foot = '<div class="modal-foot">'+
+    '<button class="btn btn-green" onclick="confirmOrderExchange()">'+icon("check",16)+' تأكيد الاستبدال</button>'+
+    '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+  '</div>';
+  return '<div class="modal-head"><h3>'+icon("return",18)+' استبدال — '+esc(o.number)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>' + body + foot;
+}
+async function confirmOrderExchange(){
+  var o = DB.orders.find(function(x){ return x.id===orderExchangeDraft.orderId; });
+  if(!o) return;
+  var checkedLines = orderExchangeDraft.lines.filter(function(l){ return l.checked && l.qty>0; });
+  if(!checkedLines.length){ toast("اختر صنفاً واحداً على الأقل للاستبدال","err"); return; }
+  if(checkedLines.some(function(l){ return !l.replacementVariantId; })){
+    toast("اختر المنتج البديل (بالمقاس/اللون) لكل صنف مرتجع","err"); return;
+  }
+
+  var totals = computeOrderExchangeTotals();
+  var newTotal = Math.max(0, (o.total||0) + totals.difference);
+  var collected = orderCollectedTotal(o);
+  var refundAmount = Math.max(0, collected - newTotal);
+  if(refundAmount > 0.004 && !orderExchangeDraft.refundPartner){
+    toast("اختر الحساب (مؤمن/عبدو) اللي هيتحمّل الاسترداد","err"); return;
+  }
+
+  var payload = {
+    reason: orderExchangeDraft.reason||"",
+    refundPartner: refundAmount>0.004 ? orderExchangeDraft.refundPartner : null,
+    items: checkedLines.map(function(l){
+      var repProd = DB.products.find(function(p){ return p.id===l.replacementProductId; });
+      return {
+        orderItemId: l.orderItemId, qty: l.qty,
+        replacementVariantId: l.replacementVariantId || null,
+        replacementQty: l.replacementVariantId ? l.replacementQty : null,
+        replacementPrice: repProd ? repProd.price : null
+      };
+    })
+  };
+  api("POST", "/api/order/" + o.id + "/exchange", payload).then(function(r){
+    afterSync(r);
+    closeModal(); renderViewInPlace(); toast("تم تنفيذ الاستبدال بنجاح");
+  }).catch(function(e){ toast(e.message, "err"); });
 }
 function orderSlipHTML(o){
   var comp = o.companyId ? DB.shippingCompanies.find(function(c){ return c.id===o.companyId; }) : null;

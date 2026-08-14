@@ -773,6 +773,123 @@ const server = http.createServer(async function(req, res){
     return;
   }
 
+  /* ---------- استبدال أوردر (مرآة لمنطق /api/returns exchange، لكن للأوردرات) ---------- */
+  if(method === "POST" && /^\/api\/order\/[^/]+\/exchange$/.test(url)){
+    const id = url.split("/")[3];
+    const b = await readBody(req);
+    const reqItems = Array.isArray(b.items) ? b.items : [];
+    const reason = (b.reason||"").trim();
+    const refundPartner = b.refundPartner === "abdo" ? "abdo" : (b.refundPartner === "moamen" ? "moamen" : null);
+
+    if(!reqItems.length){ send(res, 400, {ok:false, error:"اختر صنفاً واحداً على الأقل للاستبدال"}); return; }
+
+    const order = await prisma.order.findUnique({ where: { id }, include: { items: true } });
+    if(!order){ send(res, 404, {ok:false, error:"الطلب غير موجود"}); return; }
+    const exchangeableStatuses = ["new","preparing","ready","shipped","transit","delivered"];
+    if(exchangeableStatuses.indexOf(order.status) === -1){ send(res, 400, {ok:false, error:"لا يمكن استبدال هذا الأوردر في حالته الحالية"}); return; }
+
+    const exchangeId = uid();
+    try{
+      await prisma.$transaction(async function(tx){
+        let returnedTotal = 0, replacementTotal = 0;
+        const lineData = [];
+        const requestedSoFar = {}; // orderItemId -> qty already staged within this same request
+
+        for(const reqIt of reqItems){
+          const qty = parseInt(reqIt.qty, 10) || 0;
+          if(qty <= 0) throw httpError(400, "الكمية المرتجعة يجب أن تكون أكبر من صفر");
+
+          const orderItem = order.items.find(function(oi){ return oi.id === reqIt.orderItemId; });
+          if(!orderItem) throw httpError(400, "صنف غير موجود في هذا الأوردر");
+
+          const agg = await tx.orderExchangeItem.aggregate({ where: { orderItemId: orderItem.id }, _sum: { qty: true } });
+          const alreadyExchanged = (agg._sum.qty || 0) + (requestedSoFar[orderItem.id] || 0);
+          const remainingQty = (orderItem.qty || 0) - alreadyExchanged;
+          if(qty > remainingQty) throw httpError(400, "الكمية المطلوب استبدالها ("+qty+") أكبر من المتاح ("+remainingQty+")");
+          requestedSoFar[orderItem.id] = (requestedSoFar[orderItem.id] || 0) + qty;
+
+          const unitPrice = orderItem.price || 0;
+          const lineTotal = unitPrice * qty;
+          returnedTotal += lineTotal;
+
+          const oiData = orderItem.data || {};
+          const lineRec = {
+            id: uid(), orderItemId: orderItem.id, productId: orderItem.productId||null, variantId: orderItem.variantId||null,
+            size: oiData.size||null, color: oiData.color||null, qty: qty, unitPrice: unitPrice, lineTotal: lineTotal,
+            replacementProductId: null, replacementVariantId: null, replacementQty: null, replacementPrice: null,
+            data: reqIt
+          };
+
+          if(orderItem.variantId) await adjustVariantStock(tx, orderItem.variantId, qty);
+          await recomputeProductStock(tx, orderItem.productId);
+
+          if(reqIt.replacementVariantId){
+            const repQty = parseInt(reqIt.replacementQty, 10) || 0;
+            if(repQty <= 0) throw httpError(400, "كمية المنتج البديل يجب أن تكون أكبر من صفر");
+            const repVariant = await tx.productVariant.findUnique({ where: { id: reqIt.replacementVariantId } });
+            if(!repVariant) throw httpError(400, "المتغير البديل غير موجود");
+            if((repVariant.stock||0) < repQty) throw httpError(400, "الكمية المتاحة من المنتج البديل غير كافية");
+            const repProduct = await tx.product.findUnique({ where: { id: repVariant.productId } });
+            const repPrice = (reqIt.replacementPrice != null) ? Number(reqIt.replacementPrice) : (repProduct ? (repProduct.price||0) : 0);
+            replacementTotal += repPrice * repQty;
+
+            lineRec.replacementProductId = repVariant.productId;
+            lineRec.replacementVariantId = repVariant.id;
+            lineRec.replacementQty = repQty;
+            lineRec.replacementPrice = repPrice;
+
+            await adjustVariantStock(tx, repVariant.id, -repQty);
+            await recomputeProductStock(tx, repVariant.productId);
+          }
+
+          lineData.push(lineRec);
+        }
+
+        const difference = replacementTotal - returnedTotal;
+        const fresh = await tx.order.findUnique({ where: { id } });
+        const currentTotal = fresh.total || 0;
+        const currentCollected = fresh.collectedTotal || 0;
+        const newTotal = Math.max(0, currentTotal + difference);
+        let newCollected = currentCollected;
+        let refundAmount = 0;
+
+        if(currentCollected > newTotal){
+          refundAmount = currentCollected - newTotal;
+          if(!refundPartner) throw httpError(400, "هذا الاستبدال يترتب عليه استرداد مبلغ للعميل — اختر الحساب (مؤمن/عبدو) اللي هيتحمّل الاسترداد");
+          newCollected = newTotal;
+        }
+        const remaining = Math.max(0, newTotal - newCollected);
+        const collectionStatus = remaining <= 0.004 ? "collected" : "pending";
+
+        await tx.order.update({ where: { id }, data: { total: newTotal, collectedTotal: newCollected, remaining, collectionStatus, status: "exchanged" } });
+
+        await tx.orderExchange.create({ data: {
+          id: exchangeId, orderId: id, userId: user.id, date: new Date(), reason: reason || null,
+          returnedTotal: returnedTotal, replacementTotal: replacementTotal, difference: difference,
+          refundPartner: refundAmount>0 ? refundPartner : null, refundAmount: refundAmount>0 ? refundAmount : null,
+          data: { reason },
+          items: { create: lineData }
+        }});
+
+        if(refundAmount > 0){
+          await upsertPartnerLedger(tx, { partner: refundPartner, type: "RETURN", direction: "out", amount: refundAmount,
+            referenceType: "orderExchange", referenceId: exchangeId, date: Date.now(), userId: user.id,
+            notes: "استرداد فرق استبدال — " + (fresh.number||"") });
+        }
+
+        await tx.auditLog.create({ data: auditEntry(req, "استبدال أوردر",
+          (fresh.number||"") + " — الفرق " + difference + (refundAmount>0?(" — استرداد "+refundAmount):"")) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+
   /* ---------- المشتريات ---------- */
   if(method === "POST" && url === "/api/purchase"){
     const b = await readBody(req);

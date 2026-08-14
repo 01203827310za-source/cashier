@@ -208,6 +208,7 @@ model Order {
   data     Json?
   items    OrderItem[]
   collections OrderCollection[]
+  exchanges   OrderExchange[]
 }
 
 // دفعة تحصيل على طلب — إما العربون عند إنشاء الطلب (kind:"deposit"، دائمًا عبدو)
@@ -225,6 +226,45 @@ model OrderCollection {
   userId        String?
   data          Json?
   order         Order @relation(fields: [orderId], references: [id])
+}
+
+// استبدال أوردر — نفس مبدأ SaleReturn/SaleReturnItem لكن للأوردرات (موديل منفصل
+// عمدًا، مش نفس SaleReturn، لأن الأوردرات نظام مستقل بالكامل بعربون/تحصيلات/شركاء
+// خاصة به لا علاقة لها بفواتير البيع). لا onDelete:Cascade على orderId (نفس مبدأ
+// SaleReturn → Sale / PurchasePayment → Purchase).
+model OrderExchange {
+  id               String   @id
+  orderId          String
+  userId           String?
+  date             DateTime?
+  reason           String?
+  returnedTotal    Float?
+  replacementTotal Float?
+  difference       Float?
+  refundPartner    String?  // "moamen" | "abdo" — مطلوب فقط لو الاستبدال نتج عنه استرداد فعلي
+  refundAmount     Float?
+  data             Json?
+  order            Order @relation(fields: [orderId], references: [id])
+  items            OrderExchangeItem[]
+}
+
+model OrderExchangeItem {
+  id                   String @id
+  orderExchangeId      String
+  orderItemId          String
+  productId            String?
+  variantId            String?
+  size                 String?
+  color                String?
+  qty                  Int?
+  unitPrice            Float?
+  lineTotal            Float?
+  replacementProductId String?
+  replacementVariantId String?
+  replacementQty       Int?
+  replacementPrice     Float?
+  data                 Json?
+  orderExchange        OrderExchange @relation(fields: [orderExchangeId], references: [id], onDelete: Cascade)
 }
 
 // سجل موحّد لكل حركة مالية مرتبطة بأحد الشريكين (مؤمن/عبدو) — المصدر الوحيد
