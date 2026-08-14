@@ -321,6 +321,9 @@ tbody tr:last-child td{border-bottom:none;}
 /* ---------- الاتصال بالسيرفر ---------- */
 var storageOK = true;
 var DB = null;
+// مصدر واحد لاسم المتجر يظهر على كل فاتورة/إيصال/شيت مطبوع — لا يعتمد على
+// إعدادات المتجر القابلة للتعديل حتى لا ينحرف عنها.
+var STORE_NAME = "29 STORE";
 async function api(method, p, body){
   var headers = { "Content-Type": "application/json" };
   var opts = { method: method, headers: headers, credentials: "include" };
@@ -1387,7 +1390,7 @@ function receiptHTML(sale){
       '<tr><td></td><td style="text-align:left;font-weight:700">'+fmt(it.price*it.qty)+'</td></tr>';
   }).join("");
   return '<div class="receipt">'+
-    '<div class="rc name">'+esc(DB.settings.storeName)+'</div>'+
+    '<div class="rc name">'+esc(STORE_NAME)+'</div>'+
     '<div class="rc">'+esc(DB.settings.receiptFooter)+'</div>'+
     '<div class="divider"></div>'+
     '<div class="rc">فاتورة رقم: '+esc(sale.number)+'</div>'+
@@ -2620,7 +2623,7 @@ function orderSlipHTML(o){
   var pay = o.paymentStatus==="cod" ? "COD — الدفع عند الاستلام" : (o.paymentStatus==="credit" ? "آجل (دين على العميل)" : "مدفوع مسبقاً");
   var addr = [o.governorate,o.city,o.street].filter(Boolean).join("، ");
   return '<div class="osheet">'+
-    '<h3>'+esc(DB.settings.storeName)+'</h3>'+
+    '<h3>'+esc(STORE_NAME)+'</h3>'+
     '<div class="rc">أوردر شحن: '+esc(o.number)+'</div>'+
     '<div class="rc">'+dateStr(o.date)+' — '+timeStr(o.date)+'</div>'+
     '<div style="border-top:1px dashed #000;margin:6px 0;"></div>'+
@@ -2674,7 +2677,7 @@ function printDailySheet(){
   }).join("");
   $("#print-area").innerHTML =
     '<div style="font-family:Segoe UI,Tahoma,sans-serif;padding:10px;direction:rtl;">'+
-    '<h2 style="text-align:center;margin:0;">'+esc(DB.settings.storeName)+' — شيت الشحن</h2>'+
+    '<h2 style="text-align:center;margin:0;">'+esc(STORE_NAME)+' — شيت الشحن</h2>'+
     '<p style="text-align:center;margin:4px 0 12px;">'+dateStr(Date.now())+' — عدد الأوردرات: '+list.length+'</p>'+
     '<table style="width:100%;border-collapse:collapse;font-size:12px;" border="1" cellpadding="5">'+
     '<thead><tr><th>#</th><th>العميل / التليفون</th><th>العنوان</th><th>القطع</th><th>الإجمالي</th><th>الدفع</th><th>AWB</th></tr></thead>'+
