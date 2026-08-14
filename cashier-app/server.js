@@ -57,7 +57,7 @@ function seed(){
   ];
   return {
     settings: {
-      storeName:"بوتيك الموضة", currency:"ج.م", taxRate:14, lowStockThreshold:5,
+      storeName:"29 STORE", currency:"ج.م", taxRate:14, lowStockThreshold:5,
       invoicePrefix:"INV", invoiceCounter:1001, purchaseCounter:1001, orderCounter:1001,
       receiptFooter:"شكراً لزيارتكم — نتمنى لكم يوماً سعيداً", phone:"01000000000"
     },
