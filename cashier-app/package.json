@@ -9,6 +9,7 @@
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate deploy",
     "db:seed": "node prisma/seed.js",
+    "db:backfill-model-code": "node prisma/backfill_model_code.js",
     "migrate:from-json": "node prisma/migrate_from_json.js"
   },
   "engines": {

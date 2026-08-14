@@ -36,7 +36,7 @@ function buildVariants(sizes, colors, total){
 /* ---------- بيانات البداية ---------- */
 function seed(){
   function P(name, category, price, cost, stock, sizes, colors, sku, emoji){
-    return { id: uid(), name, category, price, cost, stock, sizes, colors, sku, emoji, image: "", offer: null,
+    return { id: uid(), name, category, price, cost, stock, sizes, colors, sku, modelCode: sku, emoji, image: "", offer: null,
       variants: buildVariants(sizes, colors, stock) };
   }
   const products = [
@@ -156,14 +156,14 @@ async function restoreOrderStock(tx, orderId){
 const genericModels = {
   products: {
     addLabel: "إضافة منتج", editLabel: "تعديل منتج", delLabel: "حذف منتج",
-    logDetail: function(it){ return it.name; },
+    logDetail: function(it){ return it.name + (it.modelCode ? " (" + it.modelCode + ")" : ""); },
     findOne: function(id){ return prisma.product.findUnique({ where: { id } }); },
     async upsert(tx, it, isNew){
       const stock = stockOf(it);
       it.stock = stock;
       const data = {
         name: it.name, category: it.category || null, price: it.price != null ? it.price : null, cost: it.cost != null ? it.cost : null,
-        stock: stock, sku: it.sku || null, image: it.image || null, emoji: it.emoji || null, data: it
+        stock: stock, sku: it.sku || null, modelCode: it.modelCode, image: it.image || null, emoji: it.emoji || null, data: it
       };
       if(isNew){
         await tx.product.create({ data: { id: it.id, ...data,
@@ -535,10 +535,22 @@ const server = http.createServer(async function(req, res){
       const existing = it.id ? await cfg.findOne(it.id) : null;
       const isNew = !existing;
       it.id = it.id || uid();
-      await prisma.$transaction(async function(tx){
-        await cfg.upsert(tx, it, isNew);
-        await tx.auditLog.create({ data: auditEntry(req, isNew ? cfg.addLabel : cfg.editLabel, cfg.logDetail(it)) });
-      }, { timeout: 30000 });
+      if(g === "products"){
+        const modelCode = (it.modelCode||"").trim();
+        if(!modelCode){ send(res, 400, {ok:false, error:"كود الموديل مطلوب"}); return; }
+        it.modelCode = modelCode;
+        const dupe = await prisma.product.findUnique({ where: { modelCode } });
+        if(dupe && dupe.id !== it.id){ send(res, 400, {ok:false, error:"كود الموديل \""+modelCode+"\" مستخدم بالفعل لمنتج آخر"}); return; }
+      }
+      try{
+        await prisma.$transaction(async function(tx){
+          await cfg.upsert(tx, it, isNew);
+          await tx.auditLog.create({ data: auditEntry(req, isNew ? cfg.addLabel : cfg.editLabel, cfg.logDetail(it)) });
+        }, { timeout: 30000 });
+      }catch(err){
+        if(g === "products" && err && err.code === "P2002"){ send(res, 400, {ok:false, error:"كود الموديل مستخدم بالفعل لمنتج آخر"}); return; }
+        throw err;
+      }
       await db.trimAuditLog();
       const state = await db.buildStateFromDB();
       send(res, 200, { ok:true, db: state, item: it });

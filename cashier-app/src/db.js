@@ -3,6 +3,30 @@ const prisma = new PrismaClient();
 
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 
+/**
+ * Derives a model code for a product that doesn't already have one, preferring
+ * its existing SKU (if non-empty and not already claimed) and otherwise
+ * generating a clearly-marked fallback — never silently reusing another
+ * product's code. `usedCodesLower` is a Set of already-claimed codes
+ * (lowercased) that this call both checks against and adds to.
+ */
+function deriveModelCode(product, usedCodesLower){
+  const sku = (product.sku || "").trim();
+  if (sku && !usedCodesLower.has(sku.toLowerCase())) {
+    usedCodesLower.add(sku.toLowerCase());
+    return sku;
+  }
+  const base = "MC-" + String(product.id || uid()).slice(-6).toUpperCase();
+  let candidate = base;
+  let n = 2;
+  while (usedCodesLower.has(candidate.toLowerCase())) {
+    candidate = base + "-" + n;
+    n++;
+  }
+  usedCodesLower.add(candidate.toLowerCase());
+  return candidate;
+}
+
 async function buildStateFromDB(){
   // Compose the full `state` object the frontend expects, entirely from Postgres.
   const state = {};
@@ -33,7 +57,7 @@ async function buildStateFromDB(){
     return {
       ...(p.data || {}),
       id: p.id, name: p.name, category: p.category, price: p.price, cost: p.cost, stock: p.stock,
-      sizes: sizes, colors: colors, sku: p.sku, emoji: p.emoji, image: p.image || "",
+      sizes: sizes, colors: colors, sku: p.sku, modelCode: p.modelCode, emoji: p.emoji, image: p.image || "",
       offer: (p.data && Object.prototype.hasOwnProperty.call(p.data, 'offer')) ? p.data.offer : null,
       variants: (p.variants || []).map(v => ({ id: v.id, size: v.size, color: v.color, stock: v.stock, barcode: v.barcode }))
     };
@@ -147,11 +171,17 @@ async function replaceStateInDB(raw){
       await tx.category.create({ data: { id: uid(), name } });
       count++;
     }
+    const usedModelCodes = new Set();
+    (raw.products || []).forEach(function (p) {
+      const mc = (p.modelCode || "").trim();
+      if (mc) usedModelCodes.add(mc.toLowerCase());
+    });
     for (const p of (raw.products || [])) {
+      const modelCode = (p.modelCode && p.modelCode.trim()) ? p.modelCode.trim() : deriveModelCode(p, usedModelCodes);
       await tx.product.create({
         data: {
           id: p.id, name: p.name, category: p.category || null, price: p.price != null ? p.price : null, cost: p.cost != null ? p.cost : null,
-          stock: p.stock != null ? p.stock : null, sku: p.sku || null, image: p.image || null, emoji: p.emoji || null, data: p,
+          stock: p.stock != null ? p.stock : null, sku: p.sku || null, modelCode: modelCode, image: p.image || null, emoji: p.emoji || null, data: p,
           variants: { create: (p.variants || []).map(v => ({ id: v.id || uid(), size: v.size || null, color: v.color || null, stock: v.stock != null ? v.stock : null, barcode: v.barcode || null })) }
         }
       });
@@ -269,4 +299,4 @@ async function initializeDatabase(seedData){
   return counts;
 }
 
-module.exports = { prisma, buildStateFromDB, replaceStateInDB, initializeDatabase, trimAuditLog };
+module.exports = { prisma, buildStateFromDB, replaceStateInDB, initializeDatabase, trimAuditLog, deriveModelCode };

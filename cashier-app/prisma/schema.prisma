@@ -21,18 +21,19 @@ model Category {
 }
 
 model Product {
-  id       String  @id
-  name     String
-  category String?
-  price    Float?
-  cost     Float?
-  stock    Int?
-  sku      String?
-  image    String?
-  offer    String?
-  emoji    String?
-  data     Json?
-  variants ProductVariant[]
+  id        String  @id
+  name      String
+  category  String?
+  price     Float?
+  cost      Float?
+  stock     Int?
+  sku       String?
+  modelCode String? @unique
+  image     String?
+  offer     String?
+  emoji     String?
+  data      Json?
+  variants  ProductVariant[]
 }
 
 model ProductVariant {
