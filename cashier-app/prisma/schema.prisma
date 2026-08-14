@@ -31,6 +31,7 @@ model Product {
   image    String?
   offer    String?
   emoji    String?
+  data     Json?
   variants ProductVariant[]
 }
 
@@ -68,6 +69,7 @@ model Purchase {
   supplierId String?
   supplierName String?
   total      Float?
+  data       Json?
   items      PurchaseItem[]
 }
 
@@ -78,6 +80,7 @@ model PurchaseItem {
   variantId  String?
   qty        Int?
   cost       Float?
+  data       Json?
   purchase   Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
 }
 
@@ -87,6 +90,7 @@ model Sale {
   date   DateTime?
   userId String?
   total  Float?
+  data   Json?
   items  SaleItem[]
 }
 
@@ -99,6 +103,7 @@ model SaleItem {
   qty     Int?
   size    String?
   color   String?
+  data    Json?
   sale    Sale @relation(fields: [saleId], references: [id], onDelete: Cascade)
 }
 
@@ -123,6 +128,7 @@ model Order {
   customerName String?
   total    Float?
   status   String?
+  data     Json?
   items    OrderItem[]
 }
 
@@ -133,6 +139,7 @@ model OrderItem {
   variantId String?
   qty      Int?
   price    Float?
+  data     Json?
   order    Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
 }
 
@@ -148,6 +155,7 @@ model Expense {
   date     DateTime?
   note     String?
   userId   String?
+  data     Json?
 }
 
 model OtherIncome {
@@ -156,6 +164,7 @@ model OtherIncome {
   amount Float?
   date   DateTime?
   userId String?
+  data   Json?
 }
 
 model PaymentIn {
@@ -164,6 +173,7 @@ model PaymentIn {
   amount       Float?
   date         DateTime?
   userId       String?
+  data         Json?
 }
 
 model PaymentOut {
@@ -172,6 +182,7 @@ model PaymentOut {
   amount       Float?
   date         DateTime?
   userId       String?
+  data         Json?
 }
 
 model CashClosing {

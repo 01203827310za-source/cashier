@@ -1,24 +1,227 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
-async function getRawState(){
-  try{
-    const r = await prisma.rawState.findUnique({ where: { id: 'main' } });
-    return r ? r.data : null;
-  }catch(e){
-    console.error('DB getRawState error', e.message || e);
-    // If DB not configured, return null to allow file fallback
-    return null;
+function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+
+async function buildStateFromDB(){
+  // Compose the full `state` object the frontend expects, entirely from Postgres.
+  const state = {};
+
+  const setting = await prisma.setting.findUnique({ where: { id: 'main' } });
+  state.settings = setting ? (setting.data || {
+    storeName: setting.storeName,
+    currency: setting.currency,
+    taxRate: setting.taxRate,
+    lowStockThreshold: setting.lowStockThreshold,
+    invoicePrefix: setting.invoicePrefix,
+    invoiceCounter: setting.invoiceCounter,
+    purchaseCounter: setting.purchaseCounter,
+    orderCounter: setting.orderCounter,
+    receiptFooter: setting.receiptFooter,
+    phone: setting.phone
+  }) : {};
+
+  state.users = await prisma.user.findMany();
+
+  const cats = await prisma.category.findMany();
+  state.categories = cats.map(c => c.name);
+
+  const products = await prisma.product.findMany({ include: { variants: true } });
+  state.products = products.map(p => {
+    const sizes = Array.from(new Set((p.variants || []).map(v => v.size).filter(x => x != null)));
+    const colors = Array.from(new Set((p.variants || []).map(v => v.color).filter(x => x != null)));
+    return {
+      ...(p.data || {}),
+      id: p.id, name: p.name, category: p.category, price: p.price, cost: p.cost, stock: p.stock,
+      sizes: sizes, colors: colors, sku: p.sku, emoji: p.emoji, image: p.image || "",
+      offer: (p.data && Object.prototype.hasOwnProperty.call(p.data, 'offer')) ? p.data.offer : null,
+      variants: (p.variants || []).map(v => ({ id: v.id, size: v.size, color: v.color, stock: v.stock, barcode: v.barcode }))
+    };
+  });
+
+  const customers = await prisma.customer.findMany();
+  state.customers = customers.map(c => ({ id: c.id, name: c.name, phone: c.phone, notes: c.notes, createdAt: c.createdAt ? c.createdAt.getTime() : null, addresses: c.addresses || [] }));
+
+  state.suppliers = await prisma.supplier.findMany();
+
+  const purchases = await prisma.purchase.findMany({ include: { items: true } });
+  state.purchases = purchases.map(pu => ({
+    ...(pu.data || {}),
+    id: pu.id, number: pu.number, date: pu.date ? pu.date.getTime() : null, userId: pu.userId,
+    supplierId: pu.supplierId, supplierName: pu.supplierName, total: pu.total,
+    items: (pu.items || []).map(it => ({ ...(it.data || {}), id: it.id, productId: it.productId, variantId: it.variantId, qty: it.qty, cost: it.cost }))
+  }));
+
+  const sales = await prisma.sale.findMany({ include: { items: true } });
+  state.sales = sales.map(s => ({
+    ...(s.data || {}),
+    id: s.id, number: s.number, date: s.date ? s.date.getTime() : null, userId: s.userId, total: s.total,
+    items: (s.items || []).map(it => ({ ...(it.data || {}), id: it.id, productId: it.productId, variantId: it.variantId, price: it.price, qty: it.qty, size: it.size, color: it.color }))
+  }));
+
+  state.shippingCompanies = await prisma.shippingCompany.findMany();
+  const shipPrices = await prisma.shippingPrice.findMany();
+  state.shipPrices = shipPrices.map(sp => ({ id: sp.id, governorate: sp.governorate, price: sp.price }));
+
+  const orders = await prisma.order.findMany({ include: { items: true } });
+  state.orders = orders.map(o => ({
+    ...(o.data || {}),
+    id: o.id, number: o.number, date: o.date ? o.date.getTime() : null, userId: o.userId,
+    customerName: o.customerName, total: o.total, status: o.status,
+    items: (o.items || []).map(it => ({ ...(it.data || {}), id: it.id, productId: it.productId, variantId: it.variantId, qty: it.qty, price: it.price }))
+  }));
+
+  const expCats = await prisma.expenseCategory.findMany();
+  state.expenseCategories = expCats.map(e => e.name);
+
+  state.expenses = (await prisma.expense.findMany()).map(e => ({ ...(e.data || {}), id: e.id, category: e.category, amount: e.amount, date: e.date ? e.date.getTime() : null, note: e.note, userId: e.userId }));
+  state.otherIncome = (await prisma.otherIncome.findMany()).map(o => ({ ...(o.data || {}), id: o.id, note: o.note, amount: o.amount, date: o.date ? o.date.getTime() : null, userId: o.userId }));
+  state.paymentsIn = (await prisma.paymentIn.findMany()).map(p => ({ ...(p.data || {}), id: p.id, customerName: p.customerName, amount: p.amount, date: p.date ? p.date.getTime() : null, userId: p.userId }));
+  state.paymentsOut = (await prisma.paymentOut.findMany()).map(p => ({ ...(p.data || {}), id: p.id, supplierName: p.supplierName, amount: p.amount, date: p.date ? p.date.getTime() : null, userId: p.userId }));
+  state.cashClosings = (await prisma.cashClosing.findMany()).map(c => ({ ...(c.data || {}), id: c.id, userId: c.userId, day: c.day, date: c.date ? c.date.getTime() : null }));
+  state.transfers = (await prisma.transfer.findMany()).map(t => ({ id: t.id, fromId: t.fromId, toId: t.toId, amount: t.amount, date: t.date ? t.date.getTime() : null, byId: t.byId }));
+  state.audit = (await prisma.auditLog.findMany({ orderBy: { date: 'asc' } })).map(a => ({ id: a.id, date: a.date ? a.date.getTime() : null, userId: a.userId, userName: a.userName, action: a.action, detail: a.detail }));
+
+  // Ensure arrays exist for compatibility
+  ["users", "categories", "products", "customers", "suppliers", "purchases", "audit", "sales",
+   "shippingCompanies", "shipPrices", "orders", "expenseCategories", "expenses", "otherIncome",
+   "paymentsIn", "paymentsOut", "cashClosings", "transfers"].forEach(function (k) { if (!state[k]) state[k] = []; });
+
+  return state;
+}
+
+async function trimAuditLog(limit){
+  limit = limit || 3000;
+  const total = await prisma.auditLog.count();
+  if (total > limit) {
+    const toRemove = await prisma.auditLog.findMany({ orderBy: { date: 'asc' }, take: total - limit, select: { id: true } });
+    if (toRemove.length) {
+      await prisma.auditLog.deleteMany({ where: { id: { in: toRemove.map(r => r.id) } } });
+    }
   }
 }
 
-async function saveRawState(state){
-  try{
-    await prisma.rawState.upsert({ where: { id: 'main' }, update: { data: state }, create: { id: 'main', data: state } });
-  }catch(e){
-    console.error('DB saveRawState error', e.message || e);
-    return null;
+async function replaceStateInDB(raw){
+  raw = raw || {};
+  await prisma.$transaction(async (tx) => {
+    // Wipe everything. Product/Sale/Purchase/Order cascade-delete their item rows.
+    await tx.product.deleteMany({});
+    await tx.sale.deleteMany({});
+    await tx.purchase.deleteMany({});
+    await tx.order.deleteMany({});
+    await tx.category.deleteMany({});
+    await tx.customer.deleteMany({});
+    await tx.supplier.deleteMany({});
+    await tx.shippingCompany.deleteMany({});
+    await tx.shippingPrice.deleteMany({});
+    await tx.expenseCategory.deleteMany({});
+    await tx.expense.deleteMany({});
+    await tx.otherIncome.deleteMany({});
+    await tx.paymentIn.deleteMany({});
+    await tx.paymentOut.deleteMany({});
+    await tx.cashClosing.deleteMany({});
+    await tx.transfer.deleteMany({});
+    await tx.auditLog.deleteMany({});
+    await tx.user.deleteMany({});
+    await tx.setting.deleteMany({});
+
+    const settings = raw.settings || {};
+    await tx.setting.create({
+      data: {
+        id: 'main', storeName: settings.storeName || null, currency: settings.currency || null, taxRate: settings.taxRate != null ? settings.taxRate : null,
+        lowStockThreshold: settings.lowStockThreshold != null ? settings.lowStockThreshold : null, invoicePrefix: settings.invoicePrefix || null,
+        invoiceCounter: settings.invoiceCounter != null ? settings.invoiceCounter : null, purchaseCounter: settings.purchaseCounter != null ? settings.purchaseCounter : null,
+        orderCounter: settings.orderCounter != null ? settings.orderCounter : null, receiptFooter: settings.receiptFooter || null, phone: settings.phone || null,
+        data: settings
+      }
+    });
+
+    for (const u of (raw.users || [])) {
+      await tx.user.create({ data: { id: u.id, name: u.name || null, username: u.username, password: u.password, role: u.role || null } });
+    }
+    for (const name of (raw.categories || [])) {
+      await tx.category.create({ data: { id: uid(), name } });
+    }
+    for (const p of (raw.products || [])) {
+      await tx.product.create({
+        data: {
+          id: p.id, name: p.name, category: p.category || null, price: p.price != null ? p.price : null, cost: p.cost != null ? p.cost : null,
+          stock: p.stock != null ? p.stock : null, sku: p.sku || null, image: p.image || null, emoji: p.emoji || null, data: p,
+          variants: { create: (p.variants || []).map(v => ({ id: v.id || uid(), size: v.size || null, color: v.color || null, stock: v.stock != null ? v.stock : null, barcode: v.barcode || null })) }
+        }
+      });
+    }
+    for (const c of (raw.customers || [])) {
+      await tx.customer.create({ data: { id: c.id, name: c.name, phone: c.phone || null, notes: c.notes || null, createdAt: c.createdAt ? new Date(c.createdAt) : null, addresses: c.addresses || [] } });
+    }
+    for (const s of (raw.suppliers || [])) {
+      await tx.supplier.create({ data: { id: s.id, name: s.name, phone: s.phone || null, notes: s.notes || null } });
+    }
+    for (const pu of (raw.purchases || [])) {
+      await tx.purchase.create({
+        data: {
+          id: pu.id, number: pu.number || null, date: pu.date ? new Date(pu.date) : null, userId: pu.userId || null,
+          supplierId: pu.supplierId || null, supplierName: pu.supplierName || null, total: pu.total != null ? pu.total : null, data: pu,
+          items: { create: (pu.items || []).map(it => ({ id: it.id || uid(), productId: it.productId || null, variantId: it.variantId || null, qty: it.qty != null ? it.qty : null, cost: it.cost != null ? it.cost : null, data: it })) }
+        }
+      });
+    }
+    for (const s of (raw.sales || [])) {
+      await tx.sale.create({
+        data: {
+          id: s.id, number: s.number || null, date: s.date ? new Date(s.date) : null, userId: s.userId || null, total: s.total != null ? s.total : null, data: s,
+          items: { create: (s.items || []).map(it => ({ id: it.id || uid(), productId: it.productId || null, variantId: it.variantId || null, price: it.price != null ? it.price : null, qty: it.qty != null ? it.qty : null, size: it.size || null, color: it.color || null, data: it })) }
+        }
+      });
+    }
+    for (const sc of (raw.shippingCompanies || [])) {
+      await tx.shippingCompany.create({ data: { id: sc.id, name: sc.name || null, phone: sc.phone || null, notes: sc.notes || null } });
+    }
+    for (const sp of (raw.shipPrices || [])) {
+      await tx.shippingPrice.create({ data: { id: sp.id, governorate: sp.governorate || null, price: sp.price != null ? sp.price : null } });
+    }
+    for (const o of (raw.orders || [])) {
+      await tx.order.create({
+        data: {
+          id: o.id, number: o.number || null, date: o.date ? new Date(o.date) : null, userId: o.userId || null,
+          customerName: o.customerName || null, total: o.total != null ? o.total : null, status: o.status || null, data: o,
+          items: { create: (o.items || []).map(it => ({ id: it.id || uid(), productId: it.productId || null, variantId: it.variantId || null, qty: it.qty != null ? it.qty : null, price: it.price != null ? it.price : null, data: it })) }
+        }
+      });
+    }
+    for (const name of (raw.expenseCategories || [])) {
+      await tx.expenseCategory.create({ data: { id: uid(), name } });
+    }
+    for (const ex of (raw.expenses || [])) {
+      await tx.expense.create({ data: { id: ex.id, category: ex.category || null, amount: ex.amount != null ? ex.amount : null, date: ex.date ? new Date(ex.date) : null, note: ex.note || null, userId: ex.userId || null, data: ex } });
+    }
+    for (const oi of (raw.otherIncome || [])) {
+      await tx.otherIncome.create({ data: { id: oi.id, note: oi.note || null, amount: oi.amount != null ? oi.amount : null, date: oi.date ? new Date(oi.date) : null, userId: oi.userId || null, data: oi } });
+    }
+    for (const pi of (raw.paymentsIn || [])) {
+      await tx.paymentIn.create({ data: { id: pi.id, customerName: pi.customerName || null, amount: pi.amount != null ? pi.amount : null, date: pi.date ? new Date(pi.date) : null, userId: pi.userId || null, data: pi } });
+    }
+    for (const po of (raw.paymentsOut || [])) {
+      await tx.paymentOut.create({ data: { id: po.id, supplierName: po.supplierName || null, amount: po.amount != null ? po.amount : null, date: po.date ? new Date(po.date) : null, userId: po.userId || null, data: po } });
+    }
+    for (const cc of (raw.cashClosings || [])) {
+      await tx.cashClosing.create({ data: { id: cc.id || uid(), userId: cc.userId || null, day: cc.day || null, date: cc.date ? new Date(cc.date) : null, data: cc } });
+    }
+    for (const t of (raw.transfers || [])) {
+      await tx.transfer.create({ data: { id: t.id, fromId: t.fromId || null, toId: t.toId || null, amount: t.amount != null ? t.amount : null, date: t.date ? new Date(t.date) : null, byId: t.byId || null } });
+    }
+    for (const a of (raw.audit || [])) {
+      await tx.auditLog.create({ data: { id: a.id || uid(), date: a.date ? new Date(a.date) : null, userId: a.userId || null, userName: a.userName || null, action: a.action || null, detail: a.detail || null } });
+    }
+  }, { timeout: 60000 });
+}
+
+async function ensureSeeded(seedData){
+  const count = await prisma.user.count();
+  if (count === 0) {
+    console.log('Database empty — seeding initial data into PostgreSQL');
+    await replaceStateInDB(seedData);
   }
 }
 
-module.exports = { prisma, getRawState, saveRawState };
+module.exports = { prisma, buildStateFromDB, replaceStateInDB, ensureSeeded, trimAuditLog };

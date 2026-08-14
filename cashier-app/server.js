@@ -1,6 +1,6 @@
 /* ============================================================
    سيستم كاشير محل ملابس — سيرفر (Node.js بدون اعتماديات)
-   بيخدم الواجهة + API + قاعدة بيانات JSON (ملف على القرص)
+   بيخدم الواجهة + API + قاعدة بيانات PostgreSQL عبر Prisma
    ============================================================ */
 "use strict";
 const http = require("http");
@@ -9,10 +9,9 @@ const path = require("path");
 const crypto = require("crypto");
 
 const PORT = process.env.PORT || 8080;
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-const DATA_FILE = path.join(DATA_DIR, "db.json");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const db = require('./src/db');
+const prisma = db.prisma;
 
 /* ---------- أدوات ---------- */
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
@@ -89,49 +88,13 @@ function seed(){
   };
 }
 
-/* ---------- حالة السيرفر ---------- */
-let state = null;
+/* ---------- جلسات الدخول (في الذاكرة — كما كانت) ---------- */
 const tokens = new Map(); // token -> userId
 
-async function loadState(){
-  // try DB raw snapshot first
-  try{
-    const raw = await db.getRawState();
-    if(raw){ state = raw; }
-    else {
-      try { state = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
-      catch(e){ state = seed(); }
-      // persist initial state to DB (non-blocking)
-      db.saveRawState(state).catch(function(err){ console.error('saveRawState error', err); });
-    }
-  }catch(e){
-    // DB unavailable — fallback to file
-    try { state = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
-    catch(e){ state = seed(); }
-  }
-  // ضمان وجود كل المفاتيح بعد تحديثات قديمة
-  ["users","categories","products","customers","suppliers","purchases","audit","sales",
-   "shippingCompanies","shipPrices","orders","expenseCategories","expenses","otherIncome",
-   "paymentsIn","paymentsOut","cashClosings","transfers"].forEach(function(k){ if(!state[k]) state[k] = []; });
-  if(!state.settings) state.settings = seed().settings;
-}
-function saveState(){
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = DATA_FILE + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(state));
-    fs.renameSync(tmp, DATA_FILE);
-  } catch(e){ console.error("save error", e); }
-  // also persist to DB asynchronously (snapshot)
-  db.saveRawState(state).catch(function(err){ console.error('saveRawState error', err); });
-}
-
 /* ---------- سجل الحركات ---------- */
-function log(req, action, detail){
+function auditEntry(req, action, detail){
   const u = req.user || null;
-  state.audit = state.audit || [];
-  state.audit.push({ id: uid(), date: Date.now(), userId: u ? u.id : null, userName: u ? u.name : "النظام", action, detail: detail||"" });
-  if(state.audit.length > 3000) state.audit = state.audit.slice(-3000);
+  return { id: uid(), date: new Date(), userId: u ? u.id : null, userName: u ? u.name : "النظام", action, detail: detail||"" };
 }
 
 /* ---------- أدوات HTTP ---------- */
@@ -158,7 +121,7 @@ function parseCookies(req){
   });
   return out;
 }
-function authUser(req){
+async function authUser(req){
   let token = null;
   const c = parseCookies(req);
   if(c.token) token = c.token;
@@ -166,14 +129,146 @@ function authUser(req){
   if(!token) return null;
   const userId = tokens.get(token);
   if(!userId) return null;
-  return state.users.find(function(u){ return u.id === userId; }) || null;
+  return prisma.user.findUnique({ where: { id: userId } });
 }
 
-/* ---------- إرجاع الحالة كاملة ---------- */
-function dbPayload(){ return JSON.parse(JSON.stringify(state)); }
+/* ---------- مساعدات المخزون ---------- */
+async function recomputeProductStock(tx, productId){
+  if(!productId) return;
+  const agg = await tx.productVariant.aggregate({ where: { productId }, _sum: { stock: true } });
+  await tx.product.update({ where: { id: productId }, data: { stock: agg._sum.stock || 0 } });
+}
+async function adjustVariantStock(tx, variantId, delta){
+  if(!variantId) return;
+  const variant = await tx.productVariant.findUnique({ where: { id: variantId } });
+  if(!variant) return;
+  await tx.productVariant.update({ where: { id: variant.id }, data: { stock: Math.max(0, (variant.stock||0) + delta) } });
+}
+async function restoreOrderStock(tx, orderId){
+  const items = await tx.orderItem.findMany({ where: { orderId } });
+  for(const it of items){
+    if(it.variantId) await adjustVariantStock(tx, it.variantId, it.qty||0);
+    await recomputeProductStock(tx, it.productId);
+  }
+}
+
+/* ---------- عناصر عامة (إضافة/تعديل/حذف) ---------- */
+const genericModels = {
+  products: {
+    addLabel: "إضافة منتج", editLabel: "تعديل منتج", delLabel: "حذف منتج",
+    logDetail: function(it){ return it.name; },
+    findOne: function(id){ return prisma.product.findUnique({ where: { id } }); },
+    async upsert(tx, it, isNew){
+      const stock = stockOf(it);
+      it.stock = stock;
+      const data = {
+        name: it.name, category: it.category || null, price: it.price != null ? it.price : null, cost: it.cost != null ? it.cost : null,
+        stock: stock, sku: it.sku || null, image: it.image || null, emoji: it.emoji || null, data: it
+      };
+      if(isNew){
+        await tx.product.create({ data: { id: it.id, ...data,
+          variants: { create: (it.variants||[]).map(function(v){ return { id: v.id || uid(), size: v.size||null, color: v.color||null, stock: v.stock!=null?v.stock:null, barcode: v.barcode||null }; }) }
+        }});
+      } else {
+        await tx.product.update({ where: { id: it.id }, data });
+        const keepIds = (it.variants||[]).map(function(v){ return v.id; }).filter(Boolean);
+        await tx.productVariant.deleteMany({ where: { productId: it.id, id: { notIn: keepIds.length ? keepIds : ["__none__"] } } });
+        for(const v of (it.variants||[])){
+          const vid = v.id || uid();
+          await tx.productVariant.upsert({
+            where: { id: vid },
+            update: { size: v.size||null, color: v.color||null, stock: v.stock!=null?v.stock:null, barcode: v.barcode||null },
+            create: { id: vid, productId: it.id, size: v.size||null, color: v.color||null, stock: v.stock!=null?v.stock:null, barcode: v.barcode||null }
+          });
+        }
+      }
+    },
+    async remove(tx, id){ await tx.product.delete({ where: { id } }); }
+  },
+  customers: {
+    addLabel: "إضافة عميل", editLabel: "تعديل عميل", delLabel: "حذف عميل",
+    logDetail: function(it){ return it.name; },
+    findOne: function(id){ return prisma.customer.findUnique({ where: { id } }); },
+    async upsert(tx, it, isNew){
+      const data = { name: it.name, phone: it.phone || null, notes: it.notes || null, addresses: it.addresses || [] };
+      if(isNew) await tx.customer.create({ data: { id: it.id, ...data, createdAt: it.createdAt ? new Date(it.createdAt) : new Date() } });
+      else await tx.customer.update({ where: { id: it.id }, data });
+    },
+    async remove(tx, id){ await tx.customer.delete({ where: { id } }); }
+  },
+  suppliers: {
+    addLabel: "إضافة مورد", editLabel: "تعديل مورد", delLabel: "حذف مورد",
+    logDetail: function(it){ return it.name; },
+    findOne: function(id){ return prisma.supplier.findUnique({ where: { id } }); },
+    async upsert(tx, it, isNew){
+      const data = { name: it.name, phone: it.phone || null, notes: it.notes || null };
+      if(isNew) await tx.supplier.create({ data: { id: it.id, ...data } });
+      else await tx.supplier.update({ where: { id: it.id }, data });
+    },
+    async remove(tx, id){ await tx.supplier.delete({ where: { id } }); }
+  },
+  expenses: {
+    addLabel: "مصروف", editLabel: "تعديل مصروف", delLabel: "حذف مصروف",
+    logDetail: function(it){ return it.note || it.category; },
+    findOne: function(id){ return prisma.expense.findUnique({ where: { id } }); },
+    async upsert(tx, it, isNew){
+      const data = { category: it.category || null, amount: it.amount != null ? it.amount : null, date: it.date ? new Date(it.date) : new Date(), note: it.note || null, userId: it.userId || null, data: it };
+      if(isNew) await tx.expense.create({ data: { id: it.id, ...data } });
+      else await tx.expense.update({ where: { id: it.id }, data });
+    },
+    async remove(tx, id){ await tx.expense.delete({ where: { id } }); }
+  },
+  income: {
+    addLabel: "إيراد آخر", editLabel: "تعديل إيراد", delLabel: "حذف إيراد آخر",
+    logDetail: function(it){ return it.note || ""; },
+    findOne: function(id){ return prisma.otherIncome.findUnique({ where: { id } }); },
+    async upsert(tx, it, isNew){
+      const data = { note: it.note || null, amount: it.amount != null ? it.amount : null, date: it.date ? new Date(it.date) : new Date(), userId: it.userId || null, data: it };
+      if(isNew) await tx.otherIncome.create({ data: { id: it.id, ...data } });
+      else await tx.otherIncome.update({ where: { id: it.id }, data });
+    },
+    async remove(tx, id){ await tx.otherIncome.delete({ where: { id } }); }
+  },
+  users: {
+    addLabel: "إضافة مستخدم", editLabel: "تعديل مستخدم", delLabel: "حذف مستخدم",
+    logDetail: function(it){ return it.username; },
+    findOne: function(id){ return prisma.user.findUnique({ where: { id } }); },
+    async upsert(tx, it, isNew){
+      const data = { name: it.name || null, username: it.username, password: it.password, role: it.role || null };
+      if(isNew) await tx.user.create({ data: { id: it.id, ...data } });
+      else await tx.user.update({ where: { id: it.id }, data });
+    },
+    async remove(tx, id){ await tx.user.delete({ where: { id } }); }
+  }
+};
+
+/* ---------- تحديث حالة أوردر (مشترك بين الحالة/الشحن/COD/الإرجاع/الإلغاء) ---------- */
+async function orderPatch(id, req, res, mutateFn, actionLabelFn, txExtraFn){
+  const existing = await prisma.order.findUnique({ where: { id } });
+  if(!existing){ send(res, 404, {ok:false}); return; }
+  const merged = { ...(existing.data||{}), id: existing.id, number: existing.number,
+    date: existing.date ? existing.date.getTime() : null, userId: existing.userId,
+    customerName: existing.customerName, total: existing.total, status: existing.status };
+  mutateFn(merged);
+  await prisma.$transaction(async function(tx){
+    if(txExtraFn) await txExtraFn(tx, id);
+    await tx.order.update({ where: { id }, data: {
+      status: merged.status || null,
+      customerName: merged.customerName || null,
+      total: merged.total != null ? merged.total : null,
+      data: merged
+    }});
+    const detail = actionLabelFn(merged);
+    if(detail) await tx.auditLog.create({ data: auditEntry(req, detail.action, detail.detail) });
+  }, { timeout: 30000 });
+  await db.trimAuditLog();
+  const state = await db.buildStateFromDB();
+  send(res, 200, { ok:true, db: state });
+}
 
 /* ---------- توجيه الطلبات ---------- */
 const server = http.createServer(async function(req, res){
+ try {
   const url = (req.url || "/").split("?")[0];
   const method = req.method || "GET";
 
@@ -197,14 +292,15 @@ const server = http.createServer(async function(req, res){
 
   if(method === "POST" && url === "/api/login"){
     const b = await readBody(req);
-    const u = state.users.find(function(x){ return x.username === (b.username||"").trim() && x.password === (b.password||""); });
+    const u = await prisma.user.findFirst({ where: { username: (b.username||"").trim(), password: b.password||"" } });
     if(!u){ send(res, 401, {ok:false, error:"بيانات الدخول غير صحيحة"}); return; }
     const token = crypto.randomUUID();
     tokens.set(token, u.id);
     res.setHeader("Set-Cookie", "token="+token+"; HttpOnly; Path=/; SameSite=Lax; Max-Age=" + 60*60*24*30);
-    log({user:u}, "تسجيل دخول", u.name);
-    saveState();
-    send(res, 200, { ok:true, token, user:{id:u.id, name:u.name, username:u.username, role:u.role}, db: dbPayload() });
+    await prisma.auditLog.create({ data: auditEntry({user:u}, "تسجيل دخول", u.name) });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, token, user:{id:u.id, name:u.name, username:u.username, role:u.role}, db: state });
     return;
   }
   if(method === "POST" && url === "/api/logout"){
@@ -216,279 +312,334 @@ const server = http.createServer(async function(req, res){
   }
 
   // --- كل الباقي يتطلب تسجيل دخول ---
-  const user = authUser(req);
+  const user = await authUser(req);
   if(!user){ send(res, 401, {ok:false, error:"غير مسجل دخول"}); return; }
   req.user = user;
 
   if(method === "GET" && url === "/api/state"){
-    send(res, 200, { ok:true, db: dbPayload(), userId: user.id });
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state, userId: user.id });
     return;
   }
 
   /* ---------- البيع ---------- */
   if(method === "POST" && url === "/api/sale"){
     const b = await readBody(req);
-    const sale = b.sale || {};
+    const saleIn = b.sale || {};
     const decrements = b.decrements || [];
-    sale.id = sale.id || uid();
-    sale.number = state.settings.invoicePrefix + "-" + state.settings.invoiceCounter;
-    state.settings.invoiceCounter++;
-    sale.date = Date.now();
-    sale.userId = user.id;
-    state.sales.push(sale);
-    decrements.forEach(function(d){
-      const p = state.products.find(function(x){ return x.id === d.productId; });
-      if(p){
-        const v = (p.variants||[]).find(function(x){ return x.id === d.variantId; });
-        if(v) v.stock = Math.max(0, v.stock - d.qty);
-        p.stock = stockOf(p);
+    const saleId = saleIn.id || uid();
+    await prisma.$transaction(async function(tx){
+      const setting = await tx.setting.findUnique({ where: { id: 'main' } });
+      const settings = (setting && setting.data) || {};
+      const counter = settings.invoiceCounter || 1001;
+      saleIn.id = saleId;
+      saleIn.number = (settings.invoicePrefix || "INV") + "-" + counter;
+      saleIn.date = Date.now();
+      saleIn.userId = user.id;
+      settings.invoiceCounter = counter + 1;
+      await tx.setting.update({ where: { id: 'main' }, data: { invoiceCounter: settings.invoiceCounter, data: settings } });
+
+      await tx.sale.create({ data: {
+        id: saleIn.id, number: saleIn.number, date: new Date(saleIn.date), userId: saleIn.userId, total: saleIn.total != null ? saleIn.total : null, data: saleIn,
+        items: { create: (saleIn.items||[]).map(function(it){ return { id: uid(), productId: it.productId||null, variantId: it.variantId||null, price: it.price!=null?it.price:null, qty: it.qty!=null?it.qty:null, size: it.size||null, color: it.color||null, data: it }; }) }
+      }});
+
+      for(const d of decrements){
+        await adjustVariantStock(tx, d.variantId, -(d.qty||0));
+        await recomputeProductStock(tx, d.productId);
       }
-    });
-    log(req, "بيع", "فاتورة " + sale.number + " — " + sale.total + " " + state.settings.currency);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload(), sale: sale });
+
+      await tx.auditLog.create({ data: auditEntry(req, "بيع", "فاتورة " + saleIn.number + " — " + saleIn.total + " " + (settings.currency||"")) });
+    }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    const savedSale = state.sales.find(function(s){ return s.id === saleId; });
+    send(res, 200, { ok:true, db: state, sale: savedSale });
     return;
   }
   if(method === "POST" && /^\/api\/sale\/[^/]+\/return$/.test(url)){
     const id = url.split("/")[3];
-    const s = state.sales.find(function(x){ return x.id === id; });
-    if(!s){ send(res, 404, {ok:false}); return; }
-    s.items.forEach(function(it){
-      const p = state.products.find(function(x){ return x.id === it.productId; });
-      if(p){
-        let v = (p.variants||[]).find(function(x){ return x.id === it.variantId; });
-        if(!v && (it.size || it.color)) v = (p.variants||[]).find(function(x){ return (x.size||null)===(it.size||null) && (x.color||null)===(it.color||null); });
-        if(!v) v = (p.variants||[])[0];
-        if(v) v.stock += it.qty;
-        p.stock = stockOf(p);
+    const existing = await prisma.sale.findUnique({ where: { id }, include: { items: true } });
+    if(!existing){ send(res, 404, {ok:false}); return; }
+    await prisma.$transaction(async function(tx){
+      for(const it of existing.items){
+        if(it.variantId){
+          await adjustVariantStock(tx, it.variantId, it.qty||0);
+        } else if(it.productId && (it.size || it.color)){
+          const match = await tx.productVariant.findFirst({ where: { productId: it.productId, size: it.size||null, color: it.color||null } });
+          if(match) await adjustVariantStock(tx, match.id, it.qty||0);
+        } else if(it.productId){
+          const first = await tx.productVariant.findFirst({ where: { productId: it.productId } });
+          if(first) await adjustVariantStock(tx, first.id, it.qty||0);
+        }
+        await recomputeProductStock(tx, it.productId);
       }
-    });
-    state.sales = state.sales.filter(function(x){ return x.id !== id; });
-    log(req, "إرجاع فاتورة", s.number);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+      await tx.sale.delete({ where: { id } });
+      await tx.auditLog.create({ data: auditEntry(req, "إرجاع فاتورة", existing.number || "") });
+    }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
 
   /* ---------- الأوردرات ---------- */
   if(method === "POST" && url === "/api/order"){
     const b = await readBody(req);
-    const order = b.order || {};
+    const orderIn = b.order || {};
     const decrements = b.decrements || [];
-    order.id = order.id || uid();
-    order.number = "ORD-" + (state.settings.orderCounter || 1001);
-    state.settings.orderCounter = (state.settings.orderCounter || 1001) + 1;
-    order.date = Date.now();
-    order.userId = user.id;
-    state.orders.push(order);
-    decrements.forEach(function(d){
-      const p = state.products.find(function(x){ return x.id === d.productId; });
-      if(p){
-        const v = (p.variants||[]).find(function(x){ return x.id === d.variantId; });
-        if(v) v.stock = Math.max(0, v.stock - d.qty);
-        p.stock = stockOf(p);
+    const orderId = orderIn.id || uid();
+    await prisma.$transaction(async function(tx){
+      const setting = await tx.setting.findUnique({ where: { id: 'main' } });
+      const settings = (setting && setting.data) || {};
+      const counter = settings.orderCounter || 1001;
+      orderIn.id = orderId;
+      orderIn.number = "ORD-" + counter;
+      orderIn.date = Date.now();
+      orderIn.userId = user.id;
+      settings.orderCounter = counter + 1;
+      await tx.setting.update({ where: { id: 'main' }, data: { orderCounter: settings.orderCounter, data: settings } });
+
+      await tx.order.create({ data: {
+        id: orderIn.id, number: orderIn.number, date: new Date(orderIn.date), userId: orderIn.userId,
+        customerName: orderIn.customerName || null, total: orderIn.total != null ? orderIn.total : null, status: orderIn.status || "new", data: orderIn,
+        items: { create: (orderIn.items||[]).map(function(it){ return { id: uid(), productId: it.productId||null, variantId: it.variantId||null, qty: it.qty!=null?it.qty:null, price: it.price!=null?it.price:null, data: it }; }) }
+      }});
+
+      for(const d of decrements){
+        await adjustVariantStock(tx, d.variantId, -(d.qty||0));
+        await recomputeProductStock(tx, d.productId);
       }
-    });
-    log(req, "أوردر جديد", order.number + " — " + order.customerName + " — " + order.total + " " + state.settings.currency);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload(), order: order });
+
+      await tx.auditLog.create({ data: auditEntry(req, "أوردر جديد", orderIn.number + " — " + orderIn.customerName + " — " + orderIn.total + " " + (settings.currency||"")) });
+    }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    const savedOrder = state.orders.find(function(o){ return o.id === orderId; });
+    send(res, 200, { ok:true, db: state, order: savedOrder });
     return;
   }
-  function orderPatch(fn){
-    const id = url.split("/")[3];
-    const o = state.orders.find(function(x){ return x.id === id; });
-    if(!o) return send(res, 404, {ok:false});
-    fn(o);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
-  }
   if(method === "POST" && /^\/api\/order\/[^/]+\/status$/.test(url)){
+    const id = url.split("/")[3];
     const b = await readBody(req);
-    orderPatch(function(o){ o.status = b.status; if(b.status==="shipped") o.shippedDate = Date.now(); if(b.status==="delivered") o.deliveredDate = Date.now();
-      log(req, "تحديث حالة أوردر", o.number+" → "+b.status); });
+    await orderPatch(id, req, res, function(o){
+      o.status = b.status;
+      if(b.status==="shipped") o.shippedDate = Date.now();
+      if(b.status==="delivered") o.deliveredDate = Date.now();
+    }, function(o){ return { action: "تحديث حالة أوردر", detail: o.number+" → "+b.status }; });
     return;
   }
   if(method === "POST" && /^\/api\/order\/[^/]+\/shipment$/.test(url)){
+    const id = url.split("/")[3];
     const b = await readBody(req);
-    orderPatch(function(o){ o.companyId = b.companyId || null; o.awb = (b.awb||"").trim();
-      log(req, "تحديث شحنة", o.number + (o.awb ? " — "+o.awb : "")); });
+    await orderPatch(id, req, res, function(o){
+      o.companyId = b.companyId || null; o.awb = (b.awb||"").trim();
+    }, function(o){ return { action: "تحديث شحنة", detail: o.number + (o.awb ? " — "+o.awb : "") }; });
     return;
   }
   if(method === "POST" && /^\/api\/order\/[^/]+\/cod$/.test(url)){
+    const id = url.split("/")[3];
     const b = await readBody(req);
-    orderPatch(function(o){
+    let byUser = null;
+    if(b.collected !== false){
+      byUser = await prisma.user.findUnique({ where: { id: b.byId || user.id } });
+    }
+    await orderPatch(id, req, res, function(o){
       if(b.collected === false){
         o.collected = false; o.collectedBy = null; o.collectedAt = null; o.collectedAmount = null;
-        log(req, "إلغاء تحصيل COD", o.number);
       } else {
         o.collected = true; o.collectedBy = b.byId || user.id; o.collectedAt = Date.now(); o.collectedAmount = b.amount;
-        const by = state.users.find(function(x){ return x.id === o.collectedBy; });
-        log(req, "تحصيل COD", o.number + " — " + b.amount + " (" + (by?by.name:"") + ")");
       }
+    }, function(o){
+      if(b.collected === false) return { action: "إلغاء تحصيل COD", detail: o.number };
+      return { action: "تحصيل COD", detail: o.number + " — " + b.amount + " (" + (byUser?byUser.name:"") + ")" };
     });
     return;
   }
-  function restoreOrder(o){
-    o.items.forEach(function(it){
-      const p = state.products.find(function(x){ return x.id === it.productId; });
-      if(p){
-        const v = (p.variants||[]).find(function(x){ return x.id === it.variantId; });
-        if(v) v.stock += it.qty;
-        p.stock = stockOf(p);
-      }
-    });
-  }
   if(method === "POST" && /^\/api\/order\/[^/]+\/return$/.test(url)){
-    orderPatch(function(o){ restoreOrder(o); o.status = "returned"; log(req, "مرتجع أوردر", o.number); });
+    const id = url.split("/")[3];
+    await orderPatch(id, req, res, function(o){ o.status = "returned"; }, function(o){ return { action: "مرتجع أوردر", detail: o.number }; }, restoreOrderStock);
     return;
   }
   if(method === "POST" && /^\/api\/order\/[^/]+\/cancel$/.test(url)){
-    orderPatch(function(o){ restoreOrder(o); o.status = "cancelled"; log(req, "إلغاء أوردر", o.number); });
+    const id = url.split("/")[3];
+    await orderPatch(id, req, res, function(o){ o.status = "cancelled"; }, function(o){ return { action: "إلغاء أوردر", detail: o.number }; }, restoreOrderStock);
     return;
   }
 
   /* ---------- المشتريات ---------- */
   if(method === "POST" && url === "/api/purchase"){
     const b = await readBody(req);
-    const purchase = b.purchase || {};
+    const purchaseIn = b.purchase || {};
     const increments = b.increments || [];
-    purchase.id = purchase.id || uid();
-    purchase.number = "PUR-" + (state.settings.purchaseCounter || 1001);
-    state.settings.purchaseCounter = (state.settings.purchaseCounter || 1001) + 1;
-    purchase.date = Date.now();
-    purchase.userId = user.id;
-    state.purchases.push(purchase);
-    increments.forEach(function(d){
-      const p = state.products.find(function(x){ return x.id === d.productId; });
-      if(p){
-        const v = (p.variants||[]).find(function(x){ return x.id === d.variantId; });
-        if(v) v.stock += d.qty;
-        if(d.cost !== undefined && d.cost !== null) p.cost = d.cost;
-        p.stock = stockOf(p);
+    const purchaseId = purchaseIn.id || uid();
+    await prisma.$transaction(async function(tx){
+      const setting = await tx.setting.findUnique({ where: { id: 'main' } });
+      const settings = (setting && setting.data) || {};
+      const counter = settings.purchaseCounter || 1001;
+      purchaseIn.id = purchaseId;
+      purchaseIn.number = "PUR-" + counter;
+      purchaseIn.date = Date.now();
+      purchaseIn.userId = user.id;
+      settings.purchaseCounter = counter + 1;
+      await tx.setting.update({ where: { id: 'main' }, data: { purchaseCounter: settings.purchaseCounter, data: settings } });
+
+      await tx.purchase.create({ data: {
+        id: purchaseIn.id, number: purchaseIn.number, date: new Date(purchaseIn.date), userId: purchaseIn.userId,
+        supplierId: purchaseIn.supplierId || null, supplierName: purchaseIn.supplierName || null, total: purchaseIn.total != null ? purchaseIn.total : null, data: purchaseIn,
+        items: { create: (purchaseIn.items||[]).map(function(it){ return { id: uid(), productId: it.productId||null, variantId: it.variantId||null, qty: it.qty!=null?it.qty:null, cost: it.cost!=null?it.cost:null, data: it }; }) }
+      }});
+
+      for(const d of increments){
+        await adjustVariantStock(tx, d.variantId, d.qty||0);
+        if(d.productId){
+          if(d.cost !== undefined && d.cost !== null) await tx.product.update({ where: { id: d.productId }, data: { cost: d.cost } });
+          await recomputeProductStock(tx, d.productId);
+        }
       }
-    });
-    log(req, "فاتورة شراء", purchase.number + " — " + purchase.supplierName + " — " + purchase.total + " " + state.settings.currency);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload(), purchase: purchase });
+
+      await tx.auditLog.create({ data: auditEntry(req, "فاتورة شراء", purchaseIn.number + " — " + purchaseIn.supplierName + " — " + purchaseIn.total + " " + (settings.currency||"")) });
+    }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    const savedPurchase = state.purchases.find(function(p){ return p.id === purchaseId; });
+    send(res, 200, { ok:true, db: state, purchase: savedPurchase });
     return;
   }
   if(method === "POST" && /^\/api\/purchase\/[^/]+\/delete$/.test(url)){
     const id = url.split("/")[3];
-    const p = state.purchases.find(function(x){ return x.id === id; });
-    if(!p){ send(res, 404, {ok:false}); return; }
-    p.items.forEach(function(it){
-      const pr = state.products.find(function(x){ return x.id === it.productId; });
-      if(pr){
-        const v = (pr.variants||[]).find(function(x){ return x.id === it.variantId; });
-        if(v) v.stock = Math.max(0, v.stock - it.qty);
-        pr.stock = stockOf(pr);
+    const existing = await prisma.purchase.findUnique({ where: { id }, include: { items: true } });
+    if(!existing){ send(res, 404, {ok:false}); return; }
+    await prisma.$transaction(async function(tx){
+      for(const it of existing.items){
+        await adjustVariantStock(tx, it.variantId, -(it.qty||0));
+        await recomputeProductStock(tx, it.productId);
       }
-    });
-    state.purchases = state.purchases.filter(function(x){ return x.id !== id; });
-    log(req, "حذف فاتورة شراء", p.number);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+      await tx.purchase.delete({ where: { id } });
+      await tx.auditLog.create({ data: auditEntry(req, "حذف فاتورة شراء", existing.number || "") });
+    }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
 
   /* ---------- عمليات عامة (إضافة/تعديل/حذف) ---------- */
-  const generic = {
-    products: { key: "products", addLabel: "إضافة منتج", editLabel: "تعديل منتج", delLabel: "حذف منتج", nameField: "name", logDetail: function(it){ return it.name; } },
-    customers: { key: "customers", addLabel: "إضافة عميل", editLabel: "تعديل عميل", delLabel: "حذف عميل", nameField: "name", logDetail: function(it){ return it.name; } },
-    suppliers: { key: "suppliers", addLabel: "إضافة مورد", editLabel: "تعديل مورد", delLabel: "حذف مورد", nameField: "name", logDetail: function(it){ return it.name; } },
-    expenses: { key: "expenses", addLabel: "مصروف", editLabel: "تعديل مصروف", delLabel: "حذف مصروف", nameField: "note", logDetail: function(it){ return it.note || it.category; } },
-    income: { key: "otherIncome", addLabel: "إيراد آخر", editLabel: "تعديل إيراد", delLabel: "حذف إيراد آخر", nameField: "note", logDetail: function(it){ return it.note || ""; } },
-    users: { key: "users", addLabel: "إضافة مستخدم", editLabel: "تعديل مستخدم", delLabel: "حذف مستخدم", nameField: "username", logDetail: function(it){ return it.username; } }
-  };
-
-  let handled = false;
-  Object.keys(generic).forEach(function(g){
-    const cfg = generic[g];
-    if(handled) return;
+  for(const g of Object.keys(genericModels)){
+    const cfg = genericModels[g];
     if(method === "POST" && url === "/api/" + g){
-      (async function(){
-        const b = await readBody(req);
-        const it = b.item || {};
-        const existing = it.id ? state[cfg.key].find(function(x){ return x.id === it.id; }) : null;
-        if(existing){ Object.assign(existing, it); }
-        else { it.id = it.id || uid(); state[cfg.key].push(it); }
-        // المنتجات: إعادة حساب إجمالي المخزون
-        if(cfg.key === "products"){ it.stock = stockOf(it); }
-        log(req, existing ? cfg.editLabel : cfg.addLabel, cfg.logDetail(it));
-        saveState();
-        send(res, 200, { ok:true, db: dbPayload(), item: it });
-      })();
-      handled = true;
+      const b = await readBody(req);
+      const it = b.item || {};
+      const existing = it.id ? await cfg.findOne(it.id) : null;
+      const isNew = !existing;
+      it.id = it.id || uid();
+      await prisma.$transaction(async function(tx){
+        await cfg.upsert(tx, it, isNew);
+        await tx.auditLog.create({ data: auditEntry(req, isNew ? cfg.addLabel : cfg.editLabel, cfg.logDetail(it)) });
+      }, { timeout: 30000 });
+      await db.trimAuditLog();
+      const state = await db.buildStateFromDB();
+      send(res, 200, { ok:true, db: state, item: it });
+      return;
     }
     if(method === "POST" && /^\/api\/[^/]+\/[^/]+\/delete$/.test(url) && url.indexOf("/api/" + g + "/") === 0){
       const id = url.split("/")[3];
-      const it = state[cfg.key].find(function(x){ return x.id === id; });
-      if(!it){ send(res, 404, {ok:false}); handled = true; return; }
-      // حماية: لا يمكن حذف آخر مدير
-      if(cfg.key === "users"){
-        if(it.id === user.id){ send(res, 400, {ok:false, error:"لا يمكنك حذف حسابك الحالي"}); handled = true; return; }
-        if(it.role === "admin" && state.users.filter(function(x){ return x.role==="admin"; }).length <= 1){ send(res, 400, {ok:false, error:"لا يمكن حذف آخر مدير"}); handled = true; return; }
+      const existing = await cfg.findOne(id);
+      if(!existing){ send(res, 404, {ok:false}); return; }
+      if(g === "users"){
+        if(existing.id === user.id){ send(res, 400, {ok:false, error:"لا يمكنك حذف حسابك الحالي"}); return; }
+        if(existing.role === "admin"){
+          const adminCount = await prisma.user.count({ where: { role: "admin" } });
+          if(adminCount <= 1){ send(res, 400, {ok:false, error:"لا يمكن حذف آخر مدير"}); return; }
+        }
       }
-      state[cfg.key] = state[cfg.key].filter(function(x){ return x.id !== id; });
-      log(req, cfg.delLabel, cfg.logDetail(it));
-      saveState();
-      send(res, 200, { ok:true, db: dbPayload() });
-      handled = true;
+      await prisma.$transaction(async function(tx){
+        await cfg.remove(tx, id);
+        await tx.auditLog.create({ data: auditEntry(req, cfg.delLabel, cfg.logDetail(existing)) });
+      }, { timeout: 30000 });
+      await db.trimAuditLog();
+      const state = await db.buildStateFromDB();
+      send(res, 200, { ok:true, db: state });
+      return;
     }
-  });
-  if(handled) return;
+  }
 
   // مخزون منتج (تعديل كميات المقاسات)
   if(method === "POST" && /^\/api\/products\/[^/]+\/stock$/.test(url)){
     const b = await readBody(req);
     const id = url.split("/")[3];
-    const p = state.products.find(function(x){ return x.id === id; });
-    if(!p){ send(res, 404, {ok:false}); return; }
-    (b.variants||[]).forEach(function(v){
-      const vv = (p.variants||[]).find(function(x){ return x.id === v.id; });
-      if(vv) vv.stock = Math.max(0, parseInt(v.stock,10)||0);
-    });
-    p.stock = stockOf(p);
-    log(req, "تعديل مخزون", p.name);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    const product = await prisma.product.findUnique({ where: { id } });
+    if(!product){ send(res, 404, {ok:false}); return; }
+    await prisma.$transaction(async function(tx){
+      for(const v of (b.variants||[])){
+        const stock = Math.max(0, parseInt(v.stock,10)||0);
+        await tx.productVariant.updateMany({ where: { id: v.id, productId: id }, data: { stock } });
+      }
+      await recomputeProductStock(tx, id);
+      await tx.auditLog.create({ data: auditEntry(req, "تعديل مخزون", product.name) });
+    }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
 
   // الفئات (منتجات ومصاريف)
   if(method === "POST" && url === "/api/categories"){
     const b = await readBody(req);
-    if(b.action === "add"){ if(state.categories.indexOf(b.name) === -1) state.categories.push(b.name); log(req, "إضافة فئة", b.name); }
-    else { state.categories = state.categories.filter(function(x){ return x !== b.name; }); log(req, "حذف فئة", b.name); }
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await prisma.$transaction(async function(tx){
+      if(b.action === "add"){
+        const existing = await tx.category.findUnique({ where: { name: b.name } });
+        if(!existing) await tx.category.create({ data: { id: uid(), name: b.name } });
+        await tx.auditLog.create({ data: auditEntry(req, "إضافة فئة", b.name) });
+      } else {
+        await tx.category.deleteMany({ where: { name: b.name } });
+        await tx.auditLog.create({ data: auditEntry(req, "حذف فئة", b.name) });
+      }
+    });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
   if(method === "POST" && url === "/api/expense-categories"){
     const b = await readBody(req);
-    if(b.action === "add"){ if(state.expenseCategories.indexOf(b.name) === -1) state.expenseCategories.push(b.name); }
-    else { state.expenseCategories = state.expenseCategories.filter(function(x){ return x !== b.name; }); }
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await prisma.$transaction(async function(tx){
+      if(b.action === "add"){
+        const existing = await tx.expenseCategory.findUnique({ where: { name: b.name } });
+        if(!existing) await tx.expenseCategory.create({ data: { id: uid(), name: b.name } });
+      } else {
+        await tx.expenseCategory.deleteMany({ where: { name: b.name } });
+      }
+    });
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
   if(method === "POST" && url === "/api/shipping-companies"){
     const b = await readBody(req);
-    if(b.action === "add"){ state.shippingCompanies.push({ id: uid(), name: b.name, phone:"", notes:"" }); }
-    else { state.shippingCompanies = state.shippingCompanies.filter(function(x){ return x.id !== b.id; }); }
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await prisma.$transaction(async function(tx){
+      if(b.action === "add"){
+        await tx.shippingCompany.create({ data: { id: uid(), name: b.name, phone:"", notes:"" } });
+      } else {
+        await tx.shippingCompany.deleteMany({ where: { id: b.id } });
+      }
+    });
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
   if(method === "POST" && url === "/api/ship-prices"){
     const b = await readBody(req);
-    (b.prices||[]).forEach(function(s){
-      const sp = state.shipPrices.find(function(x){ return x.id === s.id; });
-      if(sp) sp.price = s.price;
+    await prisma.$transaction(async function(tx){
+      for(const s of (b.prices||[])){
+        await tx.shippingPrice.updateMany({ where: { id: s.id }, data: { price: s.price } });
+      }
+      await tx.auditLog.create({ data: auditEntry(req, "تحديث أسعار الشحن") });
     });
-    log(req, "تحديث أسعار الشحن");
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
 
@@ -499,10 +650,13 @@ const server = http.createServer(async function(req, res){
     it.id = it.id || uid();
     it.date = Date.now();
     it.userId = user.id;
-    state.paymentsIn.push(it);
-    log(req, "قبض دفعة من عميل", it.customerName + " — " + it.amount);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await prisma.$transaction(async function(tx){
+      await tx.paymentIn.create({ data: { id: it.id, customerName: it.customerName || null, amount: it.amount != null ? it.amount : null, date: new Date(it.date), userId: it.userId, data: it } });
+      await tx.auditLog.create({ data: auditEntry(req, "قبض دفعة من عميل", it.customerName + " — " + it.amount) });
+    });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
   if(method === "POST" && url === "/api/payments/out"){
@@ -511,10 +665,13 @@ const server = http.createServer(async function(req, res){
     it.id = it.id || uid();
     it.date = Date.now();
     it.userId = user.id;
-    state.paymentsOut.push(it);
-    log(req, "دفع للمورد", it.supplierName + " — " + it.amount);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await prisma.$transaction(async function(tx){
+      await tx.paymentOut.create({ data: { id: it.id, supplierName: it.supplierName || null, amount: it.amount != null ? it.amount : null, date: new Date(it.date), userId: it.userId, data: it } });
+      await tx.auditLog.create({ data: auditEntry(req, "دفع للمورد", it.supplierName + " — " + it.amount) });
+    });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
   if(method === "POST" && url === "/api/transfers"){
@@ -523,60 +680,93 @@ const server = http.createServer(async function(req, res){
     it.id = it.id || uid();
     it.date = Date.now();
     it.byId = user.id;
-    state.transfers.push(it);
-    const f = state.users.find(function(x){ return x.id === it.fromId; });
-    const t = state.users.find(function(x){ return x.id === it.toId; });
-    log(req, "تحويل فلوس", (f?f.name:"") + " ← " + (t?t.name:"") + " — " + it.amount + " " + state.settings.currency);
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    const f = it.fromId ? await prisma.user.findUnique({ where: { id: it.fromId } }) : null;
+    const t = it.toId ? await prisma.user.findUnique({ where: { id: it.toId } }) : null;
+    await prisma.$transaction(async function(tx){
+      await tx.transfer.create({ data: { id: it.id, fromId: it.fromId || null, toId: it.toId || null, amount: it.amount != null ? it.amount : null, date: new Date(it.date), byId: it.byId } });
+      const settingRow = await tx.setting.findUnique({ where: { id: 'main' } });
+      const currency = (settingRow && settingRow.data && settingRow.data.currency) || (settingRow ? settingRow.currency : "") || "";
+      await tx.auditLog.create({ data: auditEntry(req, "تحويل فلوس", (f?f.name:"") + " ← " + (t?t.name:"") + " — " + it.amount + " " + currency) });
+    });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
   if(method === "POST" && url === "/api/closings"){
     const b = await readBody(req);
     const it = b.item || {};
-    const prev = state.cashClosings.find(function(c){ return c.userId === it.userId && c.day === it.day; });
-    if(prev){ Object.assign(prev, it); }
-    else { it.id = it.id || uid(); it.date = Date.now(); state.cashClosings.push(it); }
-    log(req, "إقفال خزنة", it.userName || "");
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await prisma.$transaction(async function(tx){
+      const prev = await tx.cashClosing.findFirst({ where: { userId: it.userId || null, day: it.day || null } });
+      if(prev){
+        const merged = { ...(prev.data||{}), ...it };
+        await tx.cashClosing.update({ where: { id: prev.id }, data: { data: merged } });
+      } else {
+        it.id = it.id || uid();
+        it.date = Date.now();
+        await tx.cashClosing.create({ data: { id: it.id, userId: it.userId || null, day: it.day || null, date: new Date(it.date), data: it } });
+      }
+      await tx.auditLog.create({ data: auditEntry(req, "إقفال خزنة", it.userName || "") });
+    }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
 
   // الإعدادات
   if(method === "POST" && url === "/api/settings"){
     const b = await readBody(req);
-    Object.assign(state.settings, b.settings || {});
-    log(req, "تحديث الإعدادات");
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await prisma.$transaction(async function(tx){
+      const setting = await tx.setting.findUnique({ where: { id: 'main' } });
+      const merged = { ...((setting && setting.data) || {}), ...(b.settings || {}) };
+      const cols = {
+        storeName: merged.storeName || null, currency: merged.currency || null, taxRate: merged.taxRate != null ? merged.taxRate : null,
+        lowStockThreshold: merged.lowStockThreshold != null ? merged.lowStockThreshold : null, invoicePrefix: merged.invoicePrefix || null,
+        invoiceCounter: merged.invoiceCounter != null ? merged.invoiceCounter : null, purchaseCounter: merged.purchaseCounter != null ? merged.purchaseCounter : null,
+        orderCounter: merged.orderCounter != null ? merged.orderCounter : null, receiptFooter: merged.receiptFooter || null, phone: merged.phone || null,
+        data: merged
+      };
+      await tx.setting.upsert({ where: { id: 'main' }, update: cols, create: { id: 'main', ...cols } });
+      await tx.auditLog.create({ data: auditEntry(req, "تحديث الإعدادات") });
+    });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
 
   // نسخ احتياطي / استيراد / تصفير
   if(method === "POST" && url === "/api/reset"){
-    state = seed();
-    log(req, "مسح كل البيانات");
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await db.replaceStateInDB(seed());
+    await prisma.auditLog.create({ data: auditEntry(req, "مسح كل البيانات") });
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
   if(method === "POST" && url === "/api/import"){
     const b = await readBody(req);
     if(!b.db || !b.db.settings || !b.db.products){ send(res, 400, {ok:false, error:"ملف غير صالح"}); return; }
-    state = b.db;
-    log(req, "استيراد بيانات");
-    saveState();
-    send(res, 200, { ok:true, db: dbPayload() });
+    await db.replaceStateInDB(b.db);
+    await prisma.auditLog.create({ data: auditEntry(req, "استيراد بيانات") });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
 
   send(res, 404, { ok:false, error: "مسار غير معروف" });
+ } catch(err){
+   console.error("Request error:", err);
+   if(!res.headersSent){
+     try { send(res, 500, { ok:false, error: "خطأ في الخادم" }); } catch(e){ /* noop */ }
+   }
+ }
 });
 
 (async function(){
-  await loadState();
+  await db.ensureSeeded(seed());
   server.listen(PORT, "0.0.0.0", function(){
-    console.log("Server running on port " + PORT + " | data: " + DATA_FILE);
+    console.log("Server running on port " + PORT + " | Database: PostgreSQL via Prisma");
   });
 })();
