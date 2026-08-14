@@ -242,15 +242,15 @@ tbody tr:last-child td{border-bottom:none;}
 .thumb-emoji{display:flex;align-items:center;justify-content:center;border-radius:9px;background:var(--primary-soft);flex-shrink:0;line-height:1;}
 .pthumb{display:flex;justify-content:center;margin-bottom:2px;}
 
-/* صورة/أيقونة المنتج الكبيرة في بطاقات نقطة البيع */
-.pcard-img{width:100%;height:150px;display:flex;align-items:center;justify-content:center;padding:10px;box-sizing:border-box;background:var(--primary-soft);border-radius:12px;overflow:hidden;}
+/* صورة/أيقونة المنتج الكبيرة (مربعة) في بطاقات نقطة البيع */
+.pcard-img{width:100%;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;padding:10px;box-sizing:border-box;background:var(--primary-soft);border-radius:12px;overflow:hidden;}
 .pcard-img-el{width:100%;height:100%;object-fit:contain;display:block;}
-.pcard-emoji{font-size:72px;line-height:1;}
-.kiosk-grid .pcard-img{height:190px;}
-.kiosk-grid .pcard-emoji{font-size:92px;}
+.pcard-emoji{font-size:80px;line-height:1;}
+.kiosk-grid .pcard-img{padding:14px;}
+.kiosk-grid .pcard-emoji{font-size:104px;}
 @media (max-width:480px){
-  .pcard-img{height:110px;padding:8px;}
-  .pcard-emoji{font-size:56px;}
+  .pcard-img{padding:8px;}
+  .pcard-emoji{font-size:60px;}
 }
 
 /* ---------- قوائم المتغيرات (مقاس/لون) ---------- */
