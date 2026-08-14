@@ -12,6 +12,7 @@ const PORT = process.env.PORT || 8080;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "db.json");
 const PUBLIC_DIR = path.join(__dirname, "public");
+const db = require('./src/db');
 
 /* ---------- أدوات ---------- */
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
@@ -92,12 +93,21 @@ function seed(){
 let state = null;
 const tokens = new Map(); // token -> userId
 
-function loadState(){
-  try {
-    state = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  } catch(e){
-    state = seed();
-    saveState();
+async function loadState(){
+  // try DB raw snapshot first
+  try{
+    const raw = await db.getRawState();
+    if(raw){ state = raw; }
+    else {
+      try { state = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
+      catch(e){ state = seed(); }
+      // persist initial state to DB (non-blocking)
+      db.saveRawState(state).catch(function(err){ console.error('saveRawState error', err); });
+    }
+  }catch(e){
+    // DB unavailable — fallback to file
+    try { state = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
+    catch(e){ state = seed(); }
   }
   // ضمان وجود كل المفاتيح بعد تحديثات قديمة
   ["users","categories","products","customers","suppliers","purchases","audit","sales",
@@ -112,6 +122,8 @@ function saveState(){
     fs.writeFileSync(tmp, JSON.stringify(state));
     fs.renameSync(tmp, DATA_FILE);
   } catch(e){ console.error("save error", e); }
+  // also persist to DB asynchronously (snapshot)
+  db.saveRawState(state).catch(function(err){ console.error('saveRawState error', err); });
 }
 
 /* ---------- سجل الحركات ---------- */
@@ -562,7 +574,9 @@ const server = http.createServer(async function(req, res){
   send(res, 404, { ok:false, error: "مسار غير معروف" });
 });
 
-loadState();
-server.listen(PORT, "0.0.0.0", function(){
-  console.log("Server running on port " + PORT + " | data: " + DATA_FILE);
-});
+(async function(){
+  await loadState();
+  server.listen(PORT, "0.0.0.0", function(){
+    console.log("Server running on port " + PORT + " | data: " + DATA_FILE);
+  });
+})();

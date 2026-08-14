@@ -1,0 +1,221 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id       String  @id
+  name     String?
+  username String  @unique
+  password String
+  role     String?
+}
+
+model Category {
+  id   String @id
+  name String @unique
+}
+
+model Product {
+  id       String  @id
+  name     String
+  category String?
+  price    Float?
+  cost     Float?
+  stock    Int?
+  sku      String?
+  image    String?
+  offer    String?
+  emoji    String?
+  variants ProductVariant[]
+}
+
+model ProductVariant {
+  id        String  @id
+  productId String
+  size      String?
+  color     String?
+  stock     Int?
+  barcode   String?
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+model Customer {
+  id        String @id
+  name      String
+  phone     String?
+  notes     String?
+  createdAt DateTime?
+  addresses Json?
+}
+
+model Supplier {
+  id    String @id
+  name  String
+  phone String?
+  notes String?
+}
+
+model Purchase {
+  id         String @id
+  number     String?
+  date       DateTime?
+  userId     String?
+  supplierId String?
+  supplierName String?
+  total      Float?
+  items      PurchaseItem[]
+}
+
+model PurchaseItem {
+  id         String @id
+  purchaseId String
+  productId  String?
+  variantId  String?
+  qty        Int?
+  cost       Float?
+  purchase   Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+}
+
+model Sale {
+  id     String @id
+  number String?
+  date   DateTime?
+  userId String?
+  total  Float?
+  items  SaleItem[]
+}
+
+model SaleItem {
+  id      String @id
+  saleId  String
+  productId String?
+  variantId String?
+  price   Float?
+  qty     Int?
+  size    String?
+  color   String?
+  sale    Sale @relation(fields: [saleId], references: [id], onDelete: Cascade)
+}
+
+model ShippingCompany {
+  id    String @id
+  name  String
+  phone String?
+  notes String?
+}
+
+model ShippingPrice {
+  id          String @id
+  governorate String
+  price       Float?
+}
+
+model Order {
+  id       String @id
+  number   String?
+  date     DateTime?
+  userId   String?
+  customerName String?
+  total    Float?
+  status   String?
+  items    OrderItem[]
+}
+
+model OrderItem {
+  id       String @id
+  orderId  String
+  productId String?
+  variantId String?
+  qty      Int?
+  price    Float?
+  order    Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+}
+
+model ExpenseCategory {
+  id   String @id
+  name String @unique
+}
+
+model Expense {
+  id       String @id
+  category String?
+  amount   Float?
+  date     DateTime?
+  note     String?
+  userId   String?
+}
+
+model OtherIncome {
+  id     String @id
+  note   String?
+  amount Float?
+  date   DateTime?
+  userId String?
+}
+
+model PaymentIn {
+  id           String @id
+  customerName String?
+  amount       Float?
+  date         DateTime?
+  userId       String?
+}
+
+model PaymentOut {
+  id           String @id
+  supplierName String?
+  amount       Float?
+  date         DateTime?
+  userId       String?
+}
+
+model CashClosing {
+  id     String @id
+  userId String?
+  day    String?
+  date   DateTime?
+  data   Json?
+}
+
+model Transfer {
+  id     String @id
+  fromId String?
+  toId   String?
+  amount Float?
+  date   DateTime?
+  byId   String?
+}
+
+model AuditLog {
+  id      String @id
+  date    DateTime?
+  userId  String?
+  userName String?
+  action  String?
+  detail  String?
+}
+
+model Setting {
+  id          String @id
+  storeName    String?
+  currency     String?
+  taxRate      Float?
+  lowStockThreshold Int?
+  invoicePrefix String?
+  invoiceCounter Int?
+  purchaseCounter Int?
+  orderCounter Int?
+  receiptFooter String?
+  phone        String?
+  data         Json?
+}
+
+model RawState {
+  id   String @id
+  data Json
+}
