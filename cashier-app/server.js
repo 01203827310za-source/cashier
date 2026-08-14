@@ -62,8 +62,8 @@ function seed(){
       receiptFooter:"شكراً لزيارتكم — نتمنى لكم يوماً سعيداً", phone:"01000000000"
     },
     users: [
-      { id:"u_admin", name:"مدير المتجر", username:"admin", password:"admin", role:"admin" },
-      { id:"u_cash", name:"كاشير 1", username:"cashier", password:"1234", role:"cashier" }
+      { id:"u_admin", name:"مدير المتجر", username:"admin", password:"admin", role:"admin", canManageReturns:true },
+      { id:"u_cash", name:"كاشير 1", username:"cashier", password:"1234", role:"cashier", canManageReturns:true }
     ],
     categories: ["رجالي","حريمي","أطفال","أحذية","إكسسوارات"],
     products,
@@ -152,6 +152,26 @@ async function restoreOrderStock(tx, orderId){
   }
 }
 
+/* ---------- الاسترجاع والاستبدال ---------- */
+// افتراضي "مسموح": أي كاشير عنده صلاحية بيع أصلاً، إلا لو المدير عطّلها له
+// صراحة (canManageReturns === false). العمود جديد وقيمته NULL لكل المستخدمين
+// الحاليين، فمعاملتها كـ"غير معطّلة" (!== false) بدل "لازم تبقى true" مهم
+// عشان الكاشيرز الموجودين فعلاً في قاعدة بيانات الإنتاج ميتقفلوش فجأة.
+function canManageReturns(u){ return !!u && (u.role === "admin" || u.canManageReturns !== false); }
+function httpError(status, message){ const e = new Error(message); e.httpStatus = status; return e; }
+async function restockSaleItem(tx, saleItem, qty){
+  if(saleItem.variantId){
+    await adjustVariantStock(tx, saleItem.variantId, qty);
+  } else if(saleItem.productId && (saleItem.size || saleItem.color)){
+    const match = await tx.productVariant.findFirst({ where: { productId: saleItem.productId, size: saleItem.size||null, color: saleItem.color||null } });
+    if(match) await adjustVariantStock(tx, match.id, qty);
+  } else if(saleItem.productId){
+    const first = await tx.productVariant.findFirst({ where: { productId: saleItem.productId } });
+    if(first) await adjustVariantStock(tx, first.id, qty);
+  }
+  if(saleItem.productId) await recomputeProductStock(tx, saleItem.productId);
+}
+
 /* ---------- عناصر عامة (إضافة/تعديل/حذف) ---------- */
 const genericModels = {
   products: {
@@ -234,7 +254,7 @@ const genericModels = {
     logDetail: function(it){ return it.username; },
     findOne: function(id){ return prisma.user.findUnique({ where: { id } }); },
     async upsert(tx, it, isNew){
-      const data = { name: it.name || null, username: it.username, password: it.password, role: it.role || null };
+      const data = { name: it.name || null, username: it.username, password: it.password, role: it.role || null, canManageReturns: it.canManageReturns === false ? false : true };
       if(isNew) await tx.user.create({ data: { id: it.id, ...data } });
       else await tx.user.update({ where: { id: it.id }, data });
     },
@@ -385,6 +405,118 @@ const server = http.createServer(async function(req, res){
     return;
   }
 
+  /* ---------- الاسترجاع والاستبدال (استرجاع جزئي/كامل لفاتورة قائمة — لا يحذف الفاتورة الأصلية) ---------- */
+  if(method === "POST" && url === "/api/returns"){
+    if(!canManageReturns(user)){ send(res, 403, {ok:false, error:"ليس لديك صلاحية إدارة الاسترجاع والاستبدال"}); return; }
+    const b = await readBody(req);
+    const saleId = b.saleId;
+    const type = b.type === "exchange" ? "exchange" : "return";
+    const reqItems = Array.isArray(b.items) ? b.items : [];
+    const reason = (b.reason||"").trim();
+    const refundMethod = b.refundMethod === "credit" ? "credit" : (b.refundMethod === "cash" ? "cash" : null);
+    const customerId = b.customerId || null;
+
+    if(!saleId){ send(res, 400, {ok:false, error:"رقم الفاتورة مطلوب"}); return; }
+    if(!reqItems.length){ send(res, 400, {ok:false, error:"اختر صنفاً واحداً على الأقل للاسترجاع"}); return; }
+
+    const sale = await prisma.sale.findUnique({ where: { id: saleId }, include: { items: true } });
+    if(!sale){ send(res, 404, {ok:false, error:"الفاتورة غير موجودة"}); return; }
+
+    const returnId = uid();
+    try{
+      await prisma.$transaction(async function(tx){
+        let returnedTotal = 0, replacementTotal = 0;
+        const lineData = [];
+        const requestedSoFar = {}; // saleItemId -> qty already staged within this same request
+
+        for(const reqIt of reqItems){
+          const qty = parseInt(reqIt.qty, 10) || 0;
+          if(qty <= 0) throw httpError(400, "الكمية المرتجعة يجب أن تكون أكبر من صفر");
+
+          const saleItem = sale.items.find(function(si){ return si.id === reqIt.saleItemId; });
+          if(!saleItem) throw httpError(400, "صنف غير موجود في هذه الفاتورة");
+
+          const agg = await tx.saleReturnItem.aggregate({ where: { saleItemId: saleItem.id }, _sum: { qty: true } });
+          const alreadyReturned = (agg._sum.qty || 0) + (requestedSoFar[saleItem.id] || 0);
+          const remaining = (saleItem.qty || 0) - alreadyReturned;
+          if(qty > remaining) throw httpError(400, "الكمية المطلوب استرجاعها ("+qty+") أكبر من المتاح للاسترجاع ("+remaining+")");
+          requestedSoFar[saleItem.id] = (requestedSoFar[saleItem.id] || 0) + qty;
+
+          const unitPrice = saleItem.price || 0;
+          const lineTotal = unitPrice * qty;
+          returnedTotal += lineTotal;
+
+          const prod = saleItem.productId ? await tx.product.findUnique({ where: { id: saleItem.productId } }) : null;
+
+          const lineRec = {
+            id: uid(), saleItemId: saleItem.id, productId: saleItem.productId||null, variantId: saleItem.variantId||null,
+            modelCode: prod ? prod.modelCode : null, size: saleItem.size||null, color: saleItem.color||null,
+            qty: qty, unitPrice: unitPrice, lineTotal: lineTotal,
+            condition: (reqIt.condition||"").trim() || null,
+            replacementProductId: null, replacementVariantId: null, replacementQty: null, replacementPrice: null,
+            data: reqIt
+          };
+
+          await restockSaleItem(tx, saleItem, qty);
+
+          if(type === "exchange" && reqIt.replacementVariantId){
+            const repQty = parseInt(reqIt.replacementQty, 10) || 0;
+            if(repQty <= 0) throw httpError(400, "كمية المنتج البديل يجب أن تكون أكبر من صفر");
+            const repVariant = await tx.productVariant.findUnique({ where: { id: reqIt.replacementVariantId } });
+            if(!repVariant) throw httpError(400, "المتغير البديل غير موجود");
+            if((repVariant.stock||0) < repQty) throw httpError(400, "الكمية المتاحة من المنتج البديل غير كافية");
+            const repProduct = await tx.product.findUnique({ where: { id: repVariant.productId } });
+            const repPrice = (reqIt.replacementPrice != null) ? Number(reqIt.replacementPrice) : (repProduct ? (repProduct.price||0) : 0);
+            replacementTotal += repPrice * repQty;
+
+            lineRec.replacementProductId = repVariant.productId;
+            lineRec.replacementVariantId = repVariant.id;
+            lineRec.replacementQty = repQty;
+            lineRec.replacementPrice = repPrice;
+
+            await adjustVariantStock(tx, repVariant.id, -repQty);
+            await recomputeProductStock(tx, repVariant.productId);
+          }
+
+          lineData.push(lineRec);
+        }
+
+        const priorAgg = await tx.saleReturnItem.aggregate({ where: { saleReturn: { saleId: sale.id } }, _sum: { qty: true } });
+        const totalReturnedQty = (priorAgg._sum.qty || 0) + lineData.reduce(function(a,l){ return a + l.qty; }, 0);
+        const totalSoldQty = sale.items.reduce(function(a,si){ return a + (si.qty||0); }, 0);
+        const status = type === "exchange" ? "مستبدل" : (totalReturnedQty >= totalSoldQty ? "مسترجع بالكامل" : "مسترجع جزئيًا");
+        const difference = replacementTotal - returnedTotal;
+
+        const setting = await tx.setting.findUnique({ where: { id: 'main' } });
+        const settings = (setting && setting.data) || {};
+        const counter = settings.returnCounter || 1001;
+        const number = (type === "exchange" ? "EXC-" : "RET-") + counter;
+        settings.returnCounter = counter + 1;
+        await tx.setting.update({ where: { id: 'main' }, data: { returnCounter: settings.returnCounter, data: settings } });
+
+        await tx.saleReturn.create({ data: {
+          id: returnId, number, type, saleId: sale.id, customerId: customerId, userId: user.id, date: new Date(),
+          reason: reason || null, status, refundMethod: refundMethod,
+          returnedTotal: returnedTotal, replacementTotal: replacementTotal, difference: difference,
+          data: { reason, refundMethod, customerId },
+          items: { create: lineData }
+        }});
+
+        await tx.auditLog.create({ data: auditEntry(req, type === "exchange" ? "استبدال" : "استرجاع",
+          (sale.number||"") + " — " + number + (type === "exchange" ? (" — الفرق " + difference) : (" — قيمة " + returnedTotal))) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    const savedReturn = state.returns.find(function(r){ return r.id === returnId; });
+    send(res, 200, { ok:true, db: state, saleReturn: savedReturn });
+    return;
+  }
+
   /* ---------- الأوردرات ---------- */
   if(method === "POST" && url === "/api/order"){
     const b = await readBody(req);
@@ -473,53 +605,175 @@ const server = http.createServer(async function(req, res){
   if(method === "POST" && url === "/api/purchase"){
     const b = await readBody(req);
     const purchaseIn = b.purchase || {};
-    const increments = b.increments || [];
+    const type = purchaseIn.type === "financial" ? "financial" : "goods";
+    const increments = type === "financial" ? [] : (b.increments || []);
     const purchaseId = purchaseIn.id || uid();
-    await prisma.$transaction(async function(tx){
-      const setting = await tx.setting.findUnique({ where: { id: 'main' } });
-      const settings = (setting && setting.data) || {};
-      const counter = settings.purchaseCounter || 1001;
-      purchaseIn.id = purchaseId;
-      purchaseIn.number = "PUR-" + counter;
-      purchaseIn.date = Date.now();
-      purchaseIn.userId = user.id;
-      settings.purchaseCounter = counter + 1;
-      await tx.setting.update({ where: { id: 'main' }, data: { purchaseCounter: settings.purchaseCounter, data: settings } });
 
-      await tx.purchase.create({ data: {
-        id: purchaseIn.id, number: purchaseIn.number, date: new Date(purchaseIn.date), userId: purchaseIn.userId,
-        supplierId: purchaseIn.supplierId || null, supplierName: purchaseIn.supplierName || null, total: purchaseIn.total != null ? purchaseIn.total : null, data: purchaseIn,
-        items: { create: (purchaseIn.items||[]).map(function(it){ return { id: uid(), productId: it.productId||null, variantId: it.variantId||null, qty: it.qty!=null?it.qty:null, cost: it.cost!=null?it.cost:null, data: it }; }) }
-      }});
+    if(type === "financial"){
+      if(!purchaseIn.supplierId){ send(res, 400, {ok:false, error:"المورد مطلوب"}); return; }
+      if(!(Number(purchaseIn.total) > 0)){ send(res, 400, {ok:false, error:"إجمالي الفاتورة يجب أن يكون أكبر من صفر"}); return; }
+    }
 
-      for(const d of increments){
-        await adjustVariantStock(tx, d.variantId, d.qty||0);
-        if(d.productId){
-          if(d.cost !== undefined && d.cost !== null) await tx.product.update({ where: { id: d.productId }, data: { cost: d.cost } });
-          await recomputeProductStock(tx, d.productId);
+    try{
+      await prisma.$transaction(async function(tx){
+        const setting = await tx.setting.findUnique({ where: { id: 'main' } });
+        const settings = (setting && setting.data) || {};
+
+        purchaseIn.id = purchaseId;
+        purchaseIn.date = Date.now();
+        purchaseIn.userId = user.id;
+
+        const requestedNumber = (purchaseIn.number || "").toString().trim();
+        if(requestedNumber){
+          const dupe = await tx.purchase.findFirst({ where: { supplierId: purchaseIn.supplierId || null, number: requestedNumber } });
+          if(dupe) throw httpError(400, "رقم الفاتورة \""+requestedNumber+"\" مستخدم بالفعل لهذا المورد");
+          purchaseIn.number = requestedNumber;
+        } else {
+          const counter = settings.purchaseCounter || 1001;
+          purchaseIn.number = "PUR-" + counter;
+          settings.purchaseCounter = counter + 1;
+          await tx.setting.update({ where: { id: 'main' }, data: { purchaseCounter: settings.purchaseCounter, data: settings } });
         }
-      }
 
-      await tx.auditLog.create({ data: auditEntry(req, "فاتورة شراء", purchaseIn.number + " — " + purchaseIn.supplierName + " — " + purchaseIn.total + " " + (settings.currency||"")) });
-    }, { timeout: 30000 });
+        let items = type === "financial" ? [] : (purchaseIn.items || []);
+        let total = purchaseIn.total != null ? Number(purchaseIn.total) : 0;
+        let paid = null, remaining = null, paymentStatus = null;
+        if(type === "financial" || purchaseIn.paid != null){
+          paid = Math.max(0, Math.min(total, Number(purchaseIn.paid) || 0));
+          remaining = total - paid;
+          paymentStatus = (paid >= total && total > 0) ? "paid" : (paid > 0 ? "partial" : "unpaid");
+        }
+        purchaseIn.type = type; purchaseIn.total = total; purchaseIn.paid = paid; purchaseIn.remaining = remaining; purchaseIn.paymentStatus = paymentStatus;
+
+        await tx.purchase.create({ data: {
+          id: purchaseIn.id, number: purchaseIn.number, date: new Date(purchaseIn.date), userId: purchaseIn.userId,
+          supplierId: purchaseIn.supplierId || null, supplierName: purchaseIn.supplierName || null, total: total,
+          type: type, paid: paid, remaining: remaining, paymentStatus: paymentStatus,
+          paymentMethod: purchaseIn.paymentMethod || null, notes: (purchaseIn.notes||"").trim() || null, data: purchaseIn,
+          items: { create: items.map(function(it){ return { id: uid(), productId: it.productId||null, variantId: it.variantId||null, qty: it.qty!=null?it.qty:null, cost: it.cost!=null?it.cost:null, data: it }; }) }
+        }});
+
+        for(const d of increments){
+          await adjustVariantStock(tx, d.variantId, d.qty||0);
+          if(d.productId){
+            if(d.cost !== undefined && d.cost !== null) await tx.product.update({ where: { id: d.productId }, data: { cost: d.cost } });
+            await recomputeProductStock(tx, d.productId);
+          }
+        }
+
+        await tx.auditLog.create({ data: auditEntry(req, type === "financial" ? "فاتورة مشتريات مالية" : "فاتورة شراء", purchaseIn.number + " — " + purchaseIn.supplierName + " — " + total + " " + (settings.currency||"")) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
     await db.trimAuditLog();
     const state = await db.buildStateFromDB();
     const savedPurchase = state.purchases.find(function(p){ return p.id === purchaseId; });
     send(res, 200, { ok:true, db: state, purchase: savedPurchase });
     return;
   }
+  if(method === "POST" && /^\/api\/purchase\/[^/]+\/payment$/.test(url)){
+    const id = url.split("/")[3];
+    const b = await readBody(req);
+    const amount = Number(b.amount);
+    if(!(amount > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
+    const purchase = await prisma.purchase.findUnique({ where: { id } });
+    if(!purchase){ send(res, 404, {ok:false, error:"فاتورة الشراء غير موجودة"}); return; }
+
+    const paymentId = uid();
+    try{
+      await prisma.$transaction(async function(tx){
+        const fresh = await tx.purchase.findUnique({ where: { id } });
+        const total = fresh.total || 0;
+        const currentPaid = fresh.paid || 0;
+        const newPaid = currentPaid + amount;
+        if(newPaid > total + 0.004) throw httpError(400, "المبلغ المدفوع الإجمالي ("+newPaid+") يتجاوز إجمالي الفاتورة ("+total+")");
+        const remaining = Math.max(0, total - newPaid);
+        const paymentStatus = (newPaid >= total && total > 0) ? "paid" : (newPaid > 0 ? "partial" : "unpaid");
+
+        await tx.purchase.update({ where: { id }, data: { paid: newPaid, remaining: remaining, paymentStatus: paymentStatus } });
+
+        const payDate = Date.now();
+        const pIt = { id: paymentId, purchaseId: id, supplierId: fresh.supplierId||null, supplierName: fresh.supplierName||null,
+          date: payDate, amount: amount, paymentMethod: b.paymentMethod || "cash", notes: (b.notes||"").trim() || null, userId: user.id };
+        await tx.purchasePayment.create({ data: {
+          id: pIt.id, purchaseId: pIt.purchaseId, supplierId: pIt.supplierId, supplierName: pIt.supplierName,
+          date: new Date(pIt.date), amount: pIt.amount, paymentMethod: pIt.paymentMethod, notes: pIt.notes, userId: pIt.userId, data: pIt
+        }});
+
+        await tx.auditLog.create({ data: auditEntry(req, "دفعة على فاتورة شراء", (fresh.number||"") + " — " + amount + " (" + (fresh.supplierName||"") + ")") });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+  if(method === "POST" && /^\/api\/purchase\/[^/]+\/edit$/.test(url)){
+    const id = url.split("/")[3];
+    const b = await readBody(req);
+    const existing = await prisma.purchase.findUnique({ where: { id } });
+    if(!existing){ send(res, 404, {ok:false, error:"فاتورة الشراء غير موجودة"}); return; }
+
+    try{
+      await prisma.$transaction(async function(tx){
+        const data = {
+          supplierId: b.supplierId !== undefined ? (b.supplierId||null) : existing.supplierId,
+          supplierName: b.supplierName !== undefined ? (b.supplierName||null) : existing.supplierName,
+          date: b.date ? new Date(b.date) : existing.date,
+          number: (b.number !== undefined && String(b.number).trim()) ? String(b.number).trim() : existing.number,
+          notes: b.notes !== undefined ? ((b.notes||"").trim()||null) : existing.notes,
+          paymentMethod: b.paymentMethod !== undefined ? (b.paymentMethod||null) : existing.paymentMethod
+        };
+
+        if(existing.type === "financial" && b.total !== undefined){
+          const total = Number(b.total);
+          if(!(total > 0)) throw httpError(400, "إجمالي الفاتورة يجب أن يكون أكبر من صفر");
+          const paid = Math.min(existing.paid||0, total);
+          data.total = total;
+          data.paid = paid;
+          data.remaining = total - paid;
+          data.paymentStatus = (paid >= total) ? "paid" : (paid > 0 ? "partial" : "unpaid");
+        }
+
+        if(data.number !== existing.number){
+          const dupe = await tx.purchase.findFirst({ where: { supplierId: data.supplierId||null, number: data.number, NOT: { id } } });
+          if(dupe) throw httpError(400, "رقم الفاتورة \""+data.number+"\" مستخدم بالفعل لهذا المورد");
+        }
+
+        await tx.purchase.update({ where: { id }, data });
+        await tx.auditLog.create({ data: auditEntry(req, "تعديل فاتورة شراء", data.number || "") });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
   if(method === "POST" && /^\/api\/purchase\/[^/]+\/delete$/.test(url)){
     const id = url.split("/")[3];
     const existing = await prisma.purchase.findUnique({ where: { id }, include: { items: true } });
     if(!existing){ send(res, 404, {ok:false}); return; }
-    await prisma.$transaction(async function(tx){
-      for(const it of existing.items){
-        await adjustVariantStock(tx, it.variantId, -(it.qty||0));
-        await recomputeProductStock(tx, it.productId);
-      }
-      await tx.purchase.delete({ where: { id } });
-      await tx.auditLog.create({ data: auditEntry(req, "حذف فاتورة شراء", existing.number || "") });
-    }, { timeout: 30000 });
+    try{
+      await prisma.$transaction(async function(tx){
+        for(const it of existing.items){
+          await adjustVariantStock(tx, it.variantId, -(it.qty||0));
+          await recomputeProductStock(tx, it.productId);
+        }
+        await tx.purchase.delete({ where: { id } });
+        await tx.auditLog.create({ data: auditEntry(req, "حذف فاتورة شراء", existing.number || "") });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.code === "P2003"){ send(res, 400, {ok:false, error:"لا يمكن حذف هذه الفاتورة لوجود دفعات مسجّلة عليها"}); return; }
+      throw err;
+    }
     await db.trimAuditLog();
     const state = await db.buildStateFromDB();
     send(res, 200, { ok:true, db: state });

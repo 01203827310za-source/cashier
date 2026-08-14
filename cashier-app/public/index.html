@@ -650,6 +650,7 @@ var pendingConfirm = null;
 var kioskMode = false;
 var lowStockNotified = false;
 var purchaseDraft = null;
+var purchasesTab = "invoices";
 var auditQ = "";
 var auditFrom = "";
 var auditTo = "";
@@ -663,6 +664,11 @@ var expFrom = "";
 var expTo = "";
 var cashDay = todayKey();
 var cashDayData = [];
+var returnsQ = "";
+var returnsTypeFilter = "all";
+var returnsFrom = "";
+var returnsTo = "";
+var returnDraft = null;
 
 var ORDER_STATUSES = [
   {id:"new", label:"جديد", color:"badge-blue"},
@@ -700,16 +706,38 @@ function customerPaid(cid){
   return (DB.paymentsIn||[]).filter(function(p){ return p.customerId===cid; })
     .reduce(function(a,p){ return a+p.amount; },0);
 }
+// أثر الاسترجاع/الاستبدال على رصيد العميل: لو الفاتورة الأصلية آجلة فالاسترجاع
+// بيقلل اللي عليه (أو الفرق في الاستبدال)؛ لو مش آجلة لكن رد المبلغ "رصيد للعميل"
+// بدل كاش، فده مبلغ جديد بقى المحل مديون بيه للعميل.
+function customerReturnsAdjustment(cid){
+  var v = 0;
+  (DB.returns||[]).forEach(function(r){
+    if(r.customerId !== cid) return;
+    var sale = DB.sales.find(function(s){ return s.id === r.saleId; });
+    var wasCreditSale = !!(sale && sale.paymentMethod === "credit");
+    if(wasCreditSale){
+      v += r.type === "exchange" ? -(r.difference||0) : (r.returnedTotal||0);
+    } else if(r.refundMethod === "credit"){
+      v += r.type === "exchange" ? Math.max(0, -(r.difference||0)) : (r.returnedTotal||0);
+    }
+  });
+  return v;
+}
 function customerBalance(cid){
-  return customerSalesCredit(cid) + customerOrdersCredit(cid) - customerPaid(cid);
+  return customerSalesCredit(cid) + customerOrdersCredit(cid) - customerPaid(cid) - customerReturnsAdjustment(cid);
 }
 function supplierPurchasesTotal(sid){
   return DB.purchases.filter(function(p){ return p.supplierId===sid; })
     .reduce(function(a,p){ return a+p.total; },0);
 }
 function supplierPaid(sid){
-  return (DB.paymentsOut||[]).filter(function(p){ return p.supplierId===sid; })
+  var fromPaymentsOut = (DB.paymentsOut||[]).filter(function(p){ return p.supplierId===sid; })
     .reduce(function(a,p){ return a+p.amount; },0);
+  // مدفوعات مربوطة بفاتورة شراء محددة (بضاعة أو مالية) — منفصلة عن paymentsOut
+  // اللي هي دفعة إجمالية للمورد مش مربوطة بفاتورة بعينها.
+  var fromInvoicePayments = (DB.purchasePayments||[]).filter(function(p){ return p.supplierId===sid; })
+    .reduce(function(a,p){ return a+p.amount; },0);
+  return fromPaymentsOut + fromInvoicePayments;
 }
 function supplierBalance(sid){
   return supplierPurchasesTotal(sid) - supplierPaid(sid);
@@ -755,7 +783,7 @@ function userCashBalance(userId){
 function dayMovements(userId, day){
   var from = new Date(day+"T00:00:00").getTime(), to = new Date(day+"T23:59:59").getTime();
   function inR(t){ return t>=from && t<=to; }
-  var m = {cashSales:0, cod:0, transfersIn:0, transfersOut:0, expenses:0, supplierPay:0, otherIncome:0, custPay:0};
+  var m = {cashSales:0, cod:0, transfersIn:0, transfersOut:0, expenses:0, supplierPay:0, otherIncome:0, custPay:0, refunds:0};
   DB.sales.forEach(function(s){ if(s.paymentMethod==="cash" && saleCashBy(s)===userId && inR(s.date)) m.cashSales += s.total; });
   DB.orders.forEach(function(o){ if(o.collected && o.collectedBy===userId && inR(o.collectedAt||o.date)) m.cod += (o.collectedAmount||o.total); });
   DB.otherIncome.forEach(function(i){ if(incomeReceivedBy(i)===userId && inR(i.date)) m.otherIncome += i.amount; });
@@ -763,7 +791,16 @@ function dayMovements(userId, day){
   (DB.transfers||[]).forEach(function(t){ if(inR(t.date)){ if(t.toId===userId) m.transfersIn += t.amount; if(t.fromId===userId) m.transfersOut += t.amount; } });
   DB.expenses.forEach(function(e){ if(e.paymentMethod==="cash" && expensePaidBy(e)===userId && inR(e.date)) m.expenses += e.amount; });
   (DB.paymentsOut||[]).forEach(function(p){ if((p.paymentMethod||"cash")==="cash" && payOutPaidBy(p)===userId && inR(p.date)) m.supplierPay += p.amount; });
-  m.net = m.cashSales + m.cod + m.otherIncome + m.custPay + m.transfersIn - m.expenses - m.supplierPay - m.transfersOut;
+  (DB.returns||[]).forEach(function(r){
+    if(r.refundMethod !== "cash" || r.userId !== userId || !inR(r.date)) return;
+    if(r.type === "exchange"){
+      if((r.difference||0) > 0) m.cashSales += r.difference; // العميل دفع فرق كاش زيادة
+      else if((r.difference||0) < 0) m.refunds += -r.difference; // المحل رجّع فرق كاش
+    } else {
+      m.refunds += (r.returnedTotal||0);
+    }
+  });
+  m.net = m.cashSales + m.cod + m.otherIncome + m.custPay + m.transfersIn - m.expenses - m.supplierPay - m.transfersOut - m.refunds;
   return m;
 }
 /* تحويل فلوس بين شخصين */
@@ -798,6 +835,7 @@ async function saveTransfer(){
 
 function currentUser(){ return DB.users.find(function(u){ return u.id === sessionId; }) || null; }
 function isAdmin(){ var u = currentUser(); return u && u.role === "admin"; }
+function canManageReturnsUI(){ var u = currentUser(); return !!u && (u.role === "admin" || u.canManageReturns !== false); }
 function userById(id){ return DB.users.find(function(u){ return u.id === id; }) || null; }
 
 /* ---------- Toast ---------- */
@@ -893,6 +931,7 @@ function render(){
     {id:"pos", label:"نقطة البيع", ic:"cart", roles:["admin","cashier"]},
     {id:"products", label:"المنتجات والمخزون", ic:"box", roles:["admin","cashier"]},
     {id:"orders", label:"الأوردرات والشحن", ic:"send", roles:["admin","cashier"]},
+    {id:"returns", label:"الاسترجاع والاستبدال", ic:"return", roles:["admin","cashier"]},
     {id:"purchases", label:"المشتريات والموردين", ic:"truck", roles:["admin"]},
     {id:"expenses", label:"المصاريف", ic:"coins", roles:["admin"]},
     {id:"debts", label:"الديون", ic:"scale", roles:["admin"]},
@@ -909,7 +948,7 @@ function render(){
     return '<button class="nav-item '+(currentView===n.id?"active":"")+'" onclick="go(\''+n.id+'\')">'+icon(n.ic,18)+'<span>'+n.label+'</span></button>';
   }).join("");
 
-  var titles = {dashboard:"لوحة التحكم", pos:"نقطة البيع", products:"المنتجات والمخزون", orders:"الأوردرات والشحن", purchases:"المشتريات والموردين", expenses:"المصاريف", debts:"الديون", cash:"الخزنة", finance:"الحسابات", assets:"الأصول والديون", customers:"العملاء", reports:"التقارير", audit:"سجل الحركات", cashiers:"الكاشير والصلاحيات", settings:"الإعدادات"};
+  var titles = {dashboard:"لوحة التحكم", pos:"نقطة البيع", products:"المنتجات والمخزون", orders:"الأوردرات والشحن", returns:"الاسترجاع والاستبدال", purchases:"المشتريات والموردين", expenses:"المصاريف", debts:"الديون", cash:"الخزنة", finance:"الحسابات", assets:"الأصول والديون", customers:"العملاء", reports:"التقارير", audit:"سجل الحركات", cashiers:"الكاشير والصلاحيات", settings:"الإعدادات"};
   var now = new Date();
   var dateLbl = now.toLocaleDateString("ar-EG", {weekday:"long", day:"numeric", month:"long", year:"numeric"});
   var lowCount = lowStockItems().length;
@@ -972,6 +1011,7 @@ function renderView(){
     case "pos": return kioskMode ? viewKiosk() : viewPos();
     case "products": return viewProducts();
     case "orders": return viewOrders();
+    case "returns": return viewReturns();
     case "purchases": return viewPurchases();
     case "expenses": return viewExpenses();
     case "debts": return viewDebts();
@@ -1420,6 +1460,8 @@ function showReceipt(sale){
     '</div>'+
     '<div class="modal-foot">'+
       '<button class="btn btn-primary" onclick="window.print()">'+icon("print",16)+' طباعة</button>'+
+      (canManageReturnsUI() && sale.id ? '<button class="btn btn-soft-red" onclick="openReturnFlow(\''+sale.id+'\',\'return\')">'+icon("return",16)+' استرجاع</button>' : '')+
+      (canManageReturnsUI() && sale.id ? '<button class="btn btn-soft" onclick="openReturnFlow(\''+sale.id+'\',\'exchange\')">'+icon("return",16)+' استبدال</button>' : '')+
       '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
     '</div>'
   );
@@ -1900,6 +1942,12 @@ function viewReports(){
   var count = sales.length;
   var avg = count ? revenue/count : 0;
 
+  // المرتجعات وصافي المبيعات = إجمالي المبيعات - المرتجعات + فروق الاستبدال
+  var returnsInRange = (DB.returns||[]).filter(function(r){ return r.date>=f.from && r.date<=f.to; });
+  var returnsTotal = returnsInRange.reduce(function(a,r){ return a + (r.returnedTotal||0); },0);
+  var exchangeDiffTotal = returnsInRange.filter(function(r){ return r.type==="exchange"; }).reduce(function(a,r){ return a + (r.difference||0); },0);
+  var netSales = revenue - returnsTotal + exchangeDiffTotal;
+
   // رسم بياني يومي
   var days = [];
   var cursor = new Date(f.from); cursor.setHours(0,0,0,0);
@@ -1957,7 +2005,7 @@ function viewReports(){
       '<td><span class="badge '+(s.paymentMethod==="cash"?"badge-green":(s.paymentMethod==="card"?"badge-blue":(s.paymentMethod==="credit"?"badge-red":"badge-amber")))+'">'+(payMap[s.paymentMethod]||s.paymentMethod)+'</span></td>'+
       '<td><div class="row" style="gap:2px;">'+
         '<button class="icon-btn primary" onclick="viewSale(\''+s.id+'\')">'+icon("eye",16)+'</button>'+
-        (isAdmin() ? '<button class="icon-btn danger" onclick="returnSale(\''+s.id+'\')" title="إرجاع الفاتورة">'+icon("return",16)+'</button>' : '')+
+        (canManageReturnsUI() ? '<button class="icon-btn danger" onclick="openReturnFlow(\''+s.id+'\')" title="استرجاع/استبدال">'+icon("return",16)+'</button>' : '')+
       '</div></td></tr>';
   }).join("");
 
@@ -1974,7 +2022,9 @@ function viewReports(){
 
   return '<div class="filterbar">'+rangeSel+'</div>'+
     '<div class="stats">'+
-      statCard("chart","var(--primary)", fmt(revenue), "إجمالي المبيعات ("+DB.settings.currency+")")+
+      statCard("chart","var(--primary)", fmt(revenue), "إجمالي المبيعات — إجمالي ("+DB.settings.currency+")")+
+      statCard("return","var(--red)", fmt(returnsTotal), "المرتجعات")+
+      statCard("chart","var(--green)", fmt(netSales), "صافي المبيعات")+
       statCard("print","var(--green)", fmtInt(count), "عدد الفواتير")+
       statCard("card","#0ea5e9", fmt(avg), "متوسط قيمة الفاتورة")+
       statCard("chart","var(--amber)", fmt(profit), "صافي الربح")+
@@ -2004,6 +2054,303 @@ function returnSale(id){
   confirmBox("إرجاع الفاتورة "+s.number+"؟ سيتم إرجاع الكميات للمخزون وحذف الفاتورة.", function(){
     api("POST", "/api/sale/" + id + "/return").then(function(r){ afterSync(r); renderViewInPlace(); toast("تم إرجاع الفاتورة واستعادة المخزون"); }).catch(function(e){ toast(e.message, "err"); });
   }, true);
+}
+
+/* ============================================================
+   الاسترجاع والاستبدال
+   ============================================================ */
+function saleItemReturnedQty(saleItemId){
+  var used = 0;
+  (DB.returns||[]).forEach(function(r){ (r.items||[]).forEach(function(it){ if(it.saleItemId===saleItemId) used += (it.qty||0); }); });
+  return used;
+}
+function saleItemModelCode(saleId, saleItemId){
+  var sale = DB.sales.find(function(s){ return s.id===saleId; });
+  var it = sale && sale.items.find(function(x){ return x.id===saleItemId; });
+  var p = it && it.productId ? DB.products.find(function(x){ return x.id===it.productId; }) : null;
+  return p ? p.modelCode : "";
+}
+function returnRowHTML(r){
+  var sale = DB.sales.find(function(s){ return s.id===r.saleId; });
+  var cust = r.customerId ? DB.customers.find(function(c){ return c.id===r.customerId; }) : null;
+  var badgeColor = r.type==="exchange" ? "badge-blue" : (r.status==="مسترجع بالكامل" ? "badge-red" : "badge-amber");
+  var modelCodes = Array.from(new Set((r.items||[]).map(function(it){ return it.modelCode; }).filter(Boolean))).join("، ");
+  return '<tr>'+
+    '<td class="bold">'+esc(r.number||"")+'<div class="small muted">'+(r.type==="exchange"?"استبدال":"استرجاع")+'</div></td>'+
+    '<td>'+esc(sale?sale.number:"—")+'</td>'+
+    '<td>'+dateStr(r.date)+' '+timeStr(r.date)+'</td>'+
+    '<td>'+esc(cust?cust.name:"—")+'</td>'+
+    '<td class="small" dir="ltr">'+esc(modelCodes||"—")+'</td>'+
+    '<td>'+(r.items||[]).reduce(function(a,it){ return a+(it.qty||0); },0)+'</td>'+
+    '<td class="bold">'+fmt(r.returnedTotal)+'</td>'+
+    (r.type==="exchange" ?
+      '<td class="bold">'+fmt(r.replacementTotal)+'</td><td class="bold" style="color:'+((r.difference||0)>0?"var(--red)":((r.difference||0)<0?"var(--green)":"inherit"))+';">'+fmt(r.difference)+'</td>'
+      : '<td class="muted">—</td><td class="muted">—</td>')+
+    '<td>'+esc(userById(r.userId)?userById(r.userId).name:"—")+'</td>'+
+    '<td><span class="badge '+badgeColor+'">'+esc(r.status||"")+'</span></td>'+
+    '<td><button class="icon-btn primary" onclick="viewReturnDetail(\''+r.id+'\')">'+icon("eye",16)+'</button></td>'+
+  '</tr>';
+}
+function viewReturns(){
+  var q = returnsQ.toLowerCase();
+  var list = (DB.returns||[]).slice().sort(function(a,b){ return b.date-a.date; }).filter(function(r){
+    var sale = DB.sales.find(function(s){ return s.id===r.saleId; });
+    var cust = r.customerId ? DB.customers.find(function(c){ return c.id===r.customerId; }) : null;
+    var codes = (r.items||[]).map(function(it){ return it.modelCode||""; }).join(" ");
+    var hay = ((r.number||"")+" "+(sale?sale.number:"")+" "+(cust?cust.name:"")+" "+codes).toLowerCase();
+    var okQ = !q || hay.indexOf(q)!==-1;
+    var okType = returnsTypeFilter==="all" || r.type===returnsTypeFilter;
+    var okFrom = !returnsFrom || r.date >= new Date(returnsFrom+"T00:00:00").getTime();
+    var okTo = !returnsTo || r.date <= new Date(returnsTo+"T23:59:59").getTime();
+    return okQ && okType && okFrom && okTo;
+  });
+  var totalReturned = list.reduce(function(a,r){ return a+(r.returnedTotal||0); },0);
+  var exchangesCount = list.filter(function(r){ return r.type==="exchange"; }).length;
+
+  return '<div class="filterbar">'+
+    '<input placeholder="ابحث برقم عملية الاسترجاع / رقم الفاتورة / العميل / كود الموديل..." style="flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--border);border-radius:10px;" value="'+esc(returnsQ)+'" oninput="setReturnsQ(this.value)">'+
+    '<select onchange="setReturnsType(this.value)">'+
+      '<option value="all" '+(returnsTypeFilter==="all"?"selected":"")+'>الكل</option>'+
+      '<option value="return" '+(returnsTypeFilter==="return"?"selected":"")+'>استرجاع</option>'+
+      '<option value="exchange" '+(returnsTypeFilter==="exchange"?"selected":"")+'>استبدال</option>'+
+    '</select>'+
+    '<input type="date" value="'+esc(returnsFrom)+'" onchange="setReturnsFrom(this.value)">'+
+    '<input type="date" value="'+esc(returnsTo)+'" onchange="setReturnsTo(this.value)">'+
+    (canManageReturnsUI() ? '<button class="btn btn-primary" onclick="openReturnFlow()">'+icon("plus",16)+' استرجاع/استبدال جديد</button>' : '')+
+  '</div>'+
+  '<div class="stats">'+
+    statCard("return","var(--red)", fmtInt(list.length), "عدد العمليات")+
+    statCard("cash","var(--amber)", fmt(totalReturned), "إجمالي قيمة المرتجعات")+
+    statCard("box","#0ea5e9", fmtInt(exchangesCount), "عمليات استبدال")+
+  '</div>'+
+  '<div class="card"><h3>'+icon("return",17)+' سجل الاسترجاع والاستبدال ('+list.length+')</h3>'+
+    '<div class="table-wrap"><table><thead><tr><th>رقم العملية</th><th>الفاتورة الأصلية</th><th>التاريخ</th><th>العميل</th><th>كود الموديل</th><th>الكمية</th><th>قيمة الاسترجاع</th><th>قيمة البديل</th><th>الفرق</th><th>الموظف</th><th>الحالة</th><th></th></tr></thead>'+
+    '<tbody>'+(list.length ? list.map(returnRowHTML).join("") : '<tr><td colspan="12" class="muted" style="text-align:center;padding:30px;">لا توجد عمليات استرجاع أو استبدال</td></tr>')+'</tbody></table></div></div>';
+}
+function setReturnsQ(v){ returnsQ=v; renderViewInPlace(); }
+function setReturnsType(v){ returnsTypeFilter=v; renderViewInPlace(); }
+function setReturnsFrom(v){ returnsFrom=v; renderViewInPlace(); }
+function setReturnsTo(v){ returnsTo=v; renderViewInPlace(); }
+
+function loadReturnSale(sale){
+  returnDraft.saleId = sale.id;
+  returnDraft.customerId = sale.customerId || null;
+  returnDraft.lines = sale.items.map(function(it){
+    var already = saleItemReturnedQty(it.id);
+    var remaining = Math.max(0, (it.qty||0) - already);
+    return {
+      saleItemId: it.id, name: it.name, size: it.size, color: it.color, price: it.price,
+      soldQty: it.qty||0, alreadyReturned: already, remaining: remaining,
+      checked: false, qty: remaining>0?1:0, reason: "", condition: "",
+      replacementProductId: "", replacementVariantId: "", replacementQty: 1
+    };
+  });
+}
+function openReturnFlow(saleId, presetType){
+  if(!canManageReturnsUI()){ toast("ليس لديك صلاحية إدارة الاسترجاع والاستبدال","err"); return; }
+  returnDraft = { saleId:null, invoiceInput:"", type: presetType||"return", lines:[], customerId:null, refundMethod:"cash", reason:"" };
+  if(saleId){
+    var sale = DB.sales.find(function(s){ return s.id===saleId; });
+    if(sale) loadReturnSale(sale);
+  }
+  openModal(returnModalHTML(), true);
+}
+function refreshReturnModal(){
+  var m = $("#modal");
+  if(m) m.innerHTML = returnModalHTML();
+}
+function searchReturnInvoice(){
+  var v = $("#ret-inv").value.trim();
+  returnDraft.invoiceInput = v;
+  if(!v){ toast("أدخل رقم الفاتورة","err"); return; }
+  var sale = DB.sales.find(function(s){ return (s.number||"").toLowerCase()===v.toLowerCase(); });
+  if(!sale){ toast("لم يتم العثور على فاتورة بهذا الرقم","err"); return; }
+  loadReturnSale(sale);
+  refreshReturnModal();
+}
+function setReturnType(t){ returnDraft.type = t; refreshReturnModal(); }
+function onReturnLineCheck(i, checked){
+  var l = returnDraft.lines[i]; l.checked = checked;
+  if(checked && l.qty<1) l.qty = 1;
+  refreshReturnModal();
+}
+function onReturnLineQty(i, v){
+  var l = returnDraft.lines[i];
+  l.qty = Math.max(1, Math.min(l.remaining, parseInt(v,10)||1));
+  refreshReturnModal();
+}
+function onReturnLineReason(i, v){ returnDraft.lines[i].reason = v; }
+function onReturnLineCondition(i, v){ returnDraft.lines[i].condition = v; }
+function onReturnReplacementProduct(i, pid){
+  var l = returnDraft.lines[i];
+  l.replacementProductId = pid;
+  var p = DB.products.find(function(x){ return x.id===pid; });
+  l.replacementVariantId = (p && p.variants && p.variants.length) ? p.variants[0].id : "";
+  refreshReturnModal();
+}
+function onReturnReplacementVariant(i, vid){ returnDraft.lines[i].replacementVariantId = vid; refreshReturnModal(); }
+function onReturnReplacementQty(i, v){ returnDraft.lines[i].replacementQty = Math.max(1, parseInt(v,10)||1); refreshReturnModal(); }
+function computeReturnTotals(){
+  var returnedTotal = 0, replacementTotal = 0;
+  returnDraft.lines.forEach(function(l){
+    if(!l.checked || l.qty<=0) return;
+    returnedTotal += l.price * l.qty;
+    if(returnDraft.type==="exchange" && l.replacementVariantId){
+      var p = DB.products.find(function(x){ return x.id===l.replacementProductId; });
+      replacementTotal += (p?p.price:0) * (l.replacementQty||0);
+    }
+  });
+  return { returnedTotal: returnedTotal, replacementTotal: replacementTotal, difference: replacementTotal - returnedTotal };
+}
+function returnLineHTML(l, i){
+  var repHTML = "";
+  if(returnDraft.type==="exchange"){
+    var prodOpts = '<option value="">— اختر منتج —</option>' + DB.products.map(function(p){ return '<option value="'+p.id+'" '+(l.replacementProductId===p.id?"selected":"")+'>'+esc(p.name)+(p.modelCode?' — '+esc(p.modelCode):'')+'</option>'; }).join("");
+    var repProd = DB.products.find(function(p){ return p.id===l.replacementProductId; });
+    var varOpts = '<option value="">—</option>' + ((repProd&&repProd.variants)?repProd.variants:[]).map(function(v){ return '<option value="'+v.id+'" '+(l.replacementVariantId===v.id?"selected":"")+'>'+esc(variantLabel(v))+' ('+v.stock+')</option>'; }).join("");
+    repHTML = '<td><div class="row" style="gap:4px;flex-wrap:wrap;">'+
+      '<select onchange="onReturnReplacementProduct('+i+',this.value)" style="min-width:130px;">'+prodOpts+'</select>'+
+      '<select onchange="onReturnReplacementVariant('+i+',this.value)" style="min-width:110px;">'+varOpts+'</select>'+
+      '<input type="number" min="1" value="'+l.replacementQty+'" style="width:60px;" oninput="onReturnReplacementQty('+i+',this.value)">'+
+    '</div></td>';
+  }
+  return '<tr>'+
+    '<td><input type="checkbox" '+(l.checked?"checked":"")+' '+(l.remaining<=0?"disabled":"")+' onchange="onReturnLineCheck('+i+',this.checked)"></td>'+
+    '<td>'+esc(l.name||"")+'</td>'+
+    '<td dir="ltr" class="small">'+esc(saleItemModelCode(returnDraft.saleId, l.saleItemId)||"—")+'</td>'+
+    '<td>'+esc([l.size,l.color].filter(Boolean).join(" / ")||"—")+'</td>'+
+    '<td>'+fmt(l.price)+'</td>'+
+    '<td>'+l.soldQty+'</td>'+
+    '<td>'+l.remaining+'</td>'+
+    '<td><input type="number" min="1" max="'+l.remaining+'" value="'+l.qty+'" style="width:60px;" '+(l.remaining<=0?"disabled":"")+' oninput="onReturnLineQty('+i+',this.value)"></td>'+
+    '<td><input value="'+esc(l.reason||"")+'" style="width:110px;" oninput="onReturnLineReason('+i+',this.value)"></td>'+
+    '<td><select onchange="onReturnLineCondition('+i+',this.value)"><option value="">—</option><option value="جيد" '+(l.condition==="جيد"?"selected":"")+'>جيد</option><option value="تالف" '+(l.condition==="تالف"?"selected":"")+'>تالف</option></select></td>'+
+    repHTML+
+  '</tr>';
+}
+function returnModalHTML(){
+  var sale = returnDraft.saleId ? DB.sales.find(function(s){ return s.id===returnDraft.saleId; }) : null;
+  var cust = returnDraft.customerId ? DB.customers.find(function(c){ return c.id===returnDraft.customerId; }) : null;
+  var head = '<div class="modal-head"><h3>'+icon("return",18)+' '+(returnDraft.type==="exchange"?"استبدال":"استرجاع")+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>';
+  var body, foot;
+
+  if(!sale){
+    body = '<div class="modal-body">'+
+      '<div class="field"><label>رقم الفاتورة</label><input id="ret-inv" value="'+esc(returnDraft.invoiceInput||"")+'" placeholder="مثال: INV-1001"></div>'+
+      '<button class="btn btn-primary" onclick="searchReturnInvoice()">'+icon("search",16)+' بحث عن الفاتورة</button>'+
+    '</div>';
+    foot = '<div class="modal-foot"><button class="btn btn-ghost" onclick="closeModal()">إلغاء</button></div>';
+  } else {
+    var typeBtns = '<div class="row mb16" style="gap:8px;">'+
+      '<button class="btn '+(returnDraft.type==="return"?"btn-primary":"btn-ghost")+'" onclick="setReturnType(\'return\')">استرجاع</button>'+
+      '<button class="btn '+(returnDraft.type==="exchange"?"btn-primary":"btn-ghost")+'" onclick="setReturnType(\'exchange\')">استبدال</button>'+
+    '</div>';
+    var head2 = '<div class="row" style="gap:16px;flex-wrap:wrap;margin-bottom:10px;">'+
+      '<div><span class="muted small">الفاتورة</span><div class="bold">'+esc(sale.number)+'</div></div>'+
+      '<div><span class="muted small">التاريخ</span><div class="bold">'+dateStr(sale.date)+'</div></div>'+
+      '<div><span class="muted small">العميل</span><div class="bold">'+esc(cust?cust.name:"—")+'</div></div>'+
+      '<div><span class="muted small">إجمالي الفاتورة</span><div class="bold">'+fmt(sale.total)+'</div></div>'+
+    '</div>';
+    var rows = returnDraft.lines.map(returnLineHTML).join("");
+    var table = '<div class="table-wrap"><table><thead><tr><th></th><th>الصنف</th><th>كود الموديل</th><th>المقاس/اللون</th><th>سعر الوحدة</th><th>المباع</th><th>المتاح للاسترجاع</th><th>الكمية المسترجعة</th><th>السبب</th><th>الحالة</th>'+(returnDraft.type==="exchange"?'<th>المنتج البديل</th>':'')+'</tr></thead><tbody>'+rows+'</tbody></table></div>';
+
+    var totals = computeReturnTotals();
+    var diffLine = "";
+    if(returnDraft.type==="exchange"){
+      if(totals.difference > 0.004) diffLine = '<div class="ttl bold" style="color:var(--red);"><span>المبلغ المطلوب دفعه</span><span>'+fmt(totals.difference)+' '+esc(DB.settings.currency)+'</span></div>';
+      else if(totals.difference < -0.004) diffLine = '<div class="ttl bold" style="color:var(--green);"><span>المبلغ المستحق للعميل</span><span>'+fmt(-totals.difference)+' '+esc(DB.settings.currency)+'</span></div>';
+      else diffLine = '<div class="ttl bold"><span>الفرق</span><span>لا يوجد فرق</span></div>';
+    }
+    var summary = '<div class="card mt16" style="background:#f8fafc;padding:12px;">'+
+      '<div class="ttl"><span>قيمة الاسترجاع</span><span class="bold">'+fmt(totals.returnedTotal)+' '+esc(DB.settings.currency)+'</span></div>'+
+      (returnDraft.type==="exchange" ? '<div class="ttl"><span>قيمة المنتج البديل</span><span class="bold">'+fmt(totals.replacementTotal)+' '+esc(DB.settings.currency)+'</span></div>'+diffLine : '')+
+    '</div>';
+
+    var refundNeeded = returnDraft.type==="return" ? totals.returnedTotal>0.004 : Math.abs(totals.difference)>0.004;
+    var refundLabel = (returnDraft.type==="exchange" && totals.difference>0.004) ? "طريقة تحصيل الفرق" : "طريقة الاسترداد";
+    var refundBlock = refundNeeded ? '<div class="field"><label>'+refundLabel+'</label><select id="ret-refund" onchange="returnDraft.refundMethod=this.value">'+
+      '<option value="cash" '+(returnDraft.refundMethod==="cash"?"selected":"")+'>نقدي</option>'+
+      '<option value="credit" '+(returnDraft.refundMethod==="credit"?"selected":"")+'>رصيد للعميل</option>'+
+    '</select></div>' : '';
+
+    body = '<div class="modal-body">'+typeBtns+head2+table+
+      '<div class="field full mt16"><label>سبب الاسترجاع (اختياري)</label><input id="ret-reason" value="'+esc(returnDraft.reason||"")+'" onchange="returnDraft.reason=this.value"></div>'+
+      refundBlock+summary+
+    '</div>';
+    foot = '<div class="modal-foot">'+
+      '<button class="btn btn-green" onclick="confirmReturn()">'+icon("check",16)+' تأكيد العملية</button>'+
+      '<button class="btn btn-ghost" onclick="returnDraft.saleId=null;returnDraft.lines=[];refreshReturnModal();">رجوع</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+    '</div>';
+  }
+  return head + body + foot;
+}
+async function confirmReturn(){
+  var checkedLines = returnDraft.lines.filter(function(l){ return l.checked && l.qty>0; });
+  if(!checkedLines.length){ toast("اختر صنفاً واحداً على الأقل","err"); return; }
+  if(returnDraft.type==="exchange" && checkedLines.some(function(l){ return !l.replacementVariantId; })){
+    toast("اختر المنتج البديل (بالمقاس/اللون) لكل صنف مسترجع","err"); return;
+  }
+  var totals = computeReturnTotals();
+  var msg = returnDraft.type==="exchange" ?
+    ("تأكيد الاستبدال؟ " + (totals.difference>0.004 ? ("سيتم تحصيل "+fmt(totals.difference)+" "+DB.settings.currency+" من العميل.") : (totals.difference<-0.004 ? ("سيتم رد "+fmt(-totals.difference)+" "+DB.settings.currency+" للعميل.") : "لا يوجد فرق في السعر.")))
+    : ("تأكيد استرجاع بقيمة "+fmt(totals.returnedTotal)+" "+DB.settings.currency+"؟");
+  confirmBox(msg, function(){
+    var payload = {
+      saleId: returnDraft.saleId, type: returnDraft.type, customerId: returnDraft.customerId,
+      reason: returnDraft.reason||"", refundMethod: returnDraft.refundMethod||"cash",
+      items: checkedLines.map(function(l){
+        var repProd = returnDraft.type==="exchange" ? DB.products.find(function(p){ return p.id===l.replacementProductId; }) : null;
+        return {
+          saleItemId: l.saleItemId, qty: l.qty, reason: l.reason||"", condition: l.condition||"",
+          replacementVariantId: returnDraft.type==="exchange" ? l.replacementVariantId : null,
+          replacementQty: returnDraft.type==="exchange" ? l.replacementQty : null,
+          replacementPrice: repProd ? repProd.price : null
+        };
+      })
+    };
+    api("POST", "/api/returns", payload).then(function(r){
+      afterSync(r);
+      closeModal();
+      renderViewInPlace();
+      toast(returnDraft.type==="exchange" ? "تم تنفيذ الاستبدال بنجاح" : "تم تنفيذ الاسترجاع بنجاح");
+    }).catch(function(e){ toast(e.message, "err"); });
+  }, false);
+}
+function viewReturnDetail(id){
+  var r = (DB.returns||[]).find(function(x){ return x.id===id; });
+  if(!r) return;
+  var sale = DB.sales.find(function(s){ return s.id===r.saleId; });
+  var cust = r.customerId ? DB.customers.find(function(c){ return c.id===r.customerId; }) : null;
+  var rows = (r.items||[]).map(function(it){
+    var repProd = it.replacementProductId ? DB.products.find(function(p){ return p.id===it.replacementProductId; }) : null;
+    return '<tr>'+
+      '<td dir="ltr">'+esc(it.modelCode||"—")+'</td>'+
+      '<td>'+esc([it.size,it.color].filter(Boolean).join(" / ")||"—")+'</td>'+
+      '<td>'+it.qty+'</td><td>'+fmt(it.unitPrice)+'</td><td>'+fmt(it.lineTotal)+'</td>'+
+      '<td>'+esc(repProd?repProd.name:"—")+(it.replacementQty?(' × '+it.replacementQty):'')+'</td>'+
+    '</tr>';
+  }).join("");
+  openModal(
+    '<div class="modal-head"><h3>'+icon("return",18)+' '+(r.type==="exchange"?"استبدال":"استرجاع")+' '+esc(r.number||"")+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="row" style="gap:16px;flex-wrap:wrap;margin-bottom:10px;">'+
+        '<div><span class="muted small">الفاتورة الأصلية</span><div class="bold">'+esc(sale?sale.number:"—")+'</div></div>'+
+        '<div><span class="muted small">التاريخ</span><div class="bold">'+dateStr(r.date)+' '+timeStr(r.date)+'</div></div>'+
+        '<div><span class="muted small">العميل</span><div class="bold">'+esc(cust?cust.name:"—")+'</div></div>'+
+        '<div><span class="muted small">الموظف</span><div class="bold">'+esc(userById(r.userId)?userById(r.userId).name:"—")+'</div></div>'+
+        '<div><span class="muted small">الحالة</span><div class="bold">'+esc(r.status||"")+'</div></div>'+
+      '</div>'+
+      '<div class="table-wrap"><table><thead><tr><th>كود الموديل</th><th>المقاس/اللون</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th><th>البديل</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+      '<div class="card mt16" style="background:#f8fafc;padding:12px;">'+
+        '<div class="ttl"><span>قيمة الاسترجاع</span><span class="bold">'+fmt(r.returnedTotal)+'</span></div>'+
+        (r.type==="exchange" ? '<div class="ttl"><span>قيمة البديل</span><span class="bold">'+fmt(r.replacementTotal)+'</span></div><div class="ttl"><span>الفرق</span><span class="bold">'+fmt(r.difference)+'</span></div>' : '')+
+        (r.refundMethod ? '<div class="ttl"><span>طريقة التسوية</span><span class="bold">'+(r.refundMethod==="cash"?"نقدي":"رصيد للعميل")+'</span></div>' : '')+
+        (r.reason ? '<div class="ttl"><span>السبب</span><span>'+esc(r.reason)+'</span></div>' : '')+
+      '</div>'+
+    '</div>'+
+    '<div class="modal-foot"><button class="btn btn-ghost" onclick="closeModal()">إغلاق</button></div>'
+  , true);
 }
 
 /* ============================================================
@@ -2059,6 +2406,12 @@ function openLowStock(){
 /* ============================================================
    المشتريات والموردين
    ============================================================ */
+function purchasePayBadge(p){
+  var map = { paid:{label:"مدفوعة",cls:"badge-green"}, partial:{label:"مدفوعة جزئياً",cls:"badge-amber"}, unpaid:{label:"غير مدفوعة",cls:"badge-red"} };
+  var m = map[p.paymentStatus];
+  return m ? '<span class="badge '+m.cls+'">'+m.label+'</span>' : '<span class="muted small">—</span>';
+}
+function setPurchasesTab(t){ purchasesTab = t; renderViewInPlace(); }
 function viewPurchases(){
   if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
   var supRows = DB.suppliers.map(function(s){
@@ -2072,17 +2425,51 @@ function viewPurchases(){
         '<button class="icon-btn danger" onclick="deleteSupplier(\''+s.id+'\')">'+icon("trash",16)+'</button>'+
       '</div></td></tr>';
   }).join("");
-  var totalSpent = DB.purchases.reduce(function(a,p){ return a+p.total; },0);
-  var totalItems = DB.purchases.reduce(function(a,p){ return a+p.items.reduce(function(x,it){ return x+it.qty; },0); },0);
+  var totalSpent = DB.purchases.reduce(function(a,p){ return a+(p.total||0); },0);
+  var totalItems = DB.purchases.reduce(function(a,p){ return a+(p.items||[]).reduce(function(x,it){ return x+it.qty; },0); },0);
+  var totalPaid = DB.purchases.reduce(function(a,p){ return a+(p.paid||0); },0);
+  var totalDue = DB.suppliers.reduce(function(a,s){ return a+Math.max(0,supplierBalance(s.id)); },0);
+
   var purRows = DB.purchases.slice().sort(function(a,b){ return b.date-a.date; }).map(function(p){
-    return '<tr><td class="bold">'+esc(p.number)+'</td><td>'+dateStr(p.date)+'</td><td>'+esc(p.supplierName)+'</td>'+
-      '<td>'+p.items.reduce(function(a,it){ return a+it.qty; },0)+'</td>'+
+    return '<tr><td class="bold">'+esc(p.number)+(p.type==="financial"?'<div class="small muted">فاتورة مالية</div>':'')+'</td>'+
+      '<td>'+esc(p.supplierName)+'</td><td>'+dateStr(p.date)+'</td>'+
       '<td class="bold">'+fmt(p.total)+'</td>'+
+      '<td>'+(p.paid!=null?fmt(p.paid):'—')+'</td>'+
+      '<td>'+(p.remaining!=null?fmt(p.remaining):'—')+'</td>'+
+      '<td>'+purchasePayBadge(p)+'</td>'+
+      '<td>'+(p.paymentMethod?payMethodLabel(p.paymentMethod):'—')+'</td>'+
       '<td><div class="row" style="gap:2px;">'+
-        '<button class="icon-btn primary" onclick="viewPurchase(\''+p.id+'\')">'+icon("eye",16)+'</button>'+
-        '<button class="icon-btn danger" onclick="deletePurchase(\''+p.id+'\')">'+icon("trash",16)+'</button>'+
+        '<button class="icon-btn primary" title="عرض التفاصيل" onclick="viewPurchase(\''+p.id+'\')">'+icon("eye",16)+'</button>'+
+        (p.remaining>0 ? '<button class="icon-btn" title="إضافة دفعة" onclick="openPurchasePayment(\''+p.id+'\')">'+icon("banknote",16)+'</button>' : '')+
+        '<button class="icon-btn" title="تعديل" onclick="openPurchaseEdit(\''+p.id+'\')">'+icon("edit",16)+'</button>'+
+        '<button class="icon-btn danger" title="حذف" onclick="deletePurchase(\''+p.id+'\')">'+icon("trash",16)+'</button>'+
       '</div></td></tr>';
   }).join("");
+
+  var payRows = (DB.purchasePayments||[]).slice().sort(function(a,b){ return b.date-a.date; }).map(function(pp){
+    var pur = DB.purchases.find(function(x){ return x.id===pp.purchaseId; });
+    return '<tr><td class="small muted" dir="ltr">'+esc(pp.id)+'</td>'+
+      '<td class="bold">'+esc(pur?pur.number:"—")+'</td>'+
+      '<td>'+esc(pp.supplierName||"—")+'</td>'+
+      '<td>'+dateStr(pp.date)+' '+timeStr(pp.date)+'</td>'+
+      '<td class="bold">'+fmt(pp.amount)+'</td>'+
+      '<td>'+payMethodLabel(pp.paymentMethod)+'</td>'+
+      '<td>'+esc(pp.notes||"—")+'</td>'+
+      '<td>'+esc(userById(pp.userId)?userById(pp.userId).name:"—")+'</td></tr>';
+  }).join("");
+
+  var tabs = '<div class="row mb16" style="gap:8px;">'+
+    '<button class="btn '+(purchasesTab==="invoices"?"btn-primary":"btn-ghost")+'" onclick="setPurchasesTab(\'invoices\')">فواتير المشتريات</button>'+
+    '<button class="btn '+(purchasesTab==="payments"?"btn-primary":"btn-ghost")+'" onclick="setPurchasesTab(\'payments\')">'+icon("banknote",15)+' سجل الدفعات</button>'+
+  '</div>';
+
+  var invoicesSection = '<div class="card"><h3>'+icon("box",17)+' فواتير الشراء ('+DB.purchases.length+')</h3>'+
+    '<div class="table-wrap"><table><thead><tr><th>الفاتورة</th><th>المورد</th><th>التاريخ</th><th>إجمالي الفاتورة</th><th>المدفوع</th><th>المتبقي</th><th>حالة الدفع</th><th>طريقة الدفع</th><th>الإجراءات</th></tr></thead>'+
+    '<tbody>'+(purRows || '<tr><td colspan="9" class="muted" style="text-align:center;padding:24px;">لا توجد فواتير شراء</td></tr>')+'</tbody></table></div></div>';
+
+  var paymentsSection = '<div class="card"><h3>'+icon("banknote",17)+' سجل الدفعات ('+(DB.purchasePayments||[]).length+')</h3>'+
+    '<div class="table-wrap"><table><thead><tr><th>رقم الدفعة</th><th>فاتورة الشراء</th><th>المورد</th><th>التاريخ</th><th>المبلغ</th><th>طريقة الدفع</th><th>ملاحظات</th><th>بواسطة</th></tr></thead>'+
+    '<tbody>'+(payRows || '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px;">لا توجد دفعات مسجّلة</td></tr>')+'</tbody></table></div></div>';
 
   return '<div class="filterbar">'+
     '<button class="btn btn-primary" onclick="openPurchaseForm()">'+icon("plus",16)+' تسجيل فاتورة شراء</button>'+
@@ -2092,13 +2479,13 @@ function viewPurchases(){
     statCard("factory","var(--primary)", fmtInt(DB.suppliers.length), "عدد الموردين")+
     statCard("box","#0ea5e9", fmtInt(totalItems), "قطع تم شراؤها")+
     statCard("cash","var(--green)", fmt(totalSpent), "إجمالي المشتريات ("+DB.settings.currency+")")+
+    statCard("banknote","var(--green)", fmt(totalPaid), "المبالغ المدفوعة")+
+    statCard("scale","var(--red)", fmt(totalDue), "المستحق للموردين")+
   '</div>'+
   '<div class="card mb16"><h3>'+icon("factory",17)+' الموردين</h3>'+
     '<div class="table-wrap"><table><thead><tr><th>المورد</th><th>الهاتف</th><th>فواتير</th><th>المستحق له</th><th></th></tr></thead>'+
     '<tbody>'+(supRows || '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">لا يوجد موردون</td></tr>')+'</tbody></table></div></div>'+
-  '<div class="card"><h3>'+icon("box",17)+' فواتير الشراء ('+DB.purchases.length+')</h3>'+
-    '<div class="table-wrap"><table><thead><tr><th>الفاتورة</th><th>التاريخ</th><th>المورد</th><th>القطع</th><th>الإجمالي</th><th></th></tr></thead>'+
-    '<tbody>'+(purRows || '<tr><td colspan="6" class="muted" style="text-align:center;padding:24px;">لا توجد فواتير شراء</td></tr>')+'</tbody></table></div></div>';
+  tabs + (purchasesTab==="payments" ? paymentsSection : invoicesSection);
 }
 function openSupplierForm(id){
   var s = id ? DB.suppliers.find(function(x){ return x.id===id; }) : null;
@@ -2140,15 +2527,22 @@ function supplierOptionsHTML(){
   return DB.suppliers.map(function(s){ return '<option value="'+s.id+'">'+esc(s.name)+'</option>'; }).join("");
 }
 function openPurchaseForm(){
-  purchaseDraft = {supplierId: DB.suppliers.length ? DB.suppliers[0].id : null, date: todayKey(), items:[blankPurchaseLine()]};
-  openModal(purchaseModalHTML());
+  purchaseDraft = {
+    type: "goods", supplierId: DB.suppliers.length ? DB.suppliers[0].id : null, date: todayKey(), items:[blankPurchaseLine()],
+    number: "", total: "", paid: "", paymentMethod: "cash", notes: ""
+  };
+  openModal(purchaseModalHTML(), true);
   refreshPurTotal();
 }
+function setPurchaseType(t){ purchaseDraft.type = t; var m = $("#modal"); if(m) m.innerHTML = purchaseModalHTML(); refreshPurTotal(); }
 function purchaseModalHTML(){
   var supOpts = DB.suppliers.map(function(s){ return '<option value="'+s.id+'" '+(purchaseDraft.supplierId===s.id?"selected":"")+'>'+esc(s.name)+'</option>'; }).join("");
-  return '<div class="modal-head"><h3>'+icon("truck",18)+' فاتورة شراء جديدة</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
-  '<div class="modal-body">'+
-    '<div class="form-grid">'+
+  var typeToggle = '<div class="row mb16" style="gap:8px;">'+
+    '<span class="muted small" style="align-self:center;">نوع الفاتورة:</span>'+
+    '<button class="btn '+(purchaseDraft.type==="goods"?"btn-primary":"btn-ghost")+'" onclick="setPurchaseType(\'goods\')">فاتورة بضاعة</button>'+
+    '<button class="btn '+(purchaseDraft.type==="financial"?"btn-primary":"btn-ghost")+'" onclick="setPurchaseType(\'financial\')">فاتورة مالية</button>'+
+  '</div>';
+  var supplierBlock = '<div class="form-grid">'+
       '<div class="field"><label>المورد *</label><select id="pur-supplier" onchange="purchaseDraft.supplierId=this.value">'+supOpts+'</select></div>'+
       '<div class="field"><label>التاريخ</label><input id="pur-date" type="date" value="'+esc(purchaseDraft.date||todayKey())+'" onchange="purchaseDraft.date=this.value"></div>'+
     '</div>'+
@@ -2156,16 +2550,42 @@ function purchaseModalHTML(){
     '<div class="row mt8">'+
       '<input id="pur-new-supplier" placeholder="أو أضف مورداً جديداً بالاسم..." style="flex:1;padding:9px 12px;border:1px solid var(--border);border-radius:10px;">'+
       '<button class="btn btn-ghost" onclick="quickAddSupplier()">'+icon("plus",15)+' إضافة سريعة</button>'+
-    '</div>'+
-    '<div class="row mt16 mb8"><span class="bold grow">الأصناف المشتراة</span><button class="btn btn-soft btn-sm" onclick="addPurLine()">'+icon("plus",14)+' سطر</button></div>'+
-    '<div id="pur-lines">'+purchaseLinesHTML()+'</div>'+
-    '<div class="row mt16" style="justify-content:flex-end;">'+
-      '<span class="muted">الإجمالي: </span><b style="font-size:16px;" id="pur-total"></b>'+
-    '</div>'+
-  '</div>'+
-  '<div class="modal-foot">'+
-    '<button class="btn btn-green btn-block" onclick="savePurchase()">'+icon("check",16)+' حفظ وزيادة المخزون</button>'+
-  '</div>';
+    '</div>';
+
+  var body, foot;
+  if(purchaseDraft.type === "financial"){
+    body = '<div class="modal-body">'+typeToggle+supplierBlock+
+      '<div class="form-grid mt16">'+
+        '<div class="field"><label>رقم الفاتورة</label><input id="pur-fin-number" value="'+esc(purchaseDraft.number||"")+'" placeholder="رقم فاتورة المورد" onchange="purchaseDraft.number=this.value"></div>'+
+        '<div class="field"><label>إجمالي الفاتورة *</label><input id="pur-fin-total" type="number" min="0" step="0.5" value="'+esc(purchaseDraft.total)+'" oninput="onPurFinTotal(this.value)"></div>'+
+        '<div class="field"><label>المدفوع</label><input id="pur-fin-paid" type="number" min="0" step="0.5" value="'+esc(purchaseDraft.paid)+'" oninput="onPurFinPaid(this.value)"></div>'+
+        '<div class="field"><label>طريقة الدفع</label><select id="pur-fin-method" onchange="purchaseDraft.paymentMethod=this.value">'+
+          '<option value="cash" '+(purchaseDraft.paymentMethod==="cash"?"selected":"")+'>نقدي</option>'+
+          '<option value="card" '+(purchaseDraft.paymentMethod==="card"?"selected":"")+'>كارت</option>'+
+          '<option value="wallet" '+(purchaseDraft.paymentMethod==="wallet"?"selected":"")+'>محفظة</option>'+
+        '</select></div>'+
+        '<div class="field full"><label>الملاحظات/التفاصيل</label><textarea id="pur-fin-notes" onchange="purchaseDraft.notes=this.value">'+esc(purchaseDraft.notes||"")+'</textarea></div>'+
+      '</div>'+
+      '<div class="row mt16" style="justify-content:flex-end;"><span class="muted">المتبقي: </span><b style="font-size:16px;" id="pur-fin-remaining">'+fmt(Math.max(0,(num(purchaseDraft.total)-num(purchaseDraft.paid))))+' '+esc(DB.settings.currency)+'</b></div>'+
+    '</div>';
+    foot = '<div class="modal-foot"><button class="btn btn-green btn-block" onclick="savePurchase()">'+icon("check",16)+' حفظ الفاتورة المالية</button></div>';
+  } else {
+    body = '<div class="modal-body">'+typeToggle+supplierBlock+
+      '<div class="row mt16 mb8"><span class="bold grow">الأصناف المشتراة</span><button class="btn btn-soft btn-sm" onclick="addPurLine()">'+icon("plus",14)+' سطر</button></div>'+
+      '<div id="pur-lines">'+purchaseLinesHTML()+'</div>'+
+      '<div class="row mt16" style="justify-content:flex-end;">'+
+        '<span class="muted">الإجمالي: </span><b style="font-size:16px;" id="pur-total"></b>'+
+      '</div>'+
+    '</div>';
+    foot = '<div class="modal-foot"><button class="btn btn-green btn-block" onclick="savePurchase()">'+icon("check",16)+' حفظ وزيادة المخزون</button></div>';
+  }
+  return '<div class="modal-head"><h3>'+icon("truck",18)+' فاتورة شراء جديدة</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>' + body + foot;
+}
+function onPurFinTotal(v){ purchaseDraft.total = v; refreshPurFinRemaining(); }
+function onPurFinPaid(v){ purchaseDraft.paid = v; refreshPurFinRemaining(); }
+function refreshPurFinRemaining(){
+  var el = $("#pur-fin-remaining");
+  if(el) el.textContent = fmt(Math.max(0, num(purchaseDraft.total)-num(purchaseDraft.paid))) + " " + DB.settings.currency;
 }
 function purchaseLinesHTML(){
   if(!DB.products.length){ return '<p class="muted small">لا توجد منتجات — أضف منتجات أولاً.</p>'; }
@@ -2218,42 +2638,158 @@ function quickAddSupplier(){
 async function savePurchase(){
   var supId = purchaseDraft.supplierId;
   if(!supId){ toast("اختر مورداً","err"); return; }
+  var sup = DB.suppliers.find(function(s){ return s.id===supId; });
+
+  if(purchaseDraft.type === "financial"){
+    var total = num(purchaseDraft.total);
+    var paid = num(purchaseDraft.paid);
+    if(total <= 0){ toast("أدخل إجمالي فاتورة صحيح","err"); return; }
+    if(paid < 0){ toast("المبلغ المدفوع لا يمكن أن يكون سالباً","err"); return; }
+    if(paid > total){ toast("المبلغ المدفوع لا يمكن أن يتجاوز إجمالي الفاتورة","err"); return; }
+    var purchase = {
+      id: uid(), type:"financial", supplierId: supId, supplierName: sup.name,
+      number: (purchaseDraft.number||"").trim(), total: total, paid: paid,
+      paymentMethod: purchaseDraft.paymentMethod, notes: (purchaseDraft.notes||"").trim()
+    };
+    try{
+      var r = await api("POST", "/api/purchase", { purchase: purchase });
+      afterSync(r);
+      closeModal(); renderViewInPlace(); toast("تم تسجيل الفاتورة المالية");
+    }catch(e){ toast(e.message, "err"); }
+    return;
+  }
+
   var lines = purchaseDraft.items.filter(function(it){ return it.productId && it.qty > 0; });
   if(!lines.length){ toast("أضف صنفاً واحداً على الأقل","err"); return; }
-  var sup = DB.suppliers.find(function(s){ return s.id===supId; });
-  var total = lines.reduce(function(a,it){ return a + it.qty*it.cost; },0);
+  var total2 = lines.reduce(function(a,it){ return a + it.qty*it.cost; },0);
   var items = lines.map(function(it){
     var p = DB.products.find(function(x){ return x.id===it.productId; });
     var v = p && (p.variants||[]).find(function(x){ return x.id===it.variantId; });
     return {productId:it.productId, variantId:it.variantId, name:p?p.name:"", size:v?v.size:null, color:v?v.color:null, qty:it.qty, cost:it.cost};
   });
   var increments = lines.map(function(it){ return { productId: it.productId, variantId: it.variantId, qty: it.qty, cost: it.cost }; });
-  var purchase = { id: uid(), supplierId: supId, supplierName: sup.name, items: items, total: total };
-  var r = await api("POST", "/api/purchase", { purchase: purchase, increments: increments });
-  afterSync(r);
+  var purchaseGoods = { id: uid(), type:"goods", supplierId: supId, supplierName: sup.name, items: items, total: total2 };
+  var r2 = await api("POST", "/api/purchase", { purchase: purchaseGoods, increments: increments });
+  afterSync(r2);
   closeModal(); renderViewInPlace(); toast("تم تسجيل الفاتورة وزيادة المخزون");
 }
 function viewPurchase(id){
   var p = DB.purchases.find(function(x){ return x.id===id; });
   if(!p) return;
-  var rows = p.items.map(function(it){
-    var opt = [it.size, it.color].filter(Boolean).join(" / ");
-    return '<tr><td class="bold">'+esc(it.name)+(opt?'<div class="small muted">'+esc(opt)+'</div>':'')+'</td>'+
-      '<td>'+it.qty+'</td><td>'+fmt(it.cost)+'</td><td class="bold">'+fmt(it.qty*it.cost)+'</td></tr>';
+  var isFinancial = p.type === "financial";
+  var itemsHTML;
+  if(isFinancial || !(p.items||[]).length){
+    itemsHTML = '<p class="muted small">فاتورة مالية — لا توجد أصناف أو تأثير على المخزون.</p>';
+  } else {
+    var rows = p.items.map(function(it){
+      var opt = [it.size, it.color].filter(Boolean).join(" / ");
+      return '<tr><td class="bold">'+esc(it.name)+(opt?'<div class="small muted">'+esc(opt)+'</div>':'')+'</td>'+
+        '<td>'+it.qty+'</td><td>'+fmt(it.cost)+'</td><td class="bold">'+fmt(it.qty*it.cost)+'</td></tr>';
+    }).join("");
+    itemsHTML = '<div class="table-wrap"><table><thead><tr><th>الصنف</th><th>الكمية</th><th>التكلفة</th><th>الإجمالي</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+  }
+  var pays = (DB.purchasePayments||[]).filter(function(pp){ return pp.purchaseId===id; }).sort(function(a,b){ return b.date-a.date; });
+  var payRows = pays.map(function(pp){
+    return '<tr><td>'+dateStr(pp.date)+' '+timeStr(pp.date)+'</td><td class="bold">'+fmt(pp.amount)+'</td><td>'+payMethodLabel(pp.paymentMethod)+'</td><td>'+esc(pp.notes||"—")+'</td></tr>';
   }).join("");
   openModal(
-    '<div class="modal-head"><h3>'+icon("truck",18)+' فاتورة '+esc(p.number)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-head"><h3>'+icon("truck",18)+' فاتورة '+esc(p.number)+(isFinancial?' <span class="badge badge-blue">مالية</span>':'')+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
     '<div class="modal-body">'+
       '<p class="mb8"><span class="muted">المورد: </span><b>'+esc(p.supplierName)+'</b> — <span class="muted">التاريخ: </span><b>'+dateStr(p.date)+'</b></p>'+
-      '<div class="table-wrap"><table><thead><tr><th>الصنف</th><th>الكمية</th><th>التكلفة</th><th>الإجمالي</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
-      '<div class="tot-row grand mt16"><span>الإجمالي</span><span>'+fmt(p.total)+' '+esc(DB.settings.currency)+'</span></div>'+
+      itemsHTML+
+      '<div class="card mt16" style="background:#f8fafc;padding:12px;">'+
+        '<div class="ttl"><span>الإجمالي</span><span class="bold">'+fmt(p.total)+' '+esc(DB.settings.currency)+'</span></div>'+
+        (p.paid!=null ? '<div class="ttl"><span>المدفوع</span><span class="bold">'+fmt(p.paid)+'</span></div>' : '')+
+        (p.remaining!=null ? '<div class="ttl"><span>المتبقي</span><span class="bold">'+fmt(p.remaining)+'</span></div>' : '')+
+        (p.paymentStatus ? '<div class="ttl"><span>حالة الدفع</span><span>'+purchasePayBadge(p)+'</span></div>' : '')+
+        (p.paymentMethod ? '<div class="ttl"><span>طريقة الدفع</span><span>'+payMethodLabel(p.paymentMethod)+'</span></div>' : '')+
+        (p.notes ? '<div class="ttl"><span>الملاحظات</span><span>'+esc(p.notes)+'</span></div>' : '')+
+      '</div>'+
+      (pays.length ? '<div class="mt16"><span class="bold small">سجل الدفعات على هذه الفاتورة</span>'+
+        '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>المبلغ</th><th>الطريقة</th><th>ملاحظات</th></tr></thead><tbody>'+payRows+'</tbody></table></div></div>' : '')+
+    '</div>'+
+    '<div class="modal-foot">'+
+      (p.remaining>0 ? '<button class="btn btn-primary" onclick="closeModal();openPurchasePayment(\''+p.id+'\')">'+icon("banknote",16)+' إضافة دفعة</button>' : '')+
+      '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
+    '</div>'
+  , true);
+}
+function openPurchasePayment(id){
+  var p = DB.purchases.find(function(x){ return x.id===id; });
+  if(!p) return;
+  var remaining = p.remaining!=null ? p.remaining : Math.max(0, (p.total||0) - (p.paid||0));
+  openModal(
+    '<div class="modal-head"><h3>'+icon("banknote",18)+' إضافة دفعة — فاتورة '+esc(p.number)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="tot-row mb8"><span>المتبقي على الفاتورة</span><b style="color:var(--red);">'+fmt(remaining)+' '+esc(DB.settings.currency)+'</b></div>'+
+      '<div class="field"><label>المبلغ *</label><input id="purpay-amount" type="number" min="0" step="0.5" value="'+remaining.toFixed(2)+'"></div>'+
+      '<div class="field"><label>طريقة الدفع</label><select id="purpay-method"><option value="cash">نقدي</option><option value="card">كارت</option><option value="wallet">محفظة</option></select></div>'+
+      '<div class="field"><label>ملاحظات</label><input id="purpay-note" placeholder="اختياري"></div>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="savePurchasePaymentForInvoice(\''+id+'\')">'+icon("check",16)+' تسجيل الدفعة</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
     '</div>'
   );
+}
+function savePurchasePaymentForInvoice(id){
+  var amount = num($("#purpay-amount").value);
+  if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
+  api("POST", "/api/purchase/" + id + "/payment", { amount: amount, paymentMethod: $("#purpay-method").value, notes: $("#purpay-note").value.trim() }).then(function(r){
+    afterSync(r);
+    closeModal(); renderViewInPlace(); toast("تم تسجيل الدفعة");
+  }).catch(function(e){ toast(e.message, "err"); });
+}
+function openPurchaseEdit(id){
+  var p = DB.purchases.find(function(x){ return x.id===id; });
+  if(!p) return;
+  var supOpts = DB.suppliers.map(function(s){ return '<option value="'+s.id+'" '+(p.supplierId===s.id?"selected":"")+'>'+esc(s.name)+'</option>'; }).join("");
+  openModal(
+    '<div class="modal-head"><h3>'+icon("edit",18)+' تعديل فاتورة '+esc(p.number)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="form-grid">'+
+        '<div class="field"><label>المورد *</label><select id="pured-supplier">'+supOpts+'</select></div>'+
+        '<div class="field"><label>التاريخ</label><input id="pured-date" type="date" value="'+esc(dayKey(p.date))+'"></div>'+
+        '<div class="field"><label>رقم الفاتورة</label><input id="pured-number" value="'+esc(p.number||"")+'"></div>'+
+        '<div class="field"><label>طريقة الدفع</label><select id="pured-method">'+
+          '<option value="cash" '+(p.paymentMethod==="cash"?"selected":"")+'>نقدي</option>'+
+          '<option value="card" '+(p.paymentMethod==="card"?"selected":"")+'>كارت</option>'+
+          '<option value="wallet" '+(p.paymentMethod==="wallet"?"selected":"")+'>محفظة</option>'+
+        '</select></div>'+
+        (p.type==="financial" ? '<div class="field"><label>إجمالي الفاتورة *</label><input id="pured-total" type="number" min="0" step="0.5" value="'+p.total+'"></div>' : '')+
+        '<div class="field full"><label>الملاحظات</label><textarea id="pured-notes">'+esc(p.notes||"")+'</textarea></div>'+
+      '</div>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="savePurchaseEditForm(\''+id+'\')">حفظ</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+    '</div>'
+  );
+}
+function savePurchaseEditForm(id){
+  var p = DB.purchases.find(function(x){ return x.id===id; });
+  if(!p) return;
+  var supId = $("#pured-supplier").value;
+  var sup = DB.suppliers.find(function(s){ return s.id===supId; });
+  var payload = {
+    supplierId: supId, supplierName: sup?sup.name:"", date: new Date($("#pured-date").value+"T12:00:00").getTime(),
+    number: $("#pured-number").value.trim(), paymentMethod: $("#pured-method").value, notes: $("#pured-notes").value.trim()
+  };
+  if(p.type==="financial"){
+    var total = num($("#pured-total").value);
+    if(total <= 0){ toast("إجمالي الفاتورة يجب أن يكون أكبر من صفر","err"); return; }
+    payload.total = total;
+  }
+  api("POST", "/api/purchase/" + id + "/edit", payload).then(function(r){
+    afterSync(r);
+    closeModal(); renderViewInPlace(); toast("تم تعديل الفاتورة");
+  }).catch(function(e){ toast(e.message, "err"); });
 }
 function deletePurchase(id){
   var p = DB.purchases.find(function(x){ return x.id===id; });
   if(!p) return;
-  confirmBox("حذف فاتورة الشراء "+p.number+"؟ سيتم خصم الكميات من المخزون.", function(){
+  var msg = "حذف فاتورة الشراء "+p.number+"؟" + (p.type==="financial" ? "" : " سيتم خصم الكميات من المخزون.");
+  confirmBox(msg, function(){
     api("POST", "/api/purchase/" + id + "/delete").then(function(r){ afterSync(r); renderViewInPlace(); toast("تم حذف الفاتورة"); }).catch(function(e){ toast(e.message, "err"); });
   }, true);
 }
@@ -3023,6 +3559,7 @@ function viewCash(){
         mvRow("تحويلات واردة إليه", mv.transfersIn, "var(--green)")+
         mvRow("مصاريف نقدي دفعها", -mv.expenses, "var(--red)")+
         mvRow("مدفوعات للموردين", -mv.supplierPay, "var(--red)")+
+        mvRow("مبالغ استرجاع/استبدال نقدي", -mv.refunds, "var(--red)")+
         mvRow("تحويلات صادرة منه", -mv.transfersOut, "var(--red)")+
         '<div class="tot-row grand" style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px;"><span>الصافي</span><span>'+fmt(mv.net)+' '+esc(DB.settings.currency)+'</span></div>'+
       '</div>'+
@@ -3329,6 +3866,7 @@ function openUserForm(id){
         '<option value="cashier" '+(!u||u.role==="cashier"?"selected":"")+'>كاشير (بيع فقط)</option>'+
         '<option value="admin" '+(u&&u.role==="admin"?"selected":"")+'>مدير (صلاحية كاملة)</option>'+
       '</select></div>'+
+      '<div class="field full"><label class="row" style="gap:8px;align-items:center;"><input type="checkbox" id="u-return-perm" style="width:auto;" '+((!u || u.canManageReturns!==false)?"checked":"")+'> صلاحية إدارة الاسترجاع والاستبدال</label></div>'+
     '</div>'+
     '<div class="modal-foot">'+
       '<button class="btn btn-primary" onclick="saveUser(\''+(u?u.id:"")+'\')">حفظ</button>'+
@@ -3343,7 +3881,7 @@ function saveUser(id){
   if(!name || !username || !password){ toast("أكمل كل الحقول","err"); return; }
   var dup = DB.users.find(function(x){ return x.username===username && x.id!==id; });
   if(dup){ toast("اسم المستخدم مستخدم بالفعل","err"); return; }
-  var data = {name:name, username:username, password:password, role:$("#u-role").value};
+  var data = {name:name, username:username, password:password, role:$("#u-role").value, canManageReturns: $("#u-return-perm").checked};
   var item = id ? Object.assign({}, DB.users.find(function(x){ return x.id===id; }), data) : Object.assign({id:uid()}, data);
   api("POST", "/api/users", { item: item }).then(function(r){
     afterSync(r);

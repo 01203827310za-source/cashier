@@ -8,11 +8,12 @@ datasource db {
 }
 
 model User {
-  id       String  @id
-  name     String?
-  username String  @unique
-  password String
-  role     String?
+  id               String  @id
+  name             String?
+  username         String  @unique
+  password         String
+  role             String?
+  canManageReturns Boolean?
 }
 
 model Category {
@@ -70,8 +71,15 @@ model Purchase {
   supplierId String?
   supplierName String?
   total      Float?
+  type       String?  // "goods" | "financial" — financial invoices carry no items and never touch stock
+  paid       Float?
+  remaining  Float?
+  paymentStatus String? // "paid" | "partial" | "unpaid"
+  paymentMethod String?
+  notes      String?
   data       Json?
   items      PurchaseItem[]
+  payments   PurchasePayment[]
 }
 
 model PurchaseItem {
@@ -85,14 +93,33 @@ model PurchaseItem {
   purchase   Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
 }
 
+// دفعة على فاتورة شراء محددة (بضاعة أو مالية) — منفصلة عن PaymentOut اللي هي
+// دفعة إجمالية للمورد مش مربوطة بفاتورة بعينها. لا يوجد onDelete:Cascade هنا
+// عمداً حتى لا يُحذف مرجع الفاتورة الأصلية وتحتها دفعات مسجّلة (نفس مبدأ
+// SaleReturn → Sale).
+model PurchasePayment {
+  id           String @id
+  purchaseId   String
+  supplierId   String?
+  supplierName String?
+  date         DateTime?
+  amount       Float?
+  paymentMethod String?
+  notes        String?
+  userId       String?
+  data         Json?
+  purchase     Purchase @relation(fields: [purchaseId], references: [id])
+}
+
 model Sale {
-  id     String @id
-  number String?
-  date   DateTime?
-  userId String?
-  total  Float?
-  data   Json?
-  items  SaleItem[]
+  id      String @id
+  number  String?
+  date    DateTime?
+  userId  String?
+  total   Float?
+  data    Json?
+  items   SaleItem[]
+  returns SaleReturn[]
 }
 
 model SaleItem {
@@ -106,6 +133,50 @@ model SaleItem {
   color   String?
   data    Json?
   sale    Sale @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  returnItems SaleReturnItem[]
+}
+
+// معاملة استرجاع أو استبدال — دايمًا مرتبطة بفاتورة بيع أصلية، والفاتورة الأصلية
+// لا تُحذف ولا تُعدَّل أبدًا. راجع server.js: POST /api/returns
+model SaleReturn {
+  id               String   @id
+  number           String?
+  type             String?  // "return" | "exchange"
+  saleId           String
+  customerId       String?
+  userId           String?
+  date             DateTime?
+  reason           String?
+  status           String?
+  refundMethod     String?  // "cash" | "credit"
+  returnedTotal    Float?
+  replacementTotal Float?
+  difference       Float?
+  data             Json?
+  sale             Sale @relation(fields: [saleId], references: [id])
+  items            SaleReturnItem[]
+}
+
+model SaleReturnItem {
+  id                   String @id
+  saleReturnId         String
+  saleItemId           String
+  productId            String?
+  variantId            String?
+  modelCode            String?
+  size                 String?
+  color                String?
+  qty                  Int?
+  unitPrice            Float?
+  lineTotal            Float?
+  condition            String?
+  replacementProductId String?
+  replacementVariantId String?
+  replacementQty       Int?
+  replacementPrice     Float?
+  data                 Json?
+  saleReturn           SaleReturn @relation(fields: [saleReturnId], references: [id], onDelete: Cascade)
+  saleItem             SaleItem @relation(fields: [saleItemId], references: [id])
 }
 
 model ShippingCompany {
@@ -222,6 +293,7 @@ model Setting {
   invoiceCounter Int?
   purchaseCounter Int?
   orderCounter Int?
+  returnCounter Int?
   receiptFooter String?
   phone        String?
   data         Json?

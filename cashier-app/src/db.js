@@ -73,7 +73,14 @@ async function buildStateFromDB(){
     ...(pu.data || {}),
     id: pu.id, number: pu.number, date: pu.date ? pu.date.getTime() : null, userId: pu.userId,
     supplierId: pu.supplierId, supplierName: pu.supplierName, total: pu.total,
+    type: pu.type || "goods", paid: pu.paid, remaining: pu.remaining, paymentStatus: pu.paymentStatus,
+    paymentMethod: pu.paymentMethod, notes: pu.notes,
     items: (pu.items || []).map(it => ({ ...(it.data || {}), id: it.id, productId: it.productId, variantId: it.variantId, qty: it.qty, cost: it.cost }))
+  }));
+
+  state.purchasePayments = (await prisma.purchasePayment.findMany()).map(p => ({
+    ...(p.data || {}), id: p.id, purchaseId: p.purchaseId, supplierId: p.supplierId, supplierName: p.supplierName,
+    date: p.date ? p.date.getTime() : null, amount: p.amount, paymentMethod: p.paymentMethod, notes: p.notes, userId: p.userId
   }));
 
   const sales = await prisma.sale.findMany({ include: { items: true } });
@@ -95,6 +102,20 @@ async function buildStateFromDB(){
     items: (o.items || []).map(it => ({ ...(it.data || {}), id: it.id, productId: it.productId, variantId: it.variantId, qty: it.qty, price: it.price }))
   }));
 
+  const returns = await prisma.saleReturn.findMany({ include: { items: true } });
+  state.returns = returns.map(r => ({
+    ...(r.data || {}),
+    id: r.id, number: r.number, type: r.type, saleId: r.saleId, customerId: r.customerId, userId: r.userId,
+    date: r.date ? r.date.getTime() : null, reason: r.reason, status: r.status, refundMethod: r.refundMethod,
+    returnedTotal: r.returnedTotal, replacementTotal: r.replacementTotal, difference: r.difference,
+    items: (r.items || []).map(it => ({
+      ...(it.data || {}), id: it.id, saleItemId: it.saleItemId, productId: it.productId, variantId: it.variantId,
+      modelCode: it.modelCode, size: it.size, color: it.color, qty: it.qty, unitPrice: it.unitPrice, lineTotal: it.lineTotal,
+      condition: it.condition, replacementProductId: it.replacementProductId, replacementVariantId: it.replacementVariantId,
+      replacementQty: it.replacementQty, replacementPrice: it.replacementPrice
+    }))
+  }));
+
   const expCats = await prisma.expenseCategory.findMany();
   state.expenseCategories = expCats.map(e => e.name);
 
@@ -107,7 +128,7 @@ async function buildStateFromDB(){
   state.audit = (await prisma.auditLog.findMany({ orderBy: { date: 'asc' } })).map(a => ({ id: a.id, date: a.date ? a.date.getTime() : null, userId: a.userId, userName: a.userName, action: a.action, detail: a.detail }));
 
   // Ensure arrays exist for compatibility
-  ["users", "categories", "products", "customers", "suppliers", "purchases", "audit", "sales",
+  ["users", "categories", "products", "customers", "suppliers", "purchases", "purchasePayments", "audit", "sales", "returns",
    "shippingCompanies", "shipPrices", "orders", "expenseCategories", "expenses", "otherIncome",
    "paymentsIn", "paymentsOut", "cashClosings", "transfers"].forEach(function (k) { if (!state[k]) state[k] = []; });
 
@@ -131,6 +152,12 @@ async function replaceStateInDB(raw){
     let count = 0;
 
     // Wipe everything. Product/Sale/Purchase/Order cascade-delete their item rows.
+    // SaleReturn must go first — it references Sale without a cascade delete
+    // (returns are never allowed to silently vanish just because someone wipes
+    // the sale, so this is the one relation that isn't onDelete:Cascade).
+    // PurchasePayment must go before Purchase for the same reason.
+    await tx.saleReturn.deleteMany({});
+    await tx.purchasePayment.deleteMany({});
     await tx.product.deleteMany({});
     await tx.sale.deleteMany({});
     await tx.purchase.deleteMany({});
@@ -157,14 +184,15 @@ async function replaceStateInDB(raw){
         id: 'main', storeName: settings.storeName || null, currency: settings.currency || null, taxRate: settings.taxRate != null ? settings.taxRate : null,
         lowStockThreshold: settings.lowStockThreshold != null ? settings.lowStockThreshold : null, invoicePrefix: settings.invoicePrefix || null,
         invoiceCounter: settings.invoiceCounter != null ? settings.invoiceCounter : null, purchaseCounter: settings.purchaseCounter != null ? settings.purchaseCounter : null,
-        orderCounter: settings.orderCounter != null ? settings.orderCounter : null, receiptFooter: settings.receiptFooter || null, phone: settings.phone || null,
+        orderCounter: settings.orderCounter != null ? settings.orderCounter : null, returnCounter: settings.returnCounter != null ? settings.returnCounter : null,
+        receiptFooter: settings.receiptFooter || null, phone: settings.phone || null,
         data: settings
       }
     });
     count++;
 
     for (const u of (raw.users || [])) {
-      await tx.user.create({ data: { id: u.id, name: u.name || null, username: u.username, password: u.password, role: u.role || null } });
+      await tx.user.create({ data: { id: u.id, name: u.name || null, username: u.username, password: u.password, role: u.role || null, canManageReturns: u.canManageReturns === false ? false : true } });
       count++;
     }
     for (const name of (raw.categories || [])) {
@@ -199,11 +227,23 @@ async function replaceStateInDB(raw){
       await tx.purchase.create({
         data: {
           id: pu.id, number: pu.number || null, date: pu.date ? new Date(pu.date) : null, userId: pu.userId || null,
-          supplierId: pu.supplierId || null, supplierName: pu.supplierName || null, total: pu.total != null ? pu.total : null, data: pu,
+          supplierId: pu.supplierId || null, supplierName: pu.supplierName || null, total: pu.total != null ? pu.total : null,
+          type: pu.type || "goods", paid: pu.paid != null ? pu.paid : null, remaining: pu.remaining != null ? pu.remaining : null,
+          paymentStatus: pu.paymentStatus || null, paymentMethod: pu.paymentMethod || null, notes: pu.notes || null, data: pu,
           items: { create: (pu.items || []).map(it => ({ id: it.id || uid(), productId: it.productId || null, variantId: it.variantId || null, qty: it.qty != null ? it.qty : null, cost: it.cost != null ? it.cost : null, data: it })) }
         }
       });
       count += 1 + (pu.items || []).length;
+    }
+    for (const pp of (raw.purchasePayments || [])) {
+      await tx.purchasePayment.create({
+        data: {
+          id: pp.id || uid(), purchaseId: pp.purchaseId, supplierId: pp.supplierId || null, supplierName: pp.supplierName || null,
+          date: pp.date ? new Date(pp.date) : null, amount: pp.amount != null ? pp.amount : null, paymentMethod: pp.paymentMethod || null,
+          notes: pp.notes || null, userId: pp.userId || null, data: pp
+        }
+      });
+      count++;
     }
     for (const s of (raw.sales || [])) {
       await tx.sale.create({
@@ -213,6 +253,26 @@ async function replaceStateInDB(raw){
         }
       });
       count += 1 + (s.items || []).length;
+    }
+    for (const r of (raw.returns || [])) {
+      await tx.saleReturn.create({
+        data: {
+          id: r.id, number: r.number || null, type: r.type || null, saleId: r.saleId, customerId: r.customerId || null,
+          userId: r.userId || null, date: r.date ? new Date(r.date) : null, reason: r.reason || null, status: r.status || null,
+          refundMethod: r.refundMethod || null, returnedTotal: r.returnedTotal != null ? r.returnedTotal : null,
+          replacementTotal: r.replacementTotal != null ? r.replacementTotal : null, difference: r.difference != null ? r.difference : null,
+          data: r,
+          items: { create: (r.items || []).map(it => ({
+            id: it.id || uid(), saleItemId: it.saleItemId, productId: it.productId || null, variantId: it.variantId || null,
+            modelCode: it.modelCode || null, size: it.size || null, color: it.color || null, qty: it.qty != null ? it.qty : null,
+            unitPrice: it.unitPrice != null ? it.unitPrice : null, lineTotal: it.lineTotal != null ? it.lineTotal : null,
+            condition: it.condition || null, replacementProductId: it.replacementProductId || null, replacementVariantId: it.replacementVariantId || null,
+            replacementQty: it.replacementQty != null ? it.replacementQty : null, replacementPrice: it.replacementPrice != null ? it.replacementPrice : null,
+            data: it
+          })) }
+        }
+      });
+      count += 1 + (r.items || []).length;
     }
     for (const sc of (raw.shippingCompanies || [])) {
       await tx.shippingCompany.create({ data: { id: sc.id, name: sc.name || null, phone: sc.phone || null, notes: sc.notes || null } });
