@@ -1,7 +1,7 @@
 {
   "name": "clothing-pos",
   "version": "2.0.0",
-  "description": "سيستم كاشير وإدارة متكامل لمحل ملابس مع شحن",
+  "description": " سيستم كاشير وإدارة متكامل لمحل ملابس مع شحن",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
