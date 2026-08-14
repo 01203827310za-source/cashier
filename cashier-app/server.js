@@ -539,7 +539,7 @@ const server = http.createServer(async function(req, res){
         const modelCode = (it.modelCode||"").trim();
         if(!modelCode){ send(res, 400, {ok:false, error:"كود الموديل مطلوب"}); return; }
         it.modelCode = modelCode;
-        const dupe = await prisma.product.findUnique({ where: { modelCode } });
+        const dupe = await prisma.product.findFirst({ where: { modelCode } });
         if(dupe && dupe.id !== it.id){ send(res, 400, {ok:false, error:"كود الموديل \""+modelCode+"\" مستخدم بالفعل لمنتج آخر"}); return; }
       }
       try{
