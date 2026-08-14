@@ -288,7 +288,9 @@ const server = http.createServer(async function(req, res){
   }
 
   /* ---------- عام ---------- */
-  if(method === "GET" && url === "/api/health"){ send(res, 200, {ok:true}); return; }
+  // فحص صحة السيرفر — لازم يرجع 200 فوراً من غير أي استعلام على قاعدة البيانات
+  // (Railway بيعتمد عليه عشان يعرف إن الديبلوي نجح)
+  if(method === "GET" && url === "/api/health"){ send(res, 200, {status:"ok"}); return; }
 
   if(method === "POST" && url === "/api/login"){
     const b = await readBody(req);
@@ -764,9 +766,19 @@ const server = http.createServer(async function(req, res){
  }
 });
 
-(async function(){
-  await db.ensureSeeded(seed());
-  server.listen(PORT, "0.0.0.0", function(){
-    console.log("Server running on port " + PORT + " | Database: PostgreSQL via Prisma");
+server.on("error", function(err){
+  console.error("FATAL: server failed to start listening:", err);
+  process.exit(1);
+});
+
+// السيرفر لازم يفتح البورت فوراً عشان health check بتاع Railway ينجح،
+// من غير ما يستنى قاعدة البيانات. تهيئة قاعدة البيانات بتتم بعد كده في الخلفية —
+// لو فشلت (مثلاً القاعدة لسه مش جاهزة)، السيرفر يفضل شغال ويتسجل الخطأ بوضوح،
+// وأي طلب محتاج قاعدة بيانات هيرجع خطأ مناسب لحد ما الاتصال يتظبط.
+server.listen(PORT, "0.0.0.0", function(){
+  console.log("Server running on port " + PORT + " | Database: PostgreSQL via Prisma");
+
+  db.ensureSeeded(seed()).catch(function(err){
+    console.error("Database initialization failed — server is still running, but DB-dependent requests will error until this is resolved:", err);
   });
-})();
+});
