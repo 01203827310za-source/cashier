@@ -159,6 +159,25 @@ async function restoreOrderStock(tx, orderId){
 // عشان الكاشيرز الموجودين فعلاً في قاعدة بيانات الإنتاج ميتقفلوش فجأة.
 function canManageReturns(u){ return !!u && (u.role === "admin" || u.canManageReturns !== false); }
 function httpError(status, message){ const e = new Error(message); e.httpStatus = status; return e; }
+
+/* ---------- سجل حسابات الشركاء (مؤمن/عبدو) — المصدر الوحيد لحساب الأرصدة ----------
+   referenceType/referenceId يحدّدان الحركة المالية الأصلية بشكل فريد (فاتورة بيع،
+   دفعة شراء بعينها، دفعة تحصيل أوردر بعينها، مصروف، إيراد...). الحذف-ثم-الإنشاء
+   يجعل التعديل (لمصروف/إيراد له نفس id) آمناً بدون تكرار أو قيود قديمة عالقة. */
+async function upsertPartnerLedger(tx, opts){
+  if(!opts.referenceType || !opts.referenceId) return;
+  await tx.partnerTransaction.deleteMany({ where: { referenceType: opts.referenceType, referenceId: opts.referenceId } });
+  if((opts.partner === "moamen" || opts.partner === "abdo") && Number(opts.amount) > 0){
+    await tx.partnerTransaction.create({ data: {
+      id: uid(), partner: opts.partner, type: opts.type, direction: opts.direction, amount: Number(opts.amount),
+      referenceType: opts.referenceType, referenceId: opts.referenceId,
+      date: opts.date ? new Date(opts.date) : new Date(), userId: opts.userId || null, notes: opts.notes || null, data: opts
+    }});
+  }
+}
+async function deletePartnerLedgerFor(tx, referenceType, referenceId){
+  await tx.partnerTransaction.deleteMany({ where: { referenceType, referenceId } });
+}
 async function restockSaleItem(tx, saleItem, qty){
   if(saleItem.variantId){
     await adjustVariantStock(tx, saleItem.variantId, qty);
@@ -232,7 +251,7 @@ const genericModels = {
     logDetail: function(it){ return it.note || it.category; },
     findOne: function(id){ return prisma.expense.findUnique({ where: { id } }); },
     async upsert(tx, it, isNew){
-      const data = { category: it.category || null, amount: it.amount != null ? it.amount : null, date: it.date ? new Date(it.date) : new Date(), note: it.note || null, userId: it.userId || null, data: it };
+      const data = { category: it.category || null, amount: it.amount != null ? it.amount : null, date: it.date ? new Date(it.date) : new Date(), note: it.note || null, userId: it.userId || null, partner: it.partner || null, data: it };
       if(isNew) await tx.expense.create({ data: { id: it.id, ...data } });
       else await tx.expense.update({ where: { id: it.id }, data });
     },
@@ -243,7 +262,7 @@ const genericModels = {
     logDetail: function(it){ return it.note || ""; },
     findOne: function(id){ return prisma.otherIncome.findUnique({ where: { id } }); },
     async upsert(tx, it, isNew){
-      const data = { note: it.note || null, amount: it.amount != null ? it.amount : null, date: it.date ? new Date(it.date) : new Date(), userId: it.userId || null, data: it };
+      const data = { note: it.note || null, amount: it.amount != null ? it.amount : null, date: it.date ? new Date(it.date) : new Date(), userId: it.userId || null, partner: it.partner || null, data: it };
       if(isNew) await tx.otherIncome.create({ data: { id: it.id, ...data } });
       else await tx.otherIncome.update({ where: { id: it.id }, data });
     },
@@ -370,6 +389,9 @@ const server = http.createServer(async function(req, res){
         await adjustVariantStock(tx, d.variantId, -(d.qty||0));
         await recomputeProductStock(tx, d.productId);
       }
+
+      await upsertPartnerLedger(tx, { partner: "moamen", type: "SALE", direction: "in", amount: saleIn.total,
+        referenceType: "sale", referenceId: saleIn.id, date: saleIn.date, userId: user.id, notes: "بيع — " + saleIn.number });
 
       await tx.auditLog.create({ data: auditEntry(req, "بيع", "فاتورة " + saleIn.number + " — " + saleIn.total + " " + (settings.currency||"")) });
     }, { timeout: 30000 });
@@ -502,6 +524,13 @@ const server = http.createServer(async function(req, res){
           items: { create: lineData }
         }});
 
+        await upsertPartnerLedger(tx, { partner: "moamen", type: "RETURN", direction: "out", amount: returnedTotal,
+          referenceType: "return", referenceId: returnId, date: Date.now(), userId: user.id, notes: "استرجاع — " + number });
+        if(type === "exchange" && replacementTotal > 0){
+          await upsertPartnerLedger(tx, { partner: "moamen", type: "EXCHANGE_ADJUSTMENT", direction: "in", amount: replacementTotal,
+            referenceType: "return", referenceId: returnId + "-x", date: Date.now(), userId: user.id, notes: "استبدال (بديل) — " + number });
+        }
+
         await tx.auditLog.create({ data: auditEntry(req, type === "exchange" ? "استبدال" : "استرجاع",
           (sale.number||"") + " — " + number + (type === "exchange" ? (" — الفرق " + difference) : (" — قيمة " + returnedTotal))) });
       }, { timeout: 30000 });
@@ -534,15 +563,32 @@ const server = http.createServer(async function(req, res){
       settings.orderCounter = counter + 1;
       await tx.setting.update({ where: { id: 'main' }, data: { orderCounter: settings.orderCounter, data: settings } });
 
+      const orderTotal = orderIn.total != null ? Number(orderIn.total) : 0;
+      const deposit = Math.max(0, Math.min(orderTotal, Number(orderIn.deposit) || 0));
+      const remaining = Math.max(0, orderTotal - deposit);
+      const collectionStatus = remaining <= 0.004 ? "collected" : "pending";
+      orderIn.deposit = deposit; orderIn.collectedTotal = deposit; orderIn.remaining = remaining; orderIn.collectionStatus = collectionStatus;
+
       await tx.order.create({ data: {
         id: orderIn.id, number: orderIn.number, date: new Date(orderIn.date), userId: orderIn.userId,
-        customerName: orderIn.customerName || null, total: orderIn.total != null ? orderIn.total : null, status: orderIn.status || "new", data: orderIn,
+        customerName: orderIn.customerName || null, total: orderTotal, status: orderIn.status || "new",
+        deposit: deposit, collectedTotal: deposit, remaining: remaining, collectionStatus: collectionStatus, data: orderIn,
         items: { create: (orderIn.items||[]).map(function(it){ return { id: uid(), productId: it.productId||null, variantId: it.variantId||null, qty: it.qty!=null?it.qty:null, price: it.price!=null?it.price:null, data: it }; }) }
       }});
 
       for(const d of decrements){
         await adjustVariantStock(tx, d.variantId, -(d.qty||0));
         await recomputeProductStock(tx, d.productId);
+      }
+
+      if(deposit > 0){
+        const collId = uid();
+        await tx.orderCollection.create({ data: {
+          id: collId, orderId: orderIn.id, kind: "deposit", amount: deposit, date: new Date(orderIn.date),
+          paymentMethod: orderIn.depositMethod || null, partner: "abdo", notes: "عربون عند إنشاء الطلب", userId: user.id, data: {}
+        }});
+        await upsertPartnerLedger(tx, { partner: "abdo", type: "ORDER_DEPOSIT", direction: "in", amount: deposit,
+          referenceType: "orderCollection", referenceId: collId, date: orderIn.date, userId: user.id, notes: "عربون — " + orderIn.number });
       }
 
       await tx.auditLog.create({ data: auditEntry(req, "أوردر جديد", orderIn.number + " — " + orderIn.customerName + " — " + orderIn.total + " " + (settings.currency||"")) });
@@ -590,6 +636,48 @@ const server = http.createServer(async function(req, res){
     });
     return;
   }
+  if(method === "POST" && /^\/api\/order\/[^/]+\/collection$/.test(url)){
+    const id = url.split("/")[3];
+    const b = await readBody(req);
+    const amount = Number(b.amount);
+    const partner = b.partner === "abdo" ? "abdo" : (b.partner === "moamen" ? "moamen" : null);
+    if(!(amount > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
+    if(!partner){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
+    const order = await prisma.order.findUnique({ where: { id } });
+    if(!order){ send(res, 404, {ok:false, error:"الطلب غير موجود"}); return; }
+
+    const collId = uid();
+    try{
+      await prisma.$transaction(async function(tx){
+        const fresh = await tx.order.findUnique({ where: { id } });
+        const total = fresh.total || 0;
+        const currentCollected = fresh.collectedTotal || 0;
+        const newCollected = currentCollected + amount;
+        if(newCollected > total + 0.004) throw httpError(400, "إجمالي المحصَّل ("+newCollected+") يتجاوز إجمالي الفاتورة ("+total+")");
+        const remaining = Math.max(0, total - newCollected);
+        const collectionStatus = remaining <= 0.004 ? "collected" : "pending";
+
+        await tx.order.update({ where: { id }, data: { collectedTotal: newCollected, remaining, collectionStatus } });
+
+        const payDate = Date.now();
+        await tx.orderCollection.create({ data: {
+          id: collId, orderId: id, kind: "collection", amount: amount, date: new Date(payDate),
+          paymentMethod: b.paymentMethod || "cash", partner: partner, notes: (b.notes||"").trim() || null, userId: user.id, data: {}
+        }});
+        await upsertPartnerLedger(tx, { partner, type: "ORDER_COLLECTION", direction: "in", amount,
+          referenceType: "orderCollection", referenceId: collId, date: payDate, userId: user.id, notes: "تحصيل لاحق — " + (fresh.number||"") });
+
+        await tx.auditLog.create({ data: auditEntry(req, "تحصيل دفعة أوردر", (fresh.number||"") + " — " + amount) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
   if(method === "POST" && /^\/api\/order\/[^/]+\/return$/.test(url)){
     const id = url.split("/")[3];
     await orderPatch(id, req, res, function(o){ o.status = "returned"; }, function(o){ return { action: "مرتجع أوردر", detail: o.number }; }, restoreOrderStock);
@@ -612,6 +700,10 @@ const server = http.createServer(async function(req, res){
     if(type === "financial"){
       if(!purchaseIn.supplierId){ send(res, 400, {ok:false, error:"المورد مطلوب"}); return; }
       if(!(Number(purchaseIn.total) > 0)){ send(res, 400, {ok:false, error:"إجمالي الفاتورة يجب أن يكون أكبر من صفر"}); return; }
+    }
+    const requestedInitialPaid = Math.max(0, Number(purchaseIn.paid) || 0);
+    if(requestedInitialPaid > 0 && purchaseIn.partner !== "moamen" && purchaseIn.partner !== "abdo"){
+      send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو) للدفعة المبدئية"}); return;
     }
 
     try{
@@ -637,12 +729,9 @@ const server = http.createServer(async function(req, res){
 
         let items = type === "financial" ? [] : (purchaseIn.items || []);
         let total = purchaseIn.total != null ? Number(purchaseIn.total) : 0;
-        let paid = null, remaining = null, paymentStatus = null;
-        if(type === "financial" || purchaseIn.paid != null){
-          paid = Math.max(0, Math.min(total, Number(purchaseIn.paid) || 0));
-          remaining = total - paid;
-          paymentStatus = (paid >= total && total > 0) ? "paid" : (paid > 0 ? "partial" : "unpaid");
-        }
+        let paid = Math.max(0, Math.min(total, Number(purchaseIn.paid) || 0));
+        let remaining = total - paid;
+        let paymentStatus = (paid >= total && total > 0) ? "paid" : (paid > 0 ? "partial" : "unpaid");
         purchaseIn.type = type; purchaseIn.total = total; purchaseIn.paid = paid; purchaseIn.remaining = remaining; purchaseIn.paymentStatus = paymentStatus;
 
         await tx.purchase.create({ data: {
@@ -661,6 +750,17 @@ const server = http.createServer(async function(req, res){
           }
         }
 
+        if(paid > 0 && purchaseIn.partner){
+          const payId = uid();
+          await tx.purchasePayment.create({ data: {
+            id: payId, purchaseId: purchaseIn.id, supplierId: purchaseIn.supplierId||null, supplierName: purchaseIn.supplierName||null,
+            date: new Date(purchaseIn.date), amount: paid, paymentMethod: purchaseIn.paymentMethod || null,
+            notes: "دفعة مبدئية عند إنشاء الفاتورة", userId: user.id, partner: purchaseIn.partner, data: {}
+          }});
+          await upsertPartnerLedger(tx, { partner: purchaseIn.partner, type: "PURCHASE_PAYMENT", direction: "out", amount: paid,
+            referenceType: "purchasePayment", referenceId: payId, date: purchaseIn.date, userId: user.id, notes: "دفعة مبدئية — " + purchaseIn.number });
+        }
+
         await tx.auditLog.create({ data: auditEntry(req, type === "financial" ? "فاتورة مشتريات مالية" : "فاتورة شراء", purchaseIn.number + " — " + purchaseIn.supplierName + " — " + total + " " + (settings.currency||"")) });
       }, { timeout: 30000 });
     }catch(err){
@@ -677,7 +777,9 @@ const server = http.createServer(async function(req, res){
     const id = url.split("/")[3];
     const b = await readBody(req);
     const amount = Number(b.amount);
+    const partner = b.partner === "abdo" ? "abdo" : (b.partner === "moamen" ? "moamen" : null);
     if(!(amount > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
+    if(!partner){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
     const purchase = await prisma.purchase.findUnique({ where: { id } });
     if(!purchase){ send(res, 404, {ok:false, error:"فاتورة الشراء غير موجودة"}); return; }
 
@@ -696,11 +798,14 @@ const server = http.createServer(async function(req, res){
 
         const payDate = Date.now();
         const pIt = { id: paymentId, purchaseId: id, supplierId: fresh.supplierId||null, supplierName: fresh.supplierName||null,
-          date: payDate, amount: amount, paymentMethod: b.paymentMethod || "cash", notes: (b.notes||"").trim() || null, userId: user.id };
+          date: payDate, amount: amount, paymentMethod: b.paymentMethod || "cash", notes: (b.notes||"").trim() || null, userId: user.id, partner: partner };
         await tx.purchasePayment.create({ data: {
           id: pIt.id, purchaseId: pIt.purchaseId, supplierId: pIt.supplierId, supplierName: pIt.supplierName,
-          date: new Date(pIt.date), amount: pIt.amount, paymentMethod: pIt.paymentMethod, notes: pIt.notes, userId: pIt.userId, data: pIt
+          date: new Date(pIt.date), amount: pIt.amount, paymentMethod: pIt.paymentMethod, notes: pIt.notes, userId: pIt.userId, partner: pIt.partner, data: pIt
         }});
+
+        await upsertPartnerLedger(tx, { partner, type: "PURCHASE_PAYMENT", direction: "out", amount,
+          referenceType: "purchasePayment", referenceId: paymentId, date: payDate, userId: user.id, notes: "دفعة على فاتورة — " + (fresh.number||"") });
 
         await tx.auditLog.create({ data: auditEntry(req, "دفعة على فاتورة شراء", (fresh.number||"") + " — " + amount + " (" + (fresh.supplierName||"") + ")") });
       }, { timeout: 30000 });
@@ -796,9 +901,19 @@ const server = http.createServer(async function(req, res){
         const dupe = await prisma.product.findFirst({ where: { modelCode } });
         if(dupe && dupe.id !== it.id){ send(res, 400, {ok:false, error:"كود الموديل \""+modelCode+"\" مستخدم بالفعل لمنتج آخر"}); return; }
       }
+      if(g === "expenses" || g === "income"){
+        if(it.partner !== "moamen" && it.partner !== "abdo"){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
+      }
       try{
         await prisma.$transaction(async function(tx){
           await cfg.upsert(tx, it, isNew);
+          if(g === "expenses"){
+            await upsertPartnerLedger(tx, { partner: it.partner, type: "EXPENSE", direction: "out", amount: it.amount,
+              referenceType: "expense", referenceId: it.id, date: it.date, userId: it.userId || user.id, notes: it.note || null });
+          } else if(g === "income"){
+            await upsertPartnerLedger(tx, { partner: it.partner, type: "OTHER_INCOME", direction: "in", amount: it.amount,
+              referenceType: "otherIncome", referenceId: it.id, date: it.date, userId: it.userId || user.id, notes: it.note || null });
+          }
           await tx.auditLog.create({ data: auditEntry(req, isNew ? cfg.addLabel : cfg.editLabel, cfg.logDetail(it)) });
         }, { timeout: 30000 });
       }catch(err){
@@ -823,6 +938,8 @@ const server = http.createServer(async function(req, res){
       }
       await prisma.$transaction(async function(tx){
         await cfg.remove(tx, id);
+        if(g === "expenses") await deletePartnerLedgerFor(tx, "expense", id);
+        if(g === "income") await deletePartnerLedgerFor(tx, "otherIncome", id);
         await tx.auditLog.create({ data: auditEntry(req, cfg.delLabel, cfg.logDetail(existing)) });
       }, { timeout: 30000 });
       await db.trimAuditLog();
@@ -930,11 +1047,15 @@ const server = http.createServer(async function(req, res){
   if(method === "POST" && url === "/api/payments/out"){
     const b = await readBody(req);
     const it = b.item || {};
+    if(!(Number(it.amount) > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
+    if(it.partner !== "moamen" && it.partner !== "abdo"){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
     it.id = it.id || uid();
     it.date = Date.now();
     it.userId = user.id;
     await prisma.$transaction(async function(tx){
-      await tx.paymentOut.create({ data: { id: it.id, supplierName: it.supplierName || null, amount: it.amount != null ? it.amount : null, date: new Date(it.date), userId: it.userId, data: it } });
+      await tx.paymentOut.create({ data: { id: it.id, supplierName: it.supplierName || null, amount: it.amount != null ? it.amount : null, date: new Date(it.date), userId: it.userId, partner: it.partner, data: it } });
+      await upsertPartnerLedger(tx, { partner: it.partner, type: "PURCHASE_PAYMENT", direction: "out", amount: it.amount,
+        referenceType: "paymentOut", referenceId: it.id, date: it.date, userId: it.userId, notes: "دفعة للمورد — " + (it.supplierName||"") });
       await tx.auditLog.create({ data: auditEntry(req, "دفع للمورد", it.supplierName + " — " + it.amount) });
     });
     await db.trimAuditLog();

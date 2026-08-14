@@ -80,7 +80,7 @@ async function buildStateFromDB(){
 
   state.purchasePayments = (await prisma.purchasePayment.findMany()).map(p => ({
     ...(p.data || {}), id: p.id, purchaseId: p.purchaseId, supplierId: p.supplierId, supplierName: p.supplierName,
-    date: p.date ? p.date.getTime() : null, amount: p.amount, paymentMethod: p.paymentMethod, notes: p.notes, userId: p.userId
+    date: p.date ? p.date.getTime() : null, amount: p.amount, paymentMethod: p.paymentMethod, notes: p.notes, userId: p.userId, partner: p.partner
   }));
 
   const sales = await prisma.sale.findMany({ include: { items: true } });
@@ -99,7 +99,13 @@ async function buildStateFromDB(){
     ...(o.data || {}),
     id: o.id, number: o.number, date: o.date ? o.date.getTime() : null, userId: o.userId,
     customerName: o.customerName, total: o.total, status: o.status,
+    deposit: o.deposit, collectedTotal: o.collectedTotal, remaining: o.remaining, collectionStatus: o.collectionStatus,
     items: (o.items || []).map(it => ({ ...(it.data || {}), id: it.id, productId: it.productId, variantId: it.variantId, qty: it.qty, price: it.price }))
+  }));
+
+  state.orderCollections = (await prisma.orderCollection.findMany()).map(c => ({
+    ...(c.data || {}), id: c.id, orderId: c.orderId, kind: c.kind, amount: c.amount,
+    date: c.date ? c.date.getTime() : null, paymentMethod: c.paymentMethod, partner: c.partner, notes: c.notes, userId: c.userId
   }));
 
   const returns = await prisma.saleReturn.findMany({ include: { items: true } });
@@ -119,18 +125,24 @@ async function buildStateFromDB(){
   const expCats = await prisma.expenseCategory.findMany();
   state.expenseCategories = expCats.map(e => e.name);
 
-  state.expenses = (await prisma.expense.findMany()).map(e => ({ ...(e.data || {}), id: e.id, category: e.category, amount: e.amount, date: e.date ? e.date.getTime() : null, note: e.note, userId: e.userId }));
-  state.otherIncome = (await prisma.otherIncome.findMany()).map(o => ({ ...(o.data || {}), id: o.id, note: o.note, amount: o.amount, date: o.date ? o.date.getTime() : null, userId: o.userId }));
+  state.expenses = (await prisma.expense.findMany()).map(e => ({ ...(e.data || {}), id: e.id, category: e.category, amount: e.amount, date: e.date ? e.date.getTime() : null, note: e.note, userId: e.userId, partner: e.partner }));
+  state.otherIncome = (await prisma.otherIncome.findMany()).map(o => ({ ...(o.data || {}), id: o.id, note: o.note, amount: o.amount, date: o.date ? o.date.getTime() : null, userId: o.userId, partner: o.partner }));
   state.paymentsIn = (await prisma.paymentIn.findMany()).map(p => ({ ...(p.data || {}), id: p.id, customerName: p.customerName, amount: p.amount, date: p.date ? p.date.getTime() : null, userId: p.userId }));
-  state.paymentsOut = (await prisma.paymentOut.findMany()).map(p => ({ ...(p.data || {}), id: p.id, supplierName: p.supplierName, amount: p.amount, date: p.date ? p.date.getTime() : null, userId: p.userId }));
+  state.paymentsOut = (await prisma.paymentOut.findMany()).map(p => ({ ...(p.data || {}), id: p.id, supplierName: p.supplierName, amount: p.amount, date: p.date ? p.date.getTime() : null, userId: p.userId, partner: p.partner }));
   state.cashClosings = (await prisma.cashClosing.findMany()).map(c => ({ ...(c.data || {}), id: c.id, userId: c.userId, day: c.day, date: c.date ? c.date.getTime() : null }));
   state.transfers = (await prisma.transfer.findMany()).map(t => ({ id: t.id, fromId: t.fromId, toId: t.toId, amount: t.amount, date: t.date ? t.date.getTime() : null, byId: t.byId }));
   state.audit = (await prisma.auditLog.findMany({ orderBy: { date: 'asc' } })).map(a => ({ id: a.id, date: a.date ? a.date.getTime() : null, userId: a.userId, userName: a.userName, action: a.action, detail: a.detail }));
 
+  state.partnerTransactions = (await prisma.partnerTransaction.findMany({ orderBy: { date: 'asc' } })).map(t => ({
+    id: t.id, partner: t.partner, type: t.type, direction: t.direction, amount: t.amount,
+    referenceType: t.referenceType, referenceId: t.referenceId, date: t.date ? t.date.getTime() : null,
+    userId: t.userId, notes: t.notes
+  }));
+
   // Ensure arrays exist for compatibility
   ["users", "categories", "products", "customers", "suppliers", "purchases", "purchasePayments", "audit", "sales", "returns",
-   "shippingCompanies", "shipPrices", "orders", "expenseCategories", "expenses", "otherIncome",
-   "paymentsIn", "paymentsOut", "cashClosings", "transfers"].forEach(function (k) { if (!state[k]) state[k] = []; });
+   "shippingCompanies", "shipPrices", "orders", "orderCollections", "expenseCategories", "expenses", "otherIncome",
+   "paymentsIn", "paymentsOut", "cashClosings", "transfers", "partnerTransactions"].forEach(function (k) { if (!state[k]) state[k] = []; });
 
   return state;
 }
@@ -158,6 +170,8 @@ async function replaceStateInDB(raw){
     // PurchasePayment must go before Purchase for the same reason.
     await tx.saleReturn.deleteMany({});
     await tx.purchasePayment.deleteMany({});
+    await tx.orderCollection.deleteMany({});
+    await tx.partnerTransaction.deleteMany({});
     await tx.product.deleteMany({});
     await tx.sale.deleteMany({});
     await tx.purchase.deleteMany({});
@@ -240,7 +254,7 @@ async function replaceStateInDB(raw){
         data: {
           id: pp.id || uid(), purchaseId: pp.purchaseId, supplierId: pp.supplierId || null, supplierName: pp.supplierName || null,
           date: pp.date ? new Date(pp.date) : null, amount: pp.amount != null ? pp.amount : null, paymentMethod: pp.paymentMethod || null,
-          notes: pp.notes || null, userId: pp.userId || null, data: pp
+          notes: pp.notes || null, userId: pp.userId || null, partner: pp.partner || null, data: pp
         }
       });
       count++;
@@ -286,22 +300,34 @@ async function replaceStateInDB(raw){
       await tx.order.create({
         data: {
           id: o.id, number: o.number || null, date: o.date ? new Date(o.date) : null, userId: o.userId || null,
-          customerName: o.customerName || null, total: o.total != null ? o.total : null, status: o.status || null, data: o,
+          customerName: o.customerName || null, total: o.total != null ? o.total : null, status: o.status || null,
+          deposit: o.deposit != null ? o.deposit : null, collectedTotal: o.collectedTotal != null ? o.collectedTotal : null,
+          remaining: o.remaining != null ? o.remaining : null, collectionStatus: o.collectionStatus || null, data: o,
           items: { create: (o.items || []).map(it => ({ id: it.id || uid(), productId: it.productId || null, variantId: it.variantId || null, qty: it.qty != null ? it.qty : null, price: it.price != null ? it.price : null, data: it })) }
         }
       });
       count += 1 + (o.items || []).length;
+    }
+    for (const oc of (raw.orderCollections || [])) {
+      await tx.orderCollection.create({
+        data: {
+          id: oc.id || uid(), orderId: oc.orderId, kind: oc.kind || null, amount: oc.amount != null ? oc.amount : null,
+          date: oc.date ? new Date(oc.date) : null, paymentMethod: oc.paymentMethod || null, partner: oc.partner || null,
+          notes: oc.notes || null, userId: oc.userId || null, data: oc
+        }
+      });
+      count++;
     }
     for (const name of (raw.expenseCategories || [])) {
       await tx.expenseCategory.create({ data: { id: uid(), name } });
       count++;
     }
     for (const ex of (raw.expenses || [])) {
-      await tx.expense.create({ data: { id: ex.id, category: ex.category || null, amount: ex.amount != null ? ex.amount : null, date: ex.date ? new Date(ex.date) : null, note: ex.note || null, userId: ex.userId || null, data: ex } });
+      await tx.expense.create({ data: { id: ex.id, category: ex.category || null, amount: ex.amount != null ? ex.amount : null, date: ex.date ? new Date(ex.date) : null, note: ex.note || null, userId: ex.userId || null, partner: ex.partner || null, data: ex } });
       count++;
     }
     for (const oi of (raw.otherIncome || [])) {
-      await tx.otherIncome.create({ data: { id: oi.id, note: oi.note || null, amount: oi.amount != null ? oi.amount : null, date: oi.date ? new Date(oi.date) : null, userId: oi.userId || null, data: oi } });
+      await tx.otherIncome.create({ data: { id: oi.id, note: oi.note || null, amount: oi.amount != null ? oi.amount : null, date: oi.date ? new Date(oi.date) : null, userId: oi.userId || null, partner: oi.partner || null, data: oi } });
       count++;
     }
     for (const pi of (raw.paymentsIn || [])) {
@@ -309,7 +335,7 @@ async function replaceStateInDB(raw){
       count++;
     }
     for (const po of (raw.paymentsOut || [])) {
-      await tx.paymentOut.create({ data: { id: po.id, supplierName: po.supplierName || null, amount: po.amount != null ? po.amount : null, date: po.date ? new Date(po.date) : null, userId: po.userId || null, data: po } });
+      await tx.paymentOut.create({ data: { id: po.id, supplierName: po.supplierName || null, amount: po.amount != null ? po.amount : null, date: po.date ? new Date(po.date) : null, userId: po.userId || null, partner: po.partner || null, data: po } });
       count++;
     }
     for (const cc of (raw.cashClosings || [])) {
@@ -322,6 +348,14 @@ async function replaceStateInDB(raw){
     }
     for (const a of (raw.audit || [])) {
       await tx.auditLog.create({ data: { id: a.id || uid(), date: a.date ? new Date(a.date) : null, userId: a.userId || null, userName: a.userName || null, action: a.action || null, detail: a.detail || null } });
+      count++;
+    }
+    for (const pt of (raw.partnerTransactions || [])) {
+      await tx.partnerTransaction.create({ data: {
+        id: pt.id || uid(), partner: pt.partner, type: pt.type || null, direction: pt.direction || null, amount: pt.amount != null ? pt.amount : null,
+        referenceType: pt.referenceType || null, referenceId: pt.referenceId || null, date: pt.date ? new Date(pt.date) : null,
+        userId: pt.userId || null, notes: pt.notes || null, data: pt
+      }});
       count++;
     }
 

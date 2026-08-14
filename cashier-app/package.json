@@ -11,6 +11,8 @@
     "db:migrate": "prisma migrate deploy",
     "db:seed": "node prisma/seed.js",
     "db:backfill-model-code": "node prisma/backfill_model_code.js",
+    "db:backfill-purchase-status": "node prisma/backfill_purchase_payment_status.js",
+    "db:backfill-partner-sales": "node prisma/backfill_partner_sales.js",
     "migrate:from-json": "node prisma/migrate_from_json.js"
   },
   "engines": {

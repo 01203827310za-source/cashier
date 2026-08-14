@@ -107,6 +107,7 @@ model PurchasePayment {
   paymentMethod String?
   notes        String?
   userId       String?
+  partner      String? // "moamen" | "abdo"
   data         Json?
   purchase     Purchase @relation(fields: [purchaseId], references: [id])
 }
@@ -200,8 +201,47 @@ model Order {
   customerName String?
   total    Float?
   status   String?
+  deposit  Float?
+  collectedTotal    Float?
+  remaining         Float?
+  collectionStatus  String? // "collected" | "pending"
   data     Json?
   items    OrderItem[]
+  collections OrderCollection[]
+}
+
+// دفعة تحصيل على طلب — إما العربون عند إنشاء الطلب (kind:"deposit"، دائمًا عبدو)
+// أو تحصيل لاحق (kind:"collection"، الشريك يُختار يدويًا). لا يوجد onDelete:Cascade
+// عمداً، بنفس مبدأ PurchasePayment → Purchase.
+model OrderCollection {
+  id            String @id
+  orderId       String
+  kind          String?  // "deposit" | "collection"
+  amount        Float?
+  date          DateTime?
+  paymentMethod String?
+  partner       String?  // "moamen" | "abdo"
+  notes         String?
+  userId        String?
+  data          Json?
+  order         Order @relation(fields: [orderId], references: [id])
+}
+
+// سجل موحّد لكل حركة مالية مرتبطة بأحد الشريكين (مؤمن/عبدو) — المصدر الوحيد
+// لحساب رصيد كل شريك. referenceType/referenceId مرجع نصي بسيط (بدون FK) لأنه
+// يشير لعدة جداول مختلفة (sale/order/purchase/expense/otherIncome/return).
+model PartnerTransaction {
+  id            String @id
+  partner       String   // "moamen" | "abdo"
+  type          String   // SALE, ORDER_DEPOSIT, ORDER_COLLECTION, PURCHASE_PAYMENT, EXPENSE, OTHER_INCOME, RETURN, EXCHANGE_ADJUSTMENT
+  direction     String   // "in" | "out"
+  amount        Float?
+  referenceType String?
+  referenceId   String?
+  date          DateTime?
+  userId        String?
+  notes         String?
+  data          Json?
 }
 
 model OrderItem {
@@ -227,6 +267,7 @@ model Expense {
   date     DateTime?
   note     String?
   userId   String?
+  partner  String? // "moamen" | "abdo"
   data     Json?
 }
 
@@ -236,6 +277,7 @@ model OtherIncome {
   amount Float?
   date   DateTime?
   userId String?
+  partner String? // "moamen" | "abdo"
   data   Json?
 }
 
@@ -254,6 +296,7 @@ model PaymentOut {
   amount       Float?
   date         DateTime?
   userId       String?
+  partner      String? // "moamen" | "abdo"
   data         Json?
 }
 

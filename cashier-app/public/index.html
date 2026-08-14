@@ -634,9 +634,22 @@ function afterSync(r){
   if(r && r.db){ DB = r.db; }
 }
 function migrateDB(){
-  ["users","categories","products","customers","sales","suppliers","purchases","audit","shippingCompanies","shipPrices","orders","expenseCategories","expenses","otherIncome","paymentsIn","paymentsOut","cashClosings","transfers"].forEach(function(k){ if(!DB[k]) DB[k] = []; });
+  ["users","categories","products","customers","sales","suppliers","purchases","purchasePayments","audit","shippingCompanies","shipPrices","orders","orderCollections","expenseCategories","expenses","otherIncome","paymentsIn","paymentsOut","cashClosings","transfers","partnerTransactions"].forEach(function(k){ if(!DB[k]) DB[k] = []; });
   migrateProducts();
   DB.customers.forEach(function(c){ if(!c.addresses) c.addresses = []; });
+}
+
+/* ---------- حسابات الشركاء (مؤمن/عبدو) ---------- */
+var PARTNERS = [ {id:"moamen", label:"مؤمن"}, {id:"abdo", label:"عبدو"} ];
+function partnerLabel(id){ var p = PARTNERS.find(function(x){ return x.id === id; }); return p ? p.label : (id || "—"); }
+function partnerSelectHTML(id, val){
+  return '<select id="'+id+'"><option value="">اختر الحساب...</option>' +
+    PARTNERS.map(function(p){ return '<option value="'+p.id+'"'+(val===p.id?' selected':'')+'>'+p.label+'</option>'; }).join('') +
+    '</select>';
+}
+function partnerBalance(pid){
+  return (DB.partnerTransactions||[]).filter(function(t){ return t.partner === pid; })
+    .reduce(function(a,t){ return a + (t.direction==="in" ? (t.amount||0) : -(t.amount||0)); }, 0);
 }
 
 /* ---------- الحالة العامة ---------- */
@@ -669,6 +682,11 @@ var returnsTypeFilter = "all";
 var returnsFrom = "";
 var returnsTo = "";
 var returnDraft = null;
+var partnersFilter = "all";
+var partnersTypeFilter = "all";
+var partnersFrom = "";
+var partnersTo = "";
+var orderCollectDraft = null;
 
 var ORDER_STATUSES = [
   {id:"new", label:"جديد", color:"badge-blue"},
@@ -723,20 +741,51 @@ function customerReturnsAdjustment(cid){
   });
   return v;
 }
+// المرتجع الإجمالي المسجّل على فاتورة بيع معينة (يشمل الجزء المرتجع من أي عملية
+// استبدال أيضاً — القطعة القديمة رجعت فعلاً بغض النظر عن نوع العملية).
+function saleReturnedTotal(saleId){
+  return (DB.returns||[]).filter(function(r){ return r.saleId===saleId; })
+    .reduce(function(a,r){ return a+(r.returnedTotal||0); },0);
+}
+// أثر مجموعة من عمليات الاسترجاع/الاستبدال على أرقام التقارير المالية:
+// - returnsTotal: قيمة كل القطع المرتجعة (سواء استرجاع مستقل أو الجزء المرتجع من استبدال)
+// - exchangeReplacementTotal: قيمة كل الأصناف البديلة في عمليات الاستبدال — دي مبيعات
+//   جديدة فعلياً ولازم تُضاف إلى إجمالي المبيعات (مفيش فاتورة بيع منفصلة اتسجلت لها)
+// - profitImpact: التعديل على صافي الربح: نقص ربح القطعة المرتجعة (بسعرها وتكلفتها
+//   الأصليين وقت البيع) + ربح القطعة البديلة (بسعرها وتكلفتها الحاليين) لو استبدال
+function returnsImpact(returnsList){
+  var returnsTotal = 0, exchangeReplacementTotal = 0, profitImpact = 0;
+  (returnsList||[]).forEach(function(r){
+    returnsTotal += (r.returnedTotal||0);
+    if(r.type === "exchange") exchangeReplacementTotal += (r.replacementTotal||0);
+    var sale = DB.sales.find(function(s){ return s.id===r.saleId; });
+    (r.items||[]).forEach(function(it){
+      var saleItem = sale ? sale.items.find(function(si){ return si.id===it.saleItemId; }) : null;
+      var cost = (saleItem && saleItem.cost!=null) ? saleItem.cost : 0;
+      profitImpact -= ((it.unitPrice||0) - cost) * (it.qty||0);
+      if(r.type === "exchange" && it.replacementProductId){
+        var rp = DB.products.find(function(p){ return p.id===it.replacementProductId; });
+        var repCost = rp ? (rp.cost||0) : 0;
+        profitImpact += ((it.replacementPrice||0) - repCost) * (it.replacementQty||0);
+      }
+    });
+  });
+  return { returnsTotal: returnsTotal, exchangeReplacementTotal: exchangeReplacementTotal, profitImpact: profitImpact };
+}
 function customerBalance(cid){
   return customerSalesCredit(cid) + customerOrdersCredit(cid) - customerPaid(cid) - customerReturnsAdjustment(cid);
 }
 function supplierPurchasesTotal(sid){
   return DB.purchases.filter(function(p){ return p.supplierId===sid; })
-    .reduce(function(a,p){ return a+p.total; },0);
+    .reduce(function(a,p){ return a+(p.total||0); },0);
 }
 function supplierPaid(sid){
   var fromPaymentsOut = (DB.paymentsOut||[]).filter(function(p){ return p.supplierId===sid; })
-    .reduce(function(a,p){ return a+p.amount; },0);
+    .reduce(function(a,p){ return a+(p.amount||0); },0);
   // مدفوعات مربوطة بفاتورة شراء محددة (بضاعة أو مالية) — منفصلة عن paymentsOut
   // اللي هي دفعة إجمالية للمورد مش مربوطة بفاتورة بعينها.
   var fromInvoicePayments = (DB.purchasePayments||[]).filter(function(p){ return p.supplierId===sid; })
-    .reduce(function(a,p){ return a+p.amount; },0);
+    .reduce(function(a,p){ return a+(p.amount||0); },0);
   return fromPaymentsOut + fromInvoicePayments;
 }
 function supplierBalance(sid){
@@ -937,6 +986,7 @@ function render(){
     {id:"debts", label:"الديون", ic:"scale", roles:["admin"]},
     {id:"cash", label:"الخزنة", ic:"wallet", roles:["admin"]},
     {id:"finance", label:"الحسابات (أرباح/خسائر)", ic:"banknote", roles:["admin"]},
+    {id:"partners", label:"حسابات الشركاء", ic:"card", roles:["admin"]},
     {id:"assets", label:"الأصول والديون", ic:"pie", roles:["admin"]},
     {id:"customers", label:"العملاء", ic:"users", roles:["admin","cashier"]},
     {id:"reports", label:"التقارير", ic:"chart", roles:["admin","cashier"]},
@@ -948,7 +998,7 @@ function render(){
     return '<button class="nav-item '+(currentView===n.id?"active":"")+'" onclick="go(\''+n.id+'\')">'+icon(n.ic,18)+'<span>'+n.label+'</span></button>';
   }).join("");
 
-  var titles = {dashboard:"لوحة التحكم", pos:"نقطة البيع", products:"المنتجات والمخزون", orders:"الأوردرات والشحن", returns:"الاسترجاع والاستبدال", purchases:"المشتريات والموردين", expenses:"المصاريف", debts:"الديون", cash:"الخزنة", finance:"الحسابات", assets:"الأصول والديون", customers:"العملاء", reports:"التقارير", audit:"سجل الحركات", cashiers:"الكاشير والصلاحيات", settings:"الإعدادات"};
+  var titles = {dashboard:"لوحة التحكم", pos:"نقطة البيع", products:"المنتجات والمخزون", orders:"الأوردرات والشحن", returns:"الاسترجاع والاستبدال", purchases:"المشتريات والموردين", expenses:"المصاريف", debts:"الديون", cash:"الخزنة", finance:"الحسابات", partners:"حسابات الشركاء", assets:"الأصول والديون", customers:"العملاء", reports:"التقارير", audit:"سجل الحركات", cashiers:"الكاشير والصلاحيات", settings:"الإعدادات"};
   var now = new Date();
   var dateLbl = now.toLocaleDateString("ar-EG", {weekday:"long", day:"numeric", month:"long", year:"numeric"});
   var lowCount = lowStockItems().length;
@@ -1017,6 +1067,7 @@ function renderView(){
     case "debts": return viewDebts();
     case "cash": return viewCash();
     case "finance": return viewFinance();
+    case "partners": return viewPartners();
     case "assets": return viewAssets();
     case "customers": return viewCustomers();
     case "reports": return viewReports();
@@ -1040,12 +1091,20 @@ function viewDashboard(){
   var low = DB.products.filter(function(p){ return p.stock <= DB.settings.lowStockThreshold; });
   var recent = DB.sales.slice().sort(function(a,b){ return b.date-a.date; }).slice(0,7);
 
+  var todayReturns = (DB.returns||[]).filter(function(r){ return dayKey(r.date) === tKey; });
+  var todayRi = returnsImpact(todayReturns);
+  var grossToday = revenue + todayRi.exchangeReplacementTotal;
+  var netToday = grossToday - todayRi.returnsTotal;
+  var netProfitToday = profit + todayRi.profitImpact;
+
   var stats =
     '<div class="stats">'+
-      statCard("grid","var(--primary)", fmt(revenue), "مبيعات اليوم ("+DB.settings.currency+")")+
+      statCard("grid","var(--primary)", fmt(grossToday), "مبيعات اليوم — إجمالي ("+DB.settings.currency+")")+
+      statCard("return","var(--red)", fmt(todayRi.returnsTotal), "مرتجعات اليوم")+
+      statCard("chart","var(--green)", fmt(netToday), "صافي مبيعات اليوم")+
       statCard("print","var(--green)", fmtInt(todaySales.length), "عدد الفواتير اليوم")+
       statCard("box","var(--amber)", fmtInt(items), "قطع تم بيعها اليوم")+
-      statCard("chart","#0ea5e9", fmt(profit), "صافي ربح اليوم")+
+      statCard("chart","#0ea5e9", fmt(netProfitToday), "صافي ربح اليوم")+
       statCard("send","#0891b2", fmtInt(orderCount), "أوردرات شحن اليوم")+
     '</div>';
 
@@ -1077,7 +1136,36 @@ function viewDashboard(){
       '<button class="btn btn-ghost" onclick="openCustomerForm()">'+icon("plus",16)+' إضافة عميل</button>'+
     '</div>' : "";
 
-  return '<h3 class="muted mb16" style="font-weight:600;">نظرة عامة على أداء المحل</h3>' + quick + stats + lowHTML + recentHTML;
+  var partnersSection = "";
+  if(isAdmin()){
+    var totalIncome = ledgerSum(function(t){ return t.type==="SALE"||t.type==="OTHER_INCOME"; });
+    var totalExpenses = ledgerSum(function(t){ return t.type==="EXPENSE"; });
+    var totalSupplierPayments = ledgerSum(function(t){ return t.type==="PURCHASE_PAYMENT"; });
+    var totalOrderCollections = ledgerSum(function(t){ return t.type==="ORDER_COLLECTION"; });
+    var totalDeposits = ledgerSum(function(t){ return t.type==="ORDER_DEPOSIT"; });
+    var totalReturns = ledgerSum(function(t){ return t.type==="RETURN"; });
+    var netMovement = (DB.partnerTransactions||[]).reduce(function(a,t){ return a + (t.direction==="in"?(t.amount||0):-(t.amount||0)); }, 0);
+    partnersSection =
+      '<h3 class="muted mb16" style="font-weight:600;margin-top:24px;">الحالة المالية للشركاء</h3>'+
+      '<div class="stats mb16">'+
+        statCard("card","var(--primary)", fmt(partnerBalance("moamen")), "رصيد مؤمن")+
+        statCard("card","#0891b2", fmt(partnerBalance("abdo")), "رصيد عبدو")+
+      '</div>'+
+      '<div class="stats">'+
+        statCard("chart","var(--green)", fmt(totalIncome), "إجمالي الإيرادات")+
+        statCard("coins","var(--red)", fmt(totalExpenses), "إجمالي المصروفات")+
+        statCard("truck","var(--amber)", fmt(totalSupplierPayments), "دفعات الموردين")+
+        statCard("send","#0ea5e9", fmt(totalOrderCollections), "تحصيلات العملاء")+
+        statCard("wallet","#8b5cf6", fmt(totalDeposits), "العربونات")+
+        statCard("return","var(--red)", fmt(totalReturns), "المرتجعات")+
+        statCard("scale", netMovement>=0?"var(--green)":"var(--red)", fmt(netMovement), "صافي الحركة المالية")+
+      '</div>';
+  }
+
+  return '<h3 class="muted mb16" style="font-weight:600;">نظرة عامة على أداء المحل</h3>' + quick + stats + lowHTML + recentHTML + partnersSection;
+}
+function ledgerSum(filterFn){
+  return (DB.partnerTransactions||[]).filter(filterFn).reduce(function(a,t){ return a + (t.amount||0); }, 0);
 }
 function statCard(ic, color, val, lbl){
   return '<div class="stat"><div class="ic" style="background:'+color+'">'+icon(ic,20)+'</div><div class="val">'+val+'</div><div class="lbl">'+lbl+'</div></div>';
@@ -1423,6 +1511,7 @@ async function completeSale(){
 function receiptHTML(sale){
   var payLbl = payMethodLabel(sale.paymentMethod);
   var cust = sale.customerId ? DB.customers.find(function(c){ return c.id===sale.customerId; }) : null;
+  var returned = sale.id ? saleReturnedTotal(sale.id) : 0;
   var rows = sale.items.map(function(it){
     var opt = [it.size, it.color].filter(Boolean).join(" / ");
     return '<tr><td>'+esc(it.name)+ (opt?'<br><span style="font-size:10px">'+esc(opt)+'</span>':'') +'</td>'+
@@ -1443,6 +1532,10 @@ function receiptHTML(sale){
     (sale.discount>0 ? '<div class="ttl"><span>الخصم</span><span>-'+fmt(sale.discount)+'</span></div>' : '')+
     (sale.tax>0 ? '<div class="ttl"><span>الضريبة</span><span>'+fmt(sale.tax)+'</span></div>' : '')+
     '<div class="ttl bold" style="font-size:14px"><span>الإجمالي</span><span>'+fmt(sale.total)+' '+esc(DB.settings.currency)+'</span></div>'+
+    (returned>0.004 ?
+      '<div class="ttl" style="color:var(--red);"><span>المرتجع</span><span>-'+fmt(returned)+'</span></div>'+
+      '<div class="ttl bold" style="font-size:14px"><span>الصافي</span><span>'+fmt(sale.total-returned)+' '+esc(DB.settings.currency)+'</span></div>'
+      : '')+
     '<div class="ttl"><span>طريقة الدفع</span><span>'+payLbl+'</span></div>'+
     (sale.paymentMethod==="cash" ? '<div class="ttl"><span>المدفوع</span><span>'+fmt(sale.cashReceived)+'</span></div><div class="ttl"><span>الباقي</span><span>'+fmt(sale.change)+'</span></div>' : '')+
     '<div class="divider"></div>'+
@@ -1942,11 +2035,15 @@ function viewReports(){
   var count = sales.length;
   var avg = count ? revenue/count : 0;
 
-  // المرتجعات وصافي المبيعات = إجمالي المبيعات - المرتجعات + فروق الاستبدال
+  // المرتجعات وصافي المبيعات: إجمالي المبيعات (بما فيه قيمة الأصناف البديلة في
+  // عمليات الاستبدال، لأنها مبيعات فعلية جديدة) ناقص إجمالي قيمة المرتجعات.
+  // صافي المبيعات = إجمالي المبيعات - إجمالي المرتجعات
   var returnsInRange = (DB.returns||[]).filter(function(r){ return r.date>=f.from && r.date<=f.to; });
-  var returnsTotal = returnsInRange.reduce(function(a,r){ return a + (r.returnedTotal||0); },0);
-  var exchangeDiffTotal = returnsInRange.filter(function(r){ return r.type==="exchange"; }).reduce(function(a,r){ return a + (r.difference||0); },0);
-  var netSales = revenue - returnsTotal + exchangeDiffTotal;
+  var ri = returnsImpact(returnsInRange);
+  var returnsTotal = ri.returnsTotal;
+  var grossSales = revenue + ri.exchangeReplacementTotal;
+  var netSales = grossSales - returnsTotal;
+  var netProfit = profit + ri.profitImpact;
 
   // رسم بياني يومي
   var days = [];
@@ -1998,10 +2095,11 @@ function viewReports(){
 
   var list = sales.slice().sort(function(a,b){ return b.date-a.date; });
   var rows = list.map(function(s){
+    var returnedForRow = saleReturnedTotal(s.id);
     return '<tr><td class="bold">'+esc(s.number)+'</td><td>'+dateStr(s.date)+' '+timeStr(s.date)+'</td>'+
       '<td>'+esc(userById(s.userId)?userById(s.userId).name:"-")+'</td>'+
       '<td>'+s.items.reduce(function(a,it){return a+it.qty;},0)+'</td>'+
-      '<td class="bold">'+fmt(s.total)+'</td>'+
+      '<td class="bold">'+fmt(s.total)+(returnedForRow>0.004?'<div class="small" style="color:var(--red);">مرتجع: -'+fmt(returnedForRow)+'</div>':'')+'</td>'+
       '<td><span class="badge '+(s.paymentMethod==="cash"?"badge-green":(s.paymentMethod==="card"?"badge-blue":(s.paymentMethod==="credit"?"badge-red":"badge-amber")))+'">'+(payMap[s.paymentMethod]||s.paymentMethod)+'</span></td>'+
       '<td><div class="row" style="gap:2px;">'+
         '<button class="icon-btn primary" onclick="viewSale(\''+s.id+'\')">'+icon("eye",16)+'</button>'+
@@ -2022,12 +2120,12 @@ function viewReports(){
 
   return '<div class="filterbar">'+rangeSel+'</div>'+
     '<div class="stats">'+
-      statCard("chart","var(--primary)", fmt(revenue), "إجمالي المبيعات — إجمالي ("+DB.settings.currency+")")+
+      statCard("chart","var(--primary)", fmt(grossSales), "إجمالي المبيعات ("+DB.settings.currency+")")+
       statCard("return","var(--red)", fmt(returnsTotal), "المرتجعات")+
       statCard("chart","var(--green)", fmt(netSales), "صافي المبيعات")+
       statCard("print","var(--green)", fmtInt(count), "عدد الفواتير")+
       statCard("card","#0ea5e9", fmt(avg), "متوسط قيمة الفاتورة")+
-      statCard("chart","var(--amber)", fmt(profit), "صافي الربح")+
+      statCard("chart","var(--amber)", fmt(netProfit), "صافي الربح")+
     '</div>'+
     '<div class="card mb16"><h3>'+icon("chart",17)+' المبيعات اليومية</h3><div class="bars">'+bars+'</div></div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;" class="mb16">'+
@@ -2406,9 +2504,17 @@ function openLowStock(){
 /* ============================================================
    المشتريات والموردين
    ============================================================ */
+function purchaseRemaining(p){
+  return p.remaining != null ? p.remaining : Math.max(0, (p.total||0) - (p.paid||0));
+}
 function purchasePayBadge(p){
   var map = { paid:{label:"مدفوعة",cls:"badge-green"}, partial:{label:"مدفوعة جزئياً",cls:"badge-amber"}, unpaid:{label:"غير مدفوعة",cls:"badge-red"} };
-  var m = map[p.paymentStatus];
+  var status = p.paymentStatus;
+  if(!status){
+    var paid = p.paid||0, total = p.total||0;
+    status = (paid >= total && total > 0) ? "paid" : (paid > 0 ? "partial" : "unpaid");
+  }
+  var m = map[status];
   return m ? '<span class="badge '+m.cls+'">'+m.label+'</span>' : '<span class="muted small">—</span>';
 }
 function setPurchasesTab(t){ purchasesTab = t; renderViewInPlace(); }
@@ -2440,7 +2546,7 @@ function viewPurchases(){
       '<td>'+(p.paymentMethod?payMethodLabel(p.paymentMethod):'—')+'</td>'+
       '<td><div class="row" style="gap:2px;">'+
         '<button class="icon-btn primary" title="عرض التفاصيل" onclick="viewPurchase(\''+p.id+'\')">'+icon("eye",16)+'</button>'+
-        (p.remaining>0 ? '<button class="icon-btn" title="إضافة دفعة" onclick="openPurchasePayment(\''+p.id+'\')">'+icon("banknote",16)+'</button>' : '')+
+        (purchaseRemaining(p)>0 ? '<button class="icon-btn" title="إضافة دفعة" onclick="openPurchasePayment(\''+p.id+'\')">'+icon("banknote",16)+'</button>' : '')+
         '<button class="icon-btn" title="تعديل" onclick="openPurchaseEdit(\''+p.id+'\')">'+icon("edit",16)+'</button>'+
         '<button class="icon-btn danger" title="حذف" onclick="deletePurchase(\''+p.id+'\')">'+icon("trash",16)+'</button>'+
       '</div></td></tr>';
@@ -2454,6 +2560,7 @@ function viewPurchases(){
       '<td>'+dateStr(pp.date)+' '+timeStr(pp.date)+'</td>'+
       '<td class="bold">'+fmt(pp.amount)+'</td>'+
       '<td>'+payMethodLabel(pp.paymentMethod)+'</td>'+
+      '<td>'+(pp.partner?partnerLabel(pp.partner):'—')+'</td>'+
       '<td>'+esc(pp.notes||"—")+'</td>'+
       '<td>'+esc(userById(pp.userId)?userById(pp.userId).name:"—")+'</td></tr>';
   }).join("");
@@ -2468,8 +2575,8 @@ function viewPurchases(){
     '<tbody>'+(purRows || '<tr><td colspan="9" class="muted" style="text-align:center;padding:24px;">لا توجد فواتير شراء</td></tr>')+'</tbody></table></div></div>';
 
   var paymentsSection = '<div class="card"><h3>'+icon("banknote",17)+' سجل الدفعات ('+(DB.purchasePayments||[]).length+')</h3>'+
-    '<div class="table-wrap"><table><thead><tr><th>رقم الدفعة</th><th>فاتورة الشراء</th><th>المورد</th><th>التاريخ</th><th>المبلغ</th><th>طريقة الدفع</th><th>ملاحظات</th><th>بواسطة</th></tr></thead>'+
-    '<tbody>'+(payRows || '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px;">لا توجد دفعات مسجّلة</td></tr>')+'</tbody></table></div></div>';
+    '<div class="table-wrap"><table><thead><tr><th>رقم الدفعة</th><th>فاتورة الشراء</th><th>المورد</th><th>التاريخ</th><th>المبلغ</th><th>طريقة الدفع</th><th>الحساب</th><th>ملاحظات</th><th>بواسطة</th></tr></thead>'+
+    '<tbody>'+(payRows || '<tr><td colspan="9" class="muted" style="text-align:center;padding:24px;">لا توجد دفعات مسجّلة</td></tr>')+'</tbody></table></div></div>';
 
   return '<div class="filterbar">'+
     '<button class="btn btn-primary" onclick="openPurchaseForm()">'+icon("plus",16)+' تسجيل فاتورة شراء</button>'+
@@ -2529,7 +2636,7 @@ function supplierOptionsHTML(){
 function openPurchaseForm(){
   purchaseDraft = {
     type: "goods", supplierId: DB.suppliers.length ? DB.suppliers[0].id : null, date: todayKey(), items:[blankPurchaseLine()],
-    number: "", total: "", paid: "", paymentMethod: "cash", notes: ""
+    number: "", total: "", paid: "", paymentMethod: "cash", notes: "", partner: ""
   };
   openModal(purchaseModalHTML(), true);
   refreshPurTotal();
@@ -2564,6 +2671,7 @@ function purchaseModalHTML(){
           '<option value="card" '+(purchaseDraft.paymentMethod==="card"?"selected":"")+'>كارت</option>'+
           '<option value="wallet" '+(purchaseDraft.paymentMethod==="wallet"?"selected":"")+'>محفظة</option>'+
         '</select></div>'+
+        '<div class="field"><label>الحساب الذي دفع (مؤمن/عبدو) — مطلوب فقط لو فيه دفعة مبدئية</label>'+partnerSelectHTML("pur-fin-partner", purchaseDraft.partner).replace('<select ','<select onchange="purchaseDraft.partner=this.value" ')+'</div>'+
         '<div class="field full"><label>الملاحظات/التفاصيل</label><textarea id="pur-fin-notes" onchange="purchaseDraft.notes=this.value">'+esc(purchaseDraft.notes||"")+'</textarea></div>'+
       '</div>'+
       '<div class="row mt16" style="justify-content:flex-end;"><span class="muted">المتبقي: </span><b style="font-size:16px;" id="pur-fin-remaining">'+fmt(Math.max(0,(num(purchaseDraft.total)-num(purchaseDraft.paid))))+' '+esc(DB.settings.currency)+'</b></div>'+
@@ -2646,10 +2754,12 @@ async function savePurchase(){
     if(total <= 0){ toast("أدخل إجمالي فاتورة صحيح","err"); return; }
     if(paid < 0){ toast("المبلغ المدفوع لا يمكن أن يكون سالباً","err"); return; }
     if(paid > total){ toast("المبلغ المدفوع لا يمكن أن يتجاوز إجمالي الفاتورة","err"); return; }
+    if(paid > 0 && !purchaseDraft.partner){ toast("اختر الحساب (مؤمن/عبدو) للدفعة المبدئية","err"); return; }
     var purchase = {
       id: uid(), type:"financial", supplierId: supId, supplierName: sup.name,
       number: (purchaseDraft.number||"").trim(), total: total, paid: paid,
-      paymentMethod: purchaseDraft.paymentMethod, notes: (purchaseDraft.notes||"").trim()
+      paymentMethod: purchaseDraft.paymentMethod, notes: (purchaseDraft.notes||"").trim(),
+      partner: paid > 0 ? purchaseDraft.partner : null
     };
     try{
       var r = await api("POST", "/api/purchase", { purchase: purchase });
@@ -2668,7 +2778,7 @@ async function savePurchase(){
     return {productId:it.productId, variantId:it.variantId, name:p?p.name:"", size:v?v.size:null, color:v?v.color:null, qty:it.qty, cost:it.cost};
   });
   var increments = lines.map(function(it){ return { productId: it.productId, variantId: it.variantId, qty: it.qty, cost: it.cost }; });
-  var purchaseGoods = { id: uid(), type:"goods", supplierId: supId, supplierName: sup.name, items: items, total: total2 };
+  var purchaseGoods = { id: uid(), type:"goods", supplierId: supId, supplierName: sup.name, items: items, total: total2, paid: 0 };
   var r2 = await api("POST", "/api/purchase", { purchase: purchaseGoods, increments: increments });
   afterSync(r2);
   closeModal(); renderViewInPlace(); toast("تم تسجيل الفاتورة وزيادة المخزون");
@@ -2701,7 +2811,7 @@ function viewPurchase(id){
         '<div class="ttl"><span>الإجمالي</span><span class="bold">'+fmt(p.total)+' '+esc(DB.settings.currency)+'</span></div>'+
         (p.paid!=null ? '<div class="ttl"><span>المدفوع</span><span class="bold">'+fmt(p.paid)+'</span></div>' : '')+
         (p.remaining!=null ? '<div class="ttl"><span>المتبقي</span><span class="bold">'+fmt(p.remaining)+'</span></div>' : '')+
-        (p.paymentStatus ? '<div class="ttl"><span>حالة الدفع</span><span>'+purchasePayBadge(p)+'</span></div>' : '')+
+        '<div class="ttl"><span>حالة الدفع</span><span>'+purchasePayBadge(p)+'</span></div>'+
         (p.paymentMethod ? '<div class="ttl"><span>طريقة الدفع</span><span>'+payMethodLabel(p.paymentMethod)+'</span></div>' : '')+
         (p.notes ? '<div class="ttl"><span>الملاحظات</span><span>'+esc(p.notes)+'</span></div>' : '')+
       '</div>'+
@@ -2709,7 +2819,7 @@ function viewPurchase(id){
         '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>المبلغ</th><th>الطريقة</th><th>ملاحظات</th></tr></thead><tbody>'+payRows+'</tbody></table></div></div>' : '')+
     '</div>'+
     '<div class="modal-foot">'+
-      (p.remaining>0 ? '<button class="btn btn-primary" onclick="closeModal();openPurchasePayment(\''+p.id+'\')">'+icon("banknote",16)+' إضافة دفعة</button>' : '')+
+      (purchaseRemaining(p)>0 ? '<button class="btn btn-primary" onclick="closeModal();openPurchasePayment(\''+p.id+'\')">'+icon("banknote",16)+' إضافة دفعة</button>' : '')+
       '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
     '</div>'
   , true);
@@ -2724,6 +2834,7 @@ function openPurchasePayment(id){
       '<div class="tot-row mb8"><span>المتبقي على الفاتورة</span><b style="color:var(--red);">'+fmt(remaining)+' '+esc(DB.settings.currency)+'</b></div>'+
       '<div class="field"><label>المبلغ *</label><input id="purpay-amount" type="number" min="0" step="0.5" value="'+remaining.toFixed(2)+'"></div>'+
       '<div class="field"><label>طريقة الدفع</label><select id="purpay-method"><option value="cash">نقدي</option><option value="card">كارت</option><option value="wallet">محفظة</option></select></div>'+
+      '<div class="field"><label>الحساب الذي دفع (مؤمن/عبدو) *</label>'+partnerSelectHTML("purpay-partner", "")+'</div>'+
       '<div class="field"><label>ملاحظات</label><input id="purpay-note" placeholder="اختياري"></div>'+
     '</div>'+
     '<div class="modal-foot">'+
@@ -2734,8 +2845,10 @@ function openPurchasePayment(id){
 }
 function savePurchasePaymentForInvoice(id){
   var amount = num($("#purpay-amount").value);
+  var partner = $("#purpay-partner").value;
   if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
-  api("POST", "/api/purchase/" + id + "/payment", { amount: amount, paymentMethod: $("#purpay-method").value, notes: $("#purpay-note").value.trim() }).then(function(r){
+  if(!partner){ toast("اختر الحساب (مؤمن/عبدو)","err"); return; }
+  api("POST", "/api/purchase/" + id + "/payment", { amount: amount, partner: partner, paymentMethod: $("#purpay-method").value, notes: $("#purpay-note").value.trim() }).then(function(r){
     afterSync(r);
     closeModal(); renderViewInPlace(); toast("تم تسجيل الدفعة");
   }).catch(function(e){ toast(e.message, "err"); });
@@ -2865,7 +2978,7 @@ function customerAddressOptions(cid){
   }).join("");
 }
 function openOrderForm(){
-  orderDraft = {customerId:null, customerName:"", phone:"", governorate:(DB.shipPrices[0]?DB.shipPrices[0].governorate:""), city:"", street:"", items:[blankOrderLine()], paymentStatus:"cod", shipping:0, discount:0, note:""};
+  orderDraft = {customerId:null, customerName:"", phone:"", governorate:(DB.shipPrices[0]?DB.shipPrices[0].governorate:""), city:"", street:"", items:[blankOrderLine()], paymentStatus:"cod", shipping:0, discount:0, deposit:0, note:""};
   orderDraft.shipping = shipPriceFor(orderDraft.governorate);
   openModal(orderModalHTML(), true);
   refreshOrderLines();
@@ -2891,6 +3004,7 @@ function orderModalHTML(){
       '</select></div>'+
       '<div class="field"><label>تكلفة الشحن</label><input id="ord-ship" type="number" min="0" step="0.5" value="'+orderDraft.shipping+'" oninput="orderDraft.shipping=num(this.value);refreshOrderTotal()"></div>'+
       '<div class="field"><label>الخصم</label><input id="ord-disc" type="number" min="0" step="0.5" value="0" oninput="orderDraft.discount=num(this.value);refreshOrderTotal()"></div>'+
+      '<div class="field"><label>العربون (اختياري)</label><input id="ord-deposit" type="number" min="0" step="0.5" value="'+(orderDraft.deposit||0)+'" oninput="orderDraft.deposit=num(this.value)"><span class="muted small">الحساب: عبدو (تلقائي)</span></div>'+
       '<div class="field full"><label>ملاحظات</label><input id="ord-note" value="" onchange="orderDraft.note=this.value"></div>'+
     '</div>'+
     '<div class="row mt16 mb8"><span class="bold grow">الأصناف</span><button class="btn btn-soft btn-sm" onclick="addOrderLine()">'+icon("plus",14)+' سطر</button></div>'+
@@ -2988,6 +3102,7 @@ async function saveOrder(){
   orderDraft.note = ($("#ord-note") ? $("#ord-note").value : "").trim();
   orderDraft.shipping = num($("#ord-ship") ? $("#ord-ship").value : orderDraft.shipping);
   orderDraft.discount = num($("#ord-disc") ? $("#ord-disc").value : 0);
+  orderDraft.deposit = num($("#ord-deposit") ? $("#ord-deposit").value : 0);
   if(!orderDraft.customerName){ toast("اكتب اسم العميل","err"); return; }
   if(!orderDraft.governorate){ toast("اختر المحافظة","err"); return; }
   var lines = orderDraft.items.filter(function(it){ return it.productId && it.qty>0; });
@@ -3000,6 +3115,7 @@ async function saveOrder(){
   var u = currentUser();
   var subtotal = lines.reduce(function(a,it){ return a+it.qty*it.price; },0);
   var total = Math.max(0, subtotal + orderDraft.shipping - orderDraft.discount);
+  var deposit = Math.max(0, Math.min(total, orderDraft.deposit||0));
   var items = lines.map(function(it){
     var p = DB.products.find(function(x){ return x.id===it.productId; });
     var v = p && (p.variants||[]).find(function(x){ return x.id===it.variantId; });
@@ -3010,7 +3126,7 @@ async function saveOrder(){
     id:uid(),
     customerId:orderDraft.customerId, customerName:orderDraft.customerName, phone:orderDraft.phone,
     governorate:orderDraft.governorate, city:orderDraft.city, street:orderDraft.street,
-    items:items, subtotal:subtotal, shipping:orderDraft.shipping, discount:orderDraft.discount, total:total,
+    items:items, subtotal:subtotal, shipping:orderDraft.shipping, discount:orderDraft.discount, total:total, deposit:deposit,
     paymentStatus:orderDraft.paymentStatus, collected:false, status:"new",
     companyId:null, awb:"", note:orderDraft.note
   };
@@ -3082,6 +3198,35 @@ function saveCodCollection(id){
     closeModal(); renderViewInPlace(); toast("تم تسجيل التحصيل باسم "+by.name);
   }).catch(function(e){ toast(e.message, "err"); });
 }
+function openOrderCollection(id){
+  var o = DB.orders.find(function(x){ return x.id===id; });
+  if(!o) return;
+  var remaining = orderRemaining(o);
+  openModal(
+    '<div class="modal-head"><h3>'+icon("banknote",18)+' تسجيل تحصيل — '+esc(o.number)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="tot-row mb8"><span>المتبقي على الطلب</span><b style="color:var(--red);">'+fmt(remaining)+' '+esc(DB.settings.currency)+'</b></div>'+
+      '<div class="field"><label>المبلغ *</label><input id="ordcol-amount" type="number" min="0" step="0.5" value="'+remaining.toFixed(2)+'"></div>'+
+      '<div class="field"><label>طريقة الدفع</label><select id="ordcol-method"><option value="cash">نقدي</option><option value="card">كارت</option><option value="wallet">محفظة</option></select></div>'+
+      '<div class="field"><label>الحساب الذي استلم (مؤمن/عبدو) *</label>'+partnerSelectHTML("ordcol-partner", "")+'</div>'+
+      '<div class="field"><label>ملاحظات</label><input id="ordcol-note" placeholder="اختياري"></div>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="saveOrderCollection(\''+id+'\')">'+icon("check",16)+' تسجيل التحصيل</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+    '</div>'
+  );
+}
+function saveOrderCollection(id){
+  var amount = num($("#ordcol-amount").value);
+  var partner = $("#ordcol-partner").value;
+  if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
+  if(!partner){ toast("اختر الحساب (مؤمن/عبدو)","err"); return; }
+  api("POST", "/api/order/" + id + "/collection", { amount: amount, partner: partner, paymentMethod: $("#ordcol-method").value, notes: $("#ordcol-note").value.trim() }).then(function(r){
+    afterSync(r);
+    closeModal(); renderViewInPlace(); toast("تم تسجيل التحصيل");
+  }).catch(function(e){ toast(e.message, "err"); });
+}
 function setShipment(id){
   var o = DB.orders.find(function(x){ return x.id===id; });
   if(!o) return;
@@ -3108,6 +3253,26 @@ function saveShipment(id){
     afterSync(r);
     closeModal(); renderViewInPlace(); toast("تم تحديث بيانات الشحن");
   }).catch(function(e){ toast(e.message, "err"); });
+}
+function orderRemaining(o){
+  return o.remaining != null ? o.remaining : Math.max(0, (o.total||0) - (o.collectedTotal||0));
+}
+function orderFinancialBlockHTML(o){
+  if(o.deposit==null && o.collectionStatus==null) return "";
+  var collectedTotal = o.collectedTotal||0;
+  var remaining = orderRemaining(o);
+  var laterCollected = Math.max(0, collectedTotal - (o.deposit||0));
+  var statusLabel = (o.collectionStatus==="collected") ? "تم التحصيل" : "لم يتم التحصيل";
+  var statusColor = (o.collectionStatus==="collected") ? "var(--green)" : "var(--amber)";
+  return '<div class="card mt16" style="background:#f8fafc;padding:12px;">'+
+      '<h3 style="margin-bottom:8px;">'+icon("wallet",17)+' الملخص المالي</h3>'+
+      '<div class="tot-row"><span>إجمالي الفاتورة</span><b>'+fmt(o.total)+'</b></div>'+
+      '<div class="tot-row"><span>العربون (حساب عبدو)</span><b>'+fmt(o.deposit||0)+'</b></div>'+
+      '<div class="tot-row"><span>المحصَّل لاحقاً</span><b>'+fmt(laterCollected)+'</b></div>'+
+      '<div class="tot-row"><span>إجمالي المحصَّل</span><b>'+fmt(collectedTotal)+'</b></div>'+
+      '<div class="tot-row"><span>المتبقي</span><b style="color:'+(remaining>0?'var(--red)':'var(--green)')+';">'+fmt(remaining)+'</b></div>'+
+      '<div class="tot-row"><span>حالة التحصيل</span><b style="color:'+statusColor+';">'+statusLabel+'</b></div>'+
+    '</div>';
 }
 function viewOrder(id){
   var o = DB.orders.find(function(x){ return x.id===id; });
@@ -3138,10 +3303,12 @@ function viewOrder(id){
         '<div class="tot-row"><span>الخصم</span><span>- '+fmt(o.discount)+'</span></div>'+
         '<div class="tot-row grand"><span>الإجمالي</span><span>'+fmt(o.total)+' '+esc(DB.settings.currency)+'</span></div>'+
       '</div>'+
+      orderFinancialBlockHTML(o)+
     '</div>'+
     '<div class="modal-foot" style="flex-wrap:wrap;">'+
       (flowNext(o.status) ? '<button class="btn btn-primary" onclick="advanceOrder(\''+o.id+'\')">'+icon("check",16)+' '+statusMeta(flowNext(o.status)).label+'</button>' : '')+
-      (o.paymentStatus==="cod" ? '<button class="btn btn-ghost" onclick="collectCod(\''+o.id+'\')">'+icon("cash",16)+' '+(o.collected?"إلغاء التحصيل":"تسجيل التحصيل")+'</button>' : '')+
+      (o.paymentStatus==="cod" ? '<button class="btn btn-ghost" onclick="collectCod(\''+o.id+'\')">'+icon("cash",16)+' '+(o.collected?"إلغاء التحصيل":"تسجيل التحصيل COD")+'</button>' : '')+
+      (orderRemaining(o)>0 ? '<button class="btn btn-ghost" onclick="closeModal();openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+' تسجيل تحصيل</button>' : '')+
       '<button class="btn btn-ghost" onclick="setShipment(\''+o.id+'\')">'+icon("truck",16)+' الشحنة</button>'+
       '<button class="btn btn-ghost" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+' طباعة</button>'+
       (["new","preparing","ready","shipped","delivered"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="returnOrder(\''+o.id+'\')">'+icon("return",16)+' مرتجع</button>' : '')+
@@ -3306,6 +3473,7 @@ function viewExpenses(){
     return '<tr><td>'+dateStr(e.date)+'</td><td><span class="badge badge-gray">'+esc(e.category||"أخرى")+'</span></td>'+
       '<td class="muted">'+esc(e.note||"—")+'</td>'+
       '<td>'+payMethodLabel(e.paymentMethod)+'</td>'+
+      '<td>'+(e.partner?partnerLabel(e.partner):'—')+'</td>'+
       '<td class="bold" style="color:var(--red);">- '+fmt(e.amount)+'</td>'+
       '<td><button class="icon-btn danger" onclick="deleteExpense(\''+e.id+'\')">'+icon("trash",16)+'</button></td></tr>';
   }).join("");
@@ -3324,8 +3492,8 @@ function viewExpenses(){
   '<div style="display:grid;grid-template-columns:1fr 2fr;gap:16px;">'+
     '<div class="card"><h3>'+icon("chart",17)+' توزيع المصاريف</h3>'+catRows+'</div>'+
     '<div class="card"><h3>'+icon("coins",17)+' سجل المصاريف</h3>'+
-      '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>الفئة</th><th>البيان</th><th>الدفع</th><th>المبلغ</th><th></th></tr></thead>'+
-      '<tbody>'+(rows || '<tr><td colspan="6" class="muted" style="text-align:center;padding:30px;">لا توجد مصاريف</td></tr>')+'</tbody></table></div>'+
+      '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>الفئة</th><th>البيان</th><th>الدفع</th><th>الحساب</th><th>المبلغ</th><th></th></tr></thead>'+
+      '<tbody>'+(rows || '<tr><td colspan="7" class="muted" style="text-align:center;padding:30px;">لا توجد مصاريف</td></tr>')+'</tbody></table></div>'+
     '</div>'+
   '</div>';
 }
@@ -3342,6 +3510,7 @@ function openExpenseForm(){
           '<option value="cash">نقدي</option><option value="card">كارت</option><option value="wallet">محفظة</option>'+
         '</select></div>'+
         '<div class="field"><label>من دفع (لو نقدي)</label><select id="ex-paidby">'+userOptionsHTML(currentUser()?currentUser().id:"", false)+'</select></div>'+
+        '<div class="field"><label>الحساب (مؤمن/عبدو) *</label>'+partnerSelectHTML("ex-partner", "")+'</div>'+
         '<div class="field full"><label>البيان / ملاحظات</label><input id="ex-note" placeholder="مثال: إيجار شهر أغسطس"></div>'+
       '</div>'+
     '</div>'+
@@ -3353,11 +3522,14 @@ function openExpenseForm(){
 }
 function saveExpense(){
   var amount = num($("#ex-amount").value);
+  var partner = $("#ex-partner").value;
   if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
+  if(!partner){ toast("اختر الحساب (مؤمن/عبدو)","err"); return; }
   var item = {
     id:uid(), date:new Date(($("#ex-date").value||todayKey())+"T12:00:00").getTime(),
     category:$("#ex-cat").value, amount:amount, note:$("#ex-note").value.trim(),
-    paymentMethod:$("#ex-method").value, paidBy:($("#ex-paidby")?$("#ex-paidby").value:null)||currentUser().id, userId:currentUser().id
+    paymentMethod:$("#ex-method").value, paidBy:($("#ex-paidby")?$("#ex-paidby").value:null)||currentUser().id, userId:currentUser().id,
+    partner: partner
   };
   api("POST", "/api/expenses", { item: item }).then(function(r){
     afterSync(r);
@@ -3476,6 +3648,7 @@ function openSupplierPayment(sid){
       '<div class="field"><label>المبلغ المدفوع *</label><input id="payout-amount" type="number" min="0" step="0.5" value="'+bal.toFixed(2)+'"></div>'+
       '<div class="field"><label>طريقة الدفع</label><select id="payout-method"><option value="cash">نقدي</option><option value="card">كارت</option><option value="wallet">محفظة</option></select></div>'+
       '<div class="field"><label>من دفع (لو نقدي)</label><select id="payout-by">'+userOptionsHTML(currentUser()?currentUser().id:"", false)+'</select></div>'+
+      '<div class="field"><label>الحساب الذي دفع (مؤمن/عبدو) *</label>'+partnerSelectHTML("payout-partner", "")+'</div>'+
       '<div class="field"><label>ملاحظات</label><input id="payout-note" placeholder="اختياري"></div>'+
     '</div>'+
     '<div class="modal-foot">'+
@@ -3486,9 +3659,11 @@ function openSupplierPayment(sid){
 }
 function saveSupplierPayment(sid){
   var amount = num($("#payout-amount").value);
+  var partner = $("#payout-partner").value;
   if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
+  if(!partner){ toast("اختر الحساب (مؤمن/عبدو)","err"); return; }
   var s = DB.suppliers.find(function(x){ return x.id===sid; });
-  var item = {id:uid(), date:Date.now(), supplierId:sid, supplierName:s.name, amount:amount, note:$("#payout-note").value.trim(), paymentMethod:$("#payout-method").value, paidBy:($("#payout-by")?$("#payout-by").value:null)||currentUser().id};
+  var item = {id:uid(), date:Date.now(), supplierId:sid, supplierName:s.name, amount:amount, note:$("#payout-note").value.trim(), paymentMethod:$("#payout-method").value, paidBy:($("#payout-by")?$("#payout-by").value:null)||currentUser().id, partner:partner};
   api("POST", "/api/payments/out", { item: item }).then(function(r){
     afterSync(r);
     closeModal(); renderViewInPlace(); toast("تم تسجيل الدفعة");
@@ -3631,7 +3806,7 @@ function viewFinance(){
     return '<div class="tot-row"><span>'+lbl+'</span><span class="bold '+(cls||"")+'">'+(sign==="+"?"+ ":"")+fmt(val)+'</span></div>';
   }
   var incomeRows = incomes.map(function(i){
-    return '<tr><td>'+dateStr(i.date)+'</td><td class="muted">'+esc(i.note||"—")+'</td><td class="bold" style="color:var(--green);">+ '+fmt(i.amount)+'</td>'+
+    return '<tr><td>'+dateStr(i.date)+'</td><td class="muted">'+esc(i.note||"—")+'</td><td>'+(i.partner?partnerLabel(i.partner):'—')+'</td><td class="bold" style="color:var(--green);">+ '+fmt(i.amount)+'</td>'+
       '<td><button class="icon-btn danger" onclick="deleteIncome(\''+i.id+'\')">'+icon("trash",16)+'</button></td></tr>';
   }).join("");
 
@@ -3658,8 +3833,8 @@ function viewFinance(){
       '</div>'+
     '</div>'+
     '<div class="card"><h3>'+icon("banknote",17)+' إيرادات أخرى <button class="btn btn-soft btn-sm" style="margin-inline-start:12px;" onclick="openIncomeForm()">'+icon("plus",14)+' إضافة</button></h3>'+
-      '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>البيان</th><th>المبلغ</th><th></th></tr></thead>'+
-      '<tbody>'+(incomeRows || '<tr><td colspan="4" class="muted" style="text-align:center;padding:24px;">لا توجد إيرادات أخرى</td></tr>')+'</tbody></table></div>'+
+      '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>البيان</th><th>الحساب</th><th>المبلغ</th><th></th></tr></thead>'+
+      '<tbody>'+(incomeRows || '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">لا توجد إيرادات أخرى</td></tr>')+'</tbody></table></div>'+
     '</div>';
 }
 function openIncomeForm(){
@@ -3669,6 +3844,7 @@ function openIncomeForm(){
       '<div class="field"><label>المبلغ *</label><input id="inc-amount" type="number" min="0" step="0.5" value=""></div>'+
       '<div class="field"><label>التاريخ</label><input id="inc-date" type="date" value="'+todayKey()+'"></div>'+
       '<div class="field"><label>من استلم الفلوس</label><select id="inc-by">'+userOptionsHTML(currentUser()?currentUser().id:"", false)+'</select></div>'+
+      '<div class="field"><label>الحساب (مؤمن/عبدو) *</label>'+partnerSelectHTML("inc-partner", "")+'</div>'+
       '<div class="field"><label>البيان</label><input id="inc-note" placeholder="مثال: بيع أكياس/إيراد إضافي"></div>'+
     '</div>'+
     '<div class="modal-foot">'+
@@ -3679,8 +3855,10 @@ function openIncomeForm(){
 }
 function saveIncome(){
   var amount = num($("#inc-amount").value);
+  var partner = $("#inc-partner").value;
   if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
-  var item = {id:uid(), date:new Date(($("#inc-date").value||todayKey())+"T12:00:00").getTime(), amount:amount, note:$("#inc-note").value.trim(), receivedBy:($("#inc-by")?$("#inc-by").value:null)||currentUser().id, userId:currentUser().id};
+  if(!partner){ toast("اختر الحساب (مؤمن/عبدو)","err"); return; }
+  var item = {id:uid(), date:new Date(($("#inc-date").value||todayKey())+"T12:00:00").getTime(), amount:amount, note:$("#inc-note").value.trim(), receivedBy:($("#inc-by")?$("#inc-by").value:null)||currentUser().id, userId:currentUser().id, partner:partner};
   api("POST", "/api/income", { item: item }).then(function(r){
     afterSync(r);
     closeModal(); renderViewInPlace(); toast("تم تسجيل الإيراد");
@@ -3828,6 +4006,80 @@ function viewAudit(){
     '<div class="table-wrap"><table><thead><tr><th>الوقت</th><th>المستخدم</th><th>الإجراء</th><th>التفاصيل</th></tr></thead>'+
     '<tbody>'+(rows || '<tr><td colspan="4" class="muted" style="text-align:center;padding:30px;">لا توجد حركات مسجلة</td></tr>')+'</tbody></table></div>'+
     '<p class="muted small mt8">💡 يُحتفظ بآخر 3000 حركة كحد أقصى.</p></div>';
+}
+
+/* ============================================================
+   حسابات الشركاء (مؤمن/عبدو)
+   ============================================================ */
+var LEDGER_TYPES = ["SALE","ORDER_DEPOSIT","ORDER_COLLECTION","PURCHASE_PAYMENT","EXPENSE","OTHER_INCOME","RETURN","EXCHANGE_ADJUSTMENT","PARTNER_TRANSFER"];
+var LEDGER_TYPE_LABELS = {
+  SALE:"بيع POS", ORDER_DEPOSIT:"عربون طلب", ORDER_COLLECTION:"تحصيل طلب", PURCHASE_PAYMENT:"دفعة مورد",
+  EXPENSE:"مصروف", OTHER_INCOME:"إيراد آخر", RETURN:"استرجاع", EXCHANGE_ADJUSTMENT:"فرق استبدال", PARTNER_TRANSFER:"تحويل بين الشركاء"
+};
+function ledgerTypeLabel(t){ return LEDGER_TYPE_LABELS[t] || t; }
+function ledgerTypeBadge(t){
+  var map = { SALE:"badge-green", ORDER_DEPOSIT:"badge-blue", ORDER_COLLECTION:"badge-blue", PURCHASE_PAYMENT:"badge-amber",
+    EXPENSE:"badge-red", OTHER_INCOME:"badge-green", RETURN:"badge-red", EXCHANGE_ADJUSTMENT:"badge-purple", PARTNER_TRANSFER:"badge-gray" };
+  return map[t] || "badge-gray";
+}
+var LEDGER_SOURCE_LABELS = { sale:"بيع POS", return:"استرجاع/استبدال", orderCollection:"طلب شحن", purchasePayment:"مشتريات", expense:"مصروف", otherIncome:"إيراد آخر", paymentOut:"دفعة مورد" };
+function ledgerSourceLabel(rt){ return LEDGER_SOURCE_LABELS[rt] || (rt||"—"); }
+function partnersLedgerWithBalance(){
+  var running = {moamen:0, abdo:0};
+  return (DB.partnerTransactions||[]).slice().sort(function(a,b){ return a.date-b.date; }).map(function(t){
+    running[t.partner] = (running[t.partner]||0) + (t.direction==="in"?(t.amount||0):-(t.amount||0));
+    return Object.assign({}, t, { balanceAfter: running[t.partner] });
+  });
+}
+function setPartnersFilter(v){ partnersFilter = v; renderViewInPlace(); }
+function setPartnersTypeFilter(v){ partnersTypeFilter = v; renderViewInPlace(); }
+function setPartnersFrom(v){ partnersFrom = v; renderViewInPlace(); }
+function setPartnersTo(v){ partnersTo = v; renderViewInPlace(); }
+function viewPartners(){
+  if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
+  var from = partnersFrom ? new Date(partnersFrom+"T00:00:00").getTime() : 0;
+  var to = partnersTo ? new Date(partnersTo+"T23:59:59").getTime() : Date.now()+86400000;
+  var all = partnersLedgerWithBalance();
+  var list = all.filter(function(t){
+    return t.date>=from && t.date<=to &&
+      (partnersFilter==="all" || t.partner===partnersFilter) &&
+      (partnersTypeFilter==="all" || t.type===partnersTypeFilter);
+  }).sort(function(a,b){ return b.date-a.date; });
+
+  var incomeTotal = list.filter(function(t){ return t.direction==="in"; }).reduce(function(a,t){ return a+(t.amount||0); },0);
+  var expenseTotalF = list.filter(function(t){ return t.direction==="out"; }).reduce(function(a,t){ return a+(t.amount||0); },0);
+
+  var typeOpts = '<option value="all">كل الأنواع</option>' + LEDGER_TYPES.map(function(t){ return '<option value="'+t+'" '+(partnersTypeFilter===t?"selected":"")+'>'+ledgerTypeLabel(t)+'</option>'; }).join("");
+  var partnerOpts = '<option value="all" '+(partnersFilter==="all"?"selected":"")+'>كل الشركاء</option>' +
+    PARTNERS.map(function(p){ return '<option value="'+p.id+'" '+(partnersFilter===p.id?"selected":"")+'>'+p.label+'</option>'; }).join("");
+
+  var rows = list.map(function(t){
+    return '<tr><td>'+dateStr(t.date)+' '+timeStr(t.date)+'</td>'+
+      '<td><span class="badge '+ledgerTypeBadge(t.type)+'">'+esc(ledgerTypeLabel(t.type))+'</span> <span class="small muted">'+esc(partnerLabel(t.partner))+'</span></td>'+
+      '<td class="muted">'+esc(t.notes||"—")+'</td>'+
+      '<td class="bold" style="color:var(--green);">'+(t.direction==="in"?fmt(t.amount):"—")+'</td>'+
+      '<td class="bold" style="color:var(--red);">'+(t.direction==="out"?fmt(t.amount):"—")+'</td>'+
+      '<td class="bold">'+fmt(t.balanceAfter)+'</td>'+
+      '<td>'+esc(ledgerSourceLabel(t.referenceType))+'</td>'+
+      '<td>'+esc(userById(t.userId)?userById(t.userId).name:"—")+'</td></tr>';
+  }).join("");
+
+  return '<div class="filterbar">'+
+    '<select onchange="setPartnersFilter(this.value)">'+partnerOpts+'</select>'+
+    '<select onchange="setPartnersTypeFilter(this.value)">'+typeOpts+'</select>'+
+    '<input type="date" value="'+partnersFrom+'" onchange="setPartnersFrom(this.value)">'+
+    '<input type="date" value="'+partnersTo+'" onchange="setPartnersTo(this.value)">'+
+    ((partnersFrom||partnersTo||partnersFilter!=="all"||partnersTypeFilter!=="all") ? '<button class="btn btn-ghost" onclick="partnersFrom=\'\';partnersTo=\'\';partnersFilter=\'all\';partnersTypeFilter=\'all\';renderViewInPlace()">مسح الفلترة</button>' : '')+
+  '</div>'+
+  '<div class="stats mb16">'+
+    statCard("card","var(--primary)", fmt(partnerBalance("moamen")), "رصيد مؤمن")+
+    statCard("card","#0891b2", fmt(partnerBalance("abdo")), "رصيد عبدو")+
+    statCard("chart","var(--green)", fmt(incomeTotal), "إجمالي الإيراد (حسب الفلترة الحالية)")+
+    statCard("coins","var(--red)", fmt(expenseTotalF), "إجمالي المصروف (حسب الفلترة الحالية)")+
+  '</div>'+
+  '<div class="card"><h3>'+icon("history",17)+' سجل حركات الشركاء ('+list.length+')</h3>'+
+    '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>نوع العملية</th><th>البيان</th><th>الإيراد</th><th>المصروف</th><th>الرصيد بعد العملية</th><th>المصدر</th><th>المستخدم</th></tr></thead>'+
+    '<tbody>'+(rows || '<tr><td colspan="8" class="muted" style="text-align:center;padding:30px;">لا توجد حركات</td></tr>')+'</tbody></table></div></div>';
 }
 
 /* ============================================================

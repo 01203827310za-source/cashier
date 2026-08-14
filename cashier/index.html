@@ -325,6 +325,9 @@ var store = (function(){
 })();
 var DB_KEY = "clothing_pos_db_v1";
 var SESSION_KEY = "clothing_pos_session_v1";
+// مصدر واحد لاسم المتجر يظهر على كل فاتورة/إيصال/شيت مطبوع — مستقل عن
+// إعدادات المتجر المحفوظة في localStorage حتى لا يظهر اسم قديم مخزّن من قبل.
+var STORE_NAME = "29 STORE";
 
 /* ---------- أدوات مساعدة ---------- */
 function $(s, r){ return (r||document).querySelector(s); }
@@ -531,7 +534,7 @@ function lowStockItems(){ return DB.products.filter(function(p){ return p.stock 
 function seed(){
   return {
     settings:{
-      storeName:" 29 STORE ",
+      storeName:"29 STORE",
       currency:"ج.م",
       taxRate:14,
       lowStockThreshold:5,
@@ -1399,7 +1402,7 @@ function receiptHTML(sale){
       '<tr><td></td><td style="text-align:left;font-weight:700">'+fmt(it.price*it.qty)+'</td></tr>';
   }).join("");
   return '<div class="receipt">'+
-    '<div class="rc name">'+esc(DB.settings.storeName)+'</div>'+
+    '<div class="rc name">'+esc(STORE_NAME)+'</div>'+
     '<div class="rc">'+esc(DB.settings.receiptFooter)+'</div>'+
     '<div class="divider"></div>'+
     '<div class="rc">فاتورة رقم: '+esc(sale.number)+'</div>'+
@@ -2682,7 +2685,7 @@ function orderSlipHTML(o){
   var pay = o.paymentStatus==="cod" ? "COD — الدفع عند الاستلام" : (o.paymentStatus==="credit" ? "آجل (دين على العميل)" : "مدفوع مسبقاً");
   var addr = [o.governorate,o.city,o.street].filter(Boolean).join("، ");
   return '<div class="osheet">'+
-    '<h3>'+esc(DB.settings.storeName)+'</h3>'+
+    '<h3>'+esc(STORE_NAME)+'</h3>'+
     '<div class="rc">أوردر شحن: '+esc(o.number)+'</div>'+
     '<div class="rc">'+dateStr(o.date)+' — '+timeStr(o.date)+'</div>'+
     '<div style="border-top:1px dashed #000;margin:6px 0;"></div>'+
@@ -2736,7 +2739,7 @@ function printDailySheet(){
   }).join("");
   $("#print-area").innerHTML =
     '<div style="font-family:Segoe UI,Tahoma,sans-serif;padding:10px;direction:rtl;">'+
-    '<h2 style="text-align:center;margin:0;">'+esc(DB.settings.storeName)+' — شيت الشحن</h2>'+
+    '<h2 style="text-align:center;margin:0;">'+esc(STORE_NAME)+' — شيت الشحن</h2>'+
     '<p style="text-align:center;margin:4px 0 12px;">'+dateStr(Date.now())+' — عدد الأوردرات: '+list.length+'</p>'+
     '<table style="width:100%;border-collapse:collapse;font-size:12px;" border="1" cellpadding="5">'+
     '<thead><tr><th>#</th><th>العميل / التليفون</th><th>العنوان</th><th>القطع</th><th>الإجمالي</th><th>الدفع</th><th>AWB</th></tr></thead>'+
@@ -3451,7 +3454,7 @@ function viewSettings(){
   '</div>';
 }
 function saveSettings(){
-  DB.settings.storeName = $("#s-name").value.trim() || "بوتيك الموضة";
+  DB.settings.storeName = $("#s-name").value.trim() || "29 STORE";
   DB.settings.currency = $("#s-cur").value.trim() || "ج.م";
   DB.settings.taxRate = num($("#s-tax").value);
   DB.settings.lowStockThreshold = Math.max(0, parseInt($("#s-low").value,10)||0);
