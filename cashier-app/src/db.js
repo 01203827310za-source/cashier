@@ -103,7 +103,9 @@ async function trimAuditLog(limit){
 
 async function replaceStateInDB(raw){
   raw = raw || {};
-  await prisma.$transaction(async (tx) => {
+  const created = await prisma.$transaction(async (tx) => {
+    let count = 0;
+
     // Wipe everything. Product/Sale/Purchase/Order cascade-delete their item rows.
     await tx.product.deleteMany({});
     await tx.sale.deleteMany({});
@@ -135,12 +137,15 @@ async function replaceStateInDB(raw){
         data: settings
       }
     });
+    count++;
 
     for (const u of (raw.users || [])) {
       await tx.user.create({ data: { id: u.id, name: u.name || null, username: u.username, password: u.password, role: u.role || null } });
+      count++;
     }
     for (const name of (raw.categories || [])) {
       await tx.category.create({ data: { id: uid(), name } });
+      count++;
     }
     for (const p of (raw.products || [])) {
       await tx.product.create({
@@ -150,12 +155,15 @@ async function replaceStateInDB(raw){
           variants: { create: (p.variants || []).map(v => ({ id: v.id || uid(), size: v.size || null, color: v.color || null, stock: v.stock != null ? v.stock : null, barcode: v.barcode || null })) }
         }
       });
+      count += 1 + (p.variants || []).length;
     }
     for (const c of (raw.customers || [])) {
       await tx.customer.create({ data: { id: c.id, name: c.name, phone: c.phone || null, notes: c.notes || null, createdAt: c.createdAt ? new Date(c.createdAt) : null, addresses: c.addresses || [] } });
+      count++;
     }
     for (const s of (raw.suppliers || [])) {
       await tx.supplier.create({ data: { id: s.id, name: s.name, phone: s.phone || null, notes: s.notes || null } });
+      count++;
     }
     for (const pu of (raw.purchases || [])) {
       await tx.purchase.create({
@@ -165,6 +173,7 @@ async function replaceStateInDB(raw){
           items: { create: (pu.items || []).map(it => ({ id: it.id || uid(), productId: it.productId || null, variantId: it.variantId || null, qty: it.qty != null ? it.qty : null, cost: it.cost != null ? it.cost : null, data: it })) }
         }
       });
+      count += 1 + (pu.items || []).length;
     }
     for (const s of (raw.sales || [])) {
       await tx.sale.create({
@@ -173,12 +182,15 @@ async function replaceStateInDB(raw){
           items: { create: (s.items || []).map(it => ({ id: it.id || uid(), productId: it.productId || null, variantId: it.variantId || null, price: it.price != null ? it.price : null, qty: it.qty != null ? it.qty : null, size: it.size || null, color: it.color || null, data: it })) }
         }
       });
+      count += 1 + (s.items || []).length;
     }
     for (const sc of (raw.shippingCompanies || [])) {
       await tx.shippingCompany.create({ data: { id: sc.id, name: sc.name || null, phone: sc.phone || null, notes: sc.notes || null } });
+      count++;
     }
     for (const sp of (raw.shipPrices || [])) {
       await tx.shippingPrice.create({ data: { id: sp.id, governorate: sp.governorate || null, price: sp.price != null ? sp.price : null } });
+      count++;
     }
     for (const o of (raw.orders || [])) {
       await tx.order.create({
@@ -188,40 +200,73 @@ async function replaceStateInDB(raw){
           items: { create: (o.items || []).map(it => ({ id: it.id || uid(), productId: it.productId || null, variantId: it.variantId || null, qty: it.qty != null ? it.qty : null, price: it.price != null ? it.price : null, data: it })) }
         }
       });
+      count += 1 + (o.items || []).length;
     }
     for (const name of (raw.expenseCategories || [])) {
       await tx.expenseCategory.create({ data: { id: uid(), name } });
+      count++;
     }
     for (const ex of (raw.expenses || [])) {
       await tx.expense.create({ data: { id: ex.id, category: ex.category || null, amount: ex.amount != null ? ex.amount : null, date: ex.date ? new Date(ex.date) : null, note: ex.note || null, userId: ex.userId || null, data: ex } });
+      count++;
     }
     for (const oi of (raw.otherIncome || [])) {
       await tx.otherIncome.create({ data: { id: oi.id, note: oi.note || null, amount: oi.amount != null ? oi.amount : null, date: oi.date ? new Date(oi.date) : null, userId: oi.userId || null, data: oi } });
+      count++;
     }
     for (const pi of (raw.paymentsIn || [])) {
       await tx.paymentIn.create({ data: { id: pi.id, customerName: pi.customerName || null, amount: pi.amount != null ? pi.amount : null, date: pi.date ? new Date(pi.date) : null, userId: pi.userId || null, data: pi } });
+      count++;
     }
     for (const po of (raw.paymentsOut || [])) {
       await tx.paymentOut.create({ data: { id: po.id, supplierName: po.supplierName || null, amount: po.amount != null ? po.amount : null, date: po.date ? new Date(po.date) : null, userId: po.userId || null, data: po } });
+      count++;
     }
     for (const cc of (raw.cashClosings || [])) {
       await tx.cashClosing.create({ data: { id: cc.id || uid(), userId: cc.userId || null, day: cc.day || null, date: cc.date ? new Date(cc.date) : null, data: cc } });
+      count++;
     }
     for (const t of (raw.transfers || [])) {
       await tx.transfer.create({ data: { id: t.id, fromId: t.fromId || null, toId: t.toId || null, amount: t.amount != null ? t.amount : null, date: t.date ? new Date(t.date) : null, byId: t.byId || null } });
+      count++;
     }
     for (const a of (raw.audit || [])) {
       await tx.auditLog.create({ data: { id: a.id || uid(), date: a.date ? new Date(a.date) : null, userId: a.userId || null, userName: a.userName || null, action: a.action || null, detail: a.detail || null } });
+      count++;
     }
-  }, { timeout: 60000 });
+
+    return count;
+  }, { timeout: 60000, maxWait: 15000 });
+
+  return created;
 }
 
-async function ensureSeeded(seedData){
-  const count = await prisma.user.count();
-  if (count === 0) {
-    console.log('Database empty — seeding initial data into PostgreSQL');
-    await replaceStateInDB(seedData);
+/**
+ * Confirms the DB is reachable, seeds it exactly once if empty, then logs
+ * row counts for a few key tables so a bad/incomplete seed is visible in
+ * the deploy logs immediately instead of surfacing later as a UI bug.
+ * Throws on failure — the caller decides whether/how to keep the process alive.
+ */
+async function initializeDatabase(seedData){
+  const userCount = await prisma.user.count();
+  console.log('Database connected');
+
+  if (userCount === 0) {
+    console.log('Database empty, starting seed');
+    const recordsCreated = await replaceStateInDB(seedData);
+    console.log('Seed completed successfully — records created: ' + recordsCreated);
+  } else {
+    console.log('Database already has data (' + userCount + ' users) — skipping seed');
   }
+
+  const counts = {
+    users: await prisma.user.count(),
+    products: await prisma.product.count(),
+    customers: await prisma.customer.count(),
+    sales: await prisma.sale.count()
+  };
+  console.log('Startup verification — users: ' + counts.users + ', products: ' + counts.products + ', customers: ' + counts.customers + ', sales: ' + counts.sales);
+  return counts;
 }
 
-module.exports = { prisma, buildStateFromDB, replaceStateInDB, ensureSeeded, trimAuditLog };
+module.exports = { prisma, buildStateFromDB, replaceStateInDB, initializeDatabase, trimAuditLog };

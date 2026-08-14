@@ -771,14 +771,30 @@ server.on("error", function(err){
   process.exit(1);
 });
 
+// شبكة أمان: أي خطأ غير متوقع (زي فشل مؤقت في تهيئة قاعدة البيانات) يتسجل
+// بوضوح بدل ما يوقف العملية كلها ويخلي Railway يعمل restart loop لا نهائي.
+// دي مش ممارسة عامة موصى بيها لكل تطبيق، لكنها مطلوبة هنا تحديداً عشان
+// نضمن إن فشل السيد (seed) وحده مايكسرش الكونتينر.
+process.on("unhandledRejection", function(err){
+  console.error("Unhandled promise rejection (server continues running):", err);
+});
+process.on("uncaughtException", function(err){
+  console.error("Uncaught exception (server continues running):", err);
+});
+
 // السيرفر لازم يفتح البورت فوراً عشان health check بتاع Railway ينجح،
-// من غير ما يستنى قاعدة البيانات. تهيئة قاعدة البيانات بتتم بعد كده في الخلفية —
-// لو فشلت (مثلاً القاعدة لسه مش جاهزة)، السيرفر يفضل شغال ويتسجل الخطأ بوضوح،
-// وأي طلب محتاج قاعدة بيانات هيرجع خطأ مناسب لحد ما الاتصال يتظبط.
+// من غير ما يستنى قاعدة البيانات. تهيئة قاعدة البيانات (فحص الاتصال + السيد
+// لو القاعدة فاضية + التحقق من الأعداد) بتتم بعد كده وبينتظرها قبل ما نعتبر
+// السيرفر "جاهز" — لكن لو فشلت، بتتسجل بوضوح والسيرفر يفضل شغال، وأي طلب
+// محتاج قاعدة بيانات هيرجع خطأ مناسب لحد ما الاتصال يتظبط.
 server.listen(PORT, "0.0.0.0", function(){
   console.log("Server running on port " + PORT + " | Database: PostgreSQL via Prisma");
 
-  db.ensureSeeded(seed()).catch(function(err){
-    console.error("Database initialization failed — server is still running, but DB-dependent requests will error until this is resolved:", err);
-  });
+  db.initializeDatabase(seed())
+    .then(function(){
+      console.log("Server ready.");
+    })
+    .catch(function(err){
+      console.error("Database initialization failed:", err);
+    });
 });
