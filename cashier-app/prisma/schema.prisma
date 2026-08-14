@@ -28,7 +28,7 @@ model Product {
   cost      Float?
   stock     Int?
   sku       String?
-  modelCode String? @unique
+  modelCode String  @unique
   image     String?
   offer     String?
   emoji     String?
