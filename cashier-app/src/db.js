@@ -83,6 +83,21 @@ async function buildStateFromDB(){
     date: p.date ? p.date.getTime() : null, amount: p.amount, paymentMethod: p.paymentMethod, notes: p.notes, userId: p.userId, partner: p.partner
   }));
 
+  const debts = await prisma.debt.findMany();
+  state.debts = debts.map(d => ({
+    ...(d.data || {}),
+    id: d.id, type: d.type, entityType: d.entityType, entityId: d.entityId, personName: d.personName,
+    totalAmount: d.totalAmount, paidAmount: d.paidAmount, remainingAmount: d.remainingAmount, status: d.status,
+    date: d.date ? d.date.getTime() : null, paymentMethod: d.paymentMethod, notes: d.notes, partner: d.partner,
+    direction: d.direction, userId: d.userId
+  }));
+
+  state.debtPayments = (await prisma.debtPayment.findMany()).map(p => ({
+    ...(p.data || {}),
+    id: p.id, debtId: p.debtId, amount: p.amount, date: p.date ? p.date.getTime() : null,
+    paymentMethod: p.paymentMethod, notes: p.notes, partner: p.partner, direction: p.direction, userId: p.userId
+  }));
+
   const sales = await prisma.sale.findMany({ include: { items: true } });
   state.sales = sales.map(s => ({
     ...(s.data || {}),
@@ -153,7 +168,7 @@ async function buildStateFromDB(){
   }));
 
   // Ensure arrays exist for compatibility
-  ["users", "categories", "products", "customers", "suppliers", "purchases", "purchasePayments", "audit", "sales", "returns",
+  ["users", "categories", "products", "customers", "suppliers", "purchases", "purchasePayments", "debts", "debtPayments", "audit", "sales", "returns",
    "shippingCompanies", "shipPrices", "orders", "orderCollections", "orderExchanges", "expenseCategories", "expenses", "otherIncome",
    "paymentsIn", "paymentsOut", "cashClosings", "transfers", "partnerTransactions"].forEach(function (k) { if (!state[k]) state[k] = []; });
 
@@ -183,6 +198,8 @@ async function replaceStateInDB(raw){
     // PurchasePayment must go before Purchase for the same reason.
     await tx.saleReturn.deleteMany({});
     await tx.purchasePayment.deleteMany({});
+    await tx.debtPayment.deleteMany({});
+    await tx.debt.deleteMany({});
     await tx.orderCollection.deleteMany({});
     await tx.orderExchange.deleteMany({});
     await tx.partnerTransaction.deleteMany({});
@@ -269,6 +286,28 @@ async function replaceStateInDB(raw){
           id: pp.id || uid(), purchaseId: pp.purchaseId, supplierId: pp.supplierId || null, supplierName: pp.supplierName || null,
           date: pp.date ? new Date(pp.date) : null, amount: pp.amount != null ? pp.amount : null, paymentMethod: pp.paymentMethod || null,
           notes: pp.notes || null, userId: pp.userId || null, partner: pp.partner || null, data: pp
+        }
+      });
+      count++;
+    }
+    for (const d of (raw.debts || [])) {
+      await tx.debt.create({
+        data: {
+          id: d.id, type: d.type || null, entityType: d.entityType || null, entityId: d.entityId || null, personName: d.personName || null,
+          totalAmount: d.totalAmount != null ? d.totalAmount : null, paidAmount: d.paidAmount != null ? d.paidAmount : null,
+          remainingAmount: d.remainingAmount != null ? d.remainingAmount : null, status: d.status || null,
+          date: d.date ? new Date(d.date) : null, paymentMethod: d.paymentMethod || null, notes: d.notes || null,
+          partner: d.partner || null, direction: d.direction || null, userId: d.userId || null, data: d
+        }
+      });
+      count++;
+    }
+    for (const dp of (raw.debtPayments || [])) {
+      await tx.debtPayment.create({
+        data: {
+          id: dp.id || uid(), debtId: dp.debtId, amount: dp.amount != null ? dp.amount : null, date: dp.date ? new Date(dp.date) : null,
+          paymentMethod: dp.paymentMethod || null, notes: dp.notes || null, partner: dp.partner || null,
+          direction: dp.direction || null, userId: dp.userId || null, data: dp
         }
       });
       count++;

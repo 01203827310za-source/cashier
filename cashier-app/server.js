@@ -243,6 +243,108 @@ async function restoreOutstandingSaleStock(tx, sale){
     if(remainingQty > 0) await restockSaleItem(tx, item, remainingQty);
   }
 }
+function debtStatusFromAmounts(totalAmount, paidAmount){
+  if(paidAmount >= totalAmount - 0.004) return "paid";
+  if(paidAmount > 0.004) return "partial";
+  return "unpaid";
+}
+function debtDirectionFromType(type){
+  return type === "customer_receivable" ? "in" : "out";
+}
+function debtEntityTypeFromType(type){
+  if(type === "customer_receivable") return "customer";
+  if(type === "supplier_payable") return "supplier";
+  if(type === "partner_personal") return "partner";
+  return "person";
+}
+function debtPersonNameFromInput(input){
+  return (input.personName || "").toString().trim();
+}
+function buildDebtPayload(input, userId){
+  const totalAmount = Number(input.totalAmount);
+  const paidAmount = Math.max(0, Number(input.paidAmount) || 0);
+  if(!(totalAmount > 0)) throw httpError(400, "إجمالي الدين يجب أن يكون أكبر من صفر");
+  if(paidAmount < 0) throw httpError(400, "المبلغ المدفوع لا يمكن أن يكون أقل من صفر");
+  if(paidAmount > totalAmount + 0.004) throw httpError(400, "المبلغ المدفوع لا يمكن أن يتجاوز إجمالي الدين");
+
+  const type = input.type || "";
+  const direction = debtDirectionFromType(type);
+  const entityType = debtEntityTypeFromType(type);
+  const entityId = input.entityId || null;
+  const personName = debtPersonNameFromInput(input);
+  const partner = input.partner === "abdo" ? "abdo" : (input.partner === "moamen" ? "moamen" : null);
+  const date = input.date ? Number(input.date) : Date.now();
+  const remainingAmount = Math.max(0, totalAmount - paidAmount);
+  const status = debtStatusFromAmounts(totalAmount, paidAmount);
+
+  if(entityType === "customer" && !entityId) throw httpError(400, "اختر العميل");
+  if(entityType === "supplier" && !entityId) throw httpError(400, "اختر المورد");
+  if(entityType === "partner" && !partner) throw httpError(400, "اختر الحساب (مؤمن/عبدو)");
+  if((entityType === "person" || entityType === "other") && !personName) throw httpError(400, "اسم الشخص / الجهة مطلوب");
+
+  return {
+    type,
+    entityType,
+    entityId,
+    personName,
+    totalAmount,
+    paidAmount,
+    remainingAmount,
+    status,
+    date,
+    paymentMethod: input.paymentMethod || null,
+    notes: (input.notes || "").trim() || null,
+    partner,
+    direction,
+    userId: userId || null
+  };
+}
+async function reverseDebtLedger(tx, debtId){
+  const payments = await tx.debtPayment.findMany({ where: { debtId }, select: { id: true } });
+  for(const p of payments){
+    await deletePartnerLedgerFor(tx, "debtPayment", p.id);
+  }
+}
+async function createDebtPayment(tx, opts){
+  const debt = opts.debt;
+  const amount = Number(opts.amount);
+  if(!(amount > 0)) throw httpError(400, "أدخل مبلغاً صحيحاً");
+  const remainingBefore = Math.max(0, (debt.remainingAmount != null ? debt.remainingAmount : ((debt.totalAmount||0) - (debt.paidAmount||0))));
+  if(amount > remainingBefore + 0.004) throw httpError(400, "المبلغ أكبر من المتبقي على الدين");
+
+  const paymentId = opts.id || uid();
+  const paymentDate = opts.date ? Number(opts.date) : Date.now();
+  const newPaid = (debt.paidAmount || 0) + amount;
+  const newRemaining = Math.max(0, (debt.totalAmount || 0) - newPaid);
+  const newStatus = debtStatusFromAmounts(debt.totalAmount || 0, newPaid);
+
+  await tx.debtPayment.create({ data: {
+    id: paymentId, debtId: debt.id, amount, date: new Date(paymentDate),
+    paymentMethod: opts.paymentMethod || null, notes: (opts.notes || "").trim() || null,
+    partner: opts.partner || null, direction: debt.direction || null, userId: opts.userId || null,
+    data: {
+      id: paymentId, debtId: debt.id, amount, date: paymentDate, paymentMethod: opts.paymentMethod || null,
+      notes: (opts.notes || "").trim() || null, partner: opts.partner || null, direction: debt.direction || null, userId: opts.userId || null
+    }
+  }});
+
+  await tx.debt.update({ where: { id: debt.id }, data: { paidAmount: newPaid, remainingAmount: newRemaining, status: newStatus } });
+
+  if(opts.partner === "moamen" || opts.partner === "abdo"){
+    await upsertPartnerLedger(tx, {
+      partner: opts.partner,
+      type: "DEBT_PAYMENT",
+      direction: debt.direction || "out",
+      amount,
+      referenceType: "debtPayment",
+      referenceId: paymentId,
+      date: paymentDate,
+      userId: opts.userId || null,
+      notes: "دفعة دين — " + (debt.personName || debt.id)
+    });
+  }
+  return { paymentId, newPaid, newRemaining, newStatus };
+}
 
 /* ---------- عناصر عامة (إضافة/تعديل/حذف) ---------- */
 const genericModels = {
@@ -1153,6 +1255,127 @@ const server = http.createServer(async function(req, res){
       if(err && err.code === "P2003"){ send(res, 400, {ok:false, error:"لا يمكن حذف هذه الفاتورة لوجود دفعات مسجّلة عليها"}); return; }
       throw err;
     }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+
+  /* ---------- الديون اليدوية ---------- */
+  if(method === "POST" && url === "/api/debts"){
+    const b = await readBody(req);
+    const debtIn = b.item || {};
+    const debtId = debtIn.id || uid();
+    try{
+      await prisma.$transaction(async function(tx){
+        const normalized = buildDebtPayload(debtIn, user.id);
+        const debtData = { id: debtId, ...normalized };
+        await tx.debt.create({ data: {
+          id: debtId, type: normalized.type, entityType: normalized.entityType, entityId: normalized.entityId,
+          personName: normalized.personName, totalAmount: normalized.totalAmount, paidAmount: 0, remainingAmount: normalized.totalAmount,
+          status: "unpaid", date: new Date(normalized.date), paymentMethod: normalized.paymentMethod, notes: normalized.notes,
+          partner: normalized.partner, direction: normalized.direction, userId: user.id, data: debtData
+        }});
+        if(normalized.paidAmount > 0){
+          await createDebtPayment(tx, {
+            debt: { id: debtId, totalAmount: normalized.totalAmount, paidAmount: 0, remainingAmount: normalized.totalAmount, direction: normalized.direction, personName: normalized.personName },
+            amount: normalized.paidAmount, date: normalized.date, paymentMethod: normalized.paymentMethod, notes: "دفعة مبدئية عند إنشاء الدين",
+            partner: normalized.partner, userId: user.id
+          });
+        }
+        await tx.auditLog.create({ data: auditEntry(req, "إضافة دين", (normalized.personName || normalized.entityId || "") + " — " + normalized.totalAmount) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    const savedDebt = state.debts.find(function(d){ return d.id === debtId; });
+    send(res, 200, { ok:true, db: state, debt: savedDebt });
+    return;
+  }
+  if(method === "POST" && /^\/api\/debts\/[^/]+\/edit$/.test(url)){
+    const id = url.split("/")[3];
+    const b = await readBody(req);
+    const existing = await prisma.debt.findUnique({ where: { id } });
+    if(!existing){ send(res, 404, { ok:false, error:"الدين غير موجود" }); return; }
+    try{
+      await prisma.$transaction(async function(tx){
+        const normalized = buildDebtPayload({
+          type: b.type !== undefined ? b.type : existing.type,
+          entityId: b.entityId !== undefined ? b.entityId : existing.entityId,
+          personName: b.personName !== undefined ? b.personName : existing.personName,
+          totalAmount: b.totalAmount !== undefined ? b.totalAmount : existing.totalAmount,
+          paidAmount: existing.paidAmount || 0,
+          date: b.date !== undefined ? b.date : (existing.date ? existing.date.getTime() : Date.now()),
+          paymentMethod: b.paymentMethod !== undefined ? b.paymentMethod : existing.paymentMethod,
+          notes: b.notes !== undefined ? b.notes : existing.notes,
+          partner: b.partner !== undefined ? b.partner : existing.partner
+        }, existing.userId || user.id);
+        if(normalized.totalAmount < (existing.paidAmount || 0) - 0.004){
+          throw httpError(400, "لا يمكن أن يكون إجمالي الدين أقل من المبلغ المدفوع.");
+        }
+        const debtData = { ...(existing.data || {}), id, ...normalized, paidAmount: existing.paidAmount || 0, remainingAmount: Math.max(0, normalized.totalAmount - (existing.paidAmount || 0)), status: debtStatusFromAmounts(normalized.totalAmount, existing.paidAmount || 0) };
+        await tx.debt.update({ where: { id }, data: {
+          type: normalized.type, entityType: normalized.entityType, entityId: normalized.entityId, personName: normalized.personName,
+          totalAmount: normalized.totalAmount, remainingAmount: debtData.remainingAmount, status: debtData.status,
+          date: new Date(normalized.date), paymentMethod: normalized.paymentMethod, notes: normalized.notes,
+          partner: normalized.partner, direction: normalized.direction, data: debtData
+        }});
+        await tx.auditLog.create({ data: auditEntry(req, "تعديل دين", normalized.personName || id) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+  if(method === "POST" && /^\/api\/debts\/[^/]+\/payment$/.test(url)){
+    const id = url.split("/")[3];
+    const b = await readBody(req);
+    const amount = Number(b.amount);
+    const existing = await prisma.debt.findUnique({ where: { id } });
+    if(!existing){ send(res, 404, { ok:false, error:"الدين غير موجود" }); return; }
+    try{
+      await prisma.$transaction(async function(tx){
+        const fresh = await tx.debt.findUnique({ where: { id } });
+        const partner = b.partner === "abdo" ? "abdo" : (b.partner === "moamen" ? "moamen" : null);
+        if(fresh.entityType === "partner" && !partner) throw httpError(400, "اختر الحساب (مؤمن/عبدو)");
+        if(fresh.entityType !== "partner" && partner == null && fresh.partner != null) throw httpError(400, "اختر الحساب (مؤمن/عبدو)");
+        await createDebtPayment(tx, {
+          debt: fresh,
+          amount,
+          date: b.date,
+          paymentMethod: b.paymentMethod || "cash",
+          notes: b.notes || null,
+          partner: partner || fresh.partner || null,
+          userId: user.id
+        });
+        await tx.auditLog.create({ data: auditEntry(req, "دفعة على دين", (fresh.personName || fresh.id) + " — " + amount) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+  if(method === "POST" && /^\/api\/debts\/[^/]+\/delete$/.test(url)){
+    const id = url.split("/")[3];
+    const existing = await prisma.debt.findUnique({ where: { id } });
+    if(!existing){ send(res, 404, { ok:false, error:"الدين غير موجود" }); return; }
+    await prisma.$transaction(async function(tx){
+      await reverseDebtLedger(tx, id);
+      await tx.debtPayment.deleteMany({ where: { debtId: id } });
+      await tx.debt.delete({ where: { id } });
+      await tx.auditLog.create({ data: auditEntry(req, "حذف دين", existing.personName || id) });
+    }, { timeout: 30000 });
     await db.trimAuditLog();
     const state = await db.buildStateFromDB();
     send(res, 200, { ok:true, db: state });

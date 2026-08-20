@@ -580,6 +580,9 @@ function seed(){
       {id:uid(), name:"مورد تجريبي", phone:"01100000000", notes:"مورد ملابس عام"}
     ],
     purchases:[],
+    purchasePayments:[],
+    debts:[],
+    debtPayments:[],
     audit:[],
     shippingCompanies:[
       {id:uid(), name:"أرامكس", phone:"", notes:""},
@@ -635,7 +638,7 @@ function afterSync(r){
   if(r && r.db){ DB = r.db; }
 }
 function migrateDB(){
-  ["users","categories","products","customers","sales","suppliers","purchases","purchasePayments","audit","shippingCompanies","shipPrices","orders","orderCollections","orderExchanges","expenseCategories","expenses","otherIncome","paymentsIn","paymentsOut","cashClosings","transfers","partnerTransactions"].forEach(function(k){ if(!DB[k]) DB[k] = []; });
+  ["users","categories","products","customers","sales","suppliers","purchases","purchasePayments","debts","debtPayments","audit","shippingCompanies","shipPrices","orders","orderCollections","orderExchanges","expenseCategories","expenses","otherIncome","paymentsIn","paymentsOut","cashClosings","transfers","partnerTransactions"].forEach(function(k){ if(!DB[k]) DB[k] = []; });
   migrateProducts();
   DB.customers.forEach(function(c){ if(!c.addresses) c.addresses = []; });
 }
@@ -689,6 +692,7 @@ var returnsTypeFilter = "all";
 var returnsFrom = "";
 var returnsTo = "";
 var returnDraft = null;
+var debtDraft = null;
 var partnersFilter = "all";
 var partnersTypeFilter = "all";
 var partnersFrom = "";

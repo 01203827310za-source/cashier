@@ -112,6 +112,40 @@ model PurchasePayment {
   purchase     Purchase @relation(fields: [purchaseId], references: [id])
 }
 
+model Debt {
+  id            String @id
+  type          String?
+  entityType    String? // "customer" | "supplier" | "partner" | "person" | "other"
+  entityId      String?
+  personName    String?
+  totalAmount   Float?
+  paidAmount    Float?
+  remainingAmount Float?
+  status        String? // "unpaid" | "partial" | "paid"
+  date          DateTime?
+  paymentMethod String?
+  notes         String?
+  partner       String? // "moamen" | "abdo" when linked to partner ledger
+  direction     String? // "in" | "out"
+  userId        String?
+  data          Json?
+  payments      DebtPayment[]
+}
+
+model DebtPayment {
+  id            String @id
+  debtId        String
+  amount        Float?
+  date          DateTime?
+  paymentMethod String?
+  notes         String?
+  partner       String? // "moamen" | "abdo"
+  direction     String? // "in" | "out"
+  userId        String?
+  data          Json?
+  debt          Debt @relation(fields: [debtId], references: [id])
+}
+
 model Sale {
   id      String @id
   number  String?
