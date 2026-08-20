@@ -195,10 +195,11 @@ tbody tr:last-child td{border-bottom:none;}
 /* ---------- Receipt / print ---------- */
 #print-area{display:none;}
 @media print{
+  html,body{width:auto; height:auto !important; margin:0; padding:0;}
   body>*:not(#print-area){display:none !important;}
-  #print-area{display:block !important;}
+  #print-area{display:block !important; width:auto; height:auto !important;}
 }
-.receipt{width:300px; margin:0 auto; font-family:"Courier New", monospace; font-size:12.5px; color:#000; background:#fff; padding:14px;}
+.receipt{width:100%; max-width:300px; margin:0 auto; font-family:"Courier New", monospace; font-size:12.5px; color:#000; background:#fff; padding:14px; box-sizing:border-box; word-wrap:break-word; overflow-wrap:break-word;}
 .receipt .rc{text-align:center; margin:2px 0;}
 .receipt .rc.name{font-size:16px; font-weight:800;}
 .receipt .divider{border-top:1px dashed #000; margin:8px 0;}
@@ -1392,6 +1393,15 @@ function completeSale(){
   toast("تم حفظ الفاتورة " + number);
 }
 
+function setPrintPageSize(mm){
+  var el = document.getElementById("print-page-size");
+  if(!el){
+    el = document.createElement("style");
+    el.id = "print-page-size";
+    document.head.appendChild(el);
+  }
+  el.textContent = mm ? ("@page{size:"+mm+" auto;margin:0;}") : "";
+}
 function receiptHTML(sale){
   var payLbl = payMethodLabel(sale.paymentMethod);
   var cust = sale.customerId ? DB.customers.find(function(c){ return c.id===sale.customerId; }) : null;
@@ -1424,6 +1434,7 @@ function receiptHTML(sale){
   '</div>';
 }
 function showReceipt(sale){
+  setPrintPageSize("80mm");
   $("#print-area").innerHTML = receiptHTML(sale);
   openModal(
     '<div class="modal-head"><h3>'+icon("print",18)+' فاتورة '+esc(sale.number)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
@@ -1567,6 +1578,7 @@ function printStickers(id){
     for(var k=0;k<q;k++){ labels.push(v); }
   });
   if(!labels.length){ toast("اختر مقاساً واحداً على الأقل","warn"); return; }
+  setPrintPageSize(null);
   $("#print-area").innerHTML = '<div class="labelsheet">'+labels.map(function(v){ return labelHTML(p, v); }).join("")+'</div>';
   closeModal();
   setTimeout(function(){ window.print(); }, 200);
@@ -2720,6 +2732,7 @@ function showOrderSlip(o){
 function printOrderSlip(id){
   var o = DB.orders.find(function(x){ return x.id===id; });
   if(!o) return;
+  setPrintPageSize("80mm");
   $("#print-area").innerHTML = orderSlipHTML(o);
   setTimeout(function(){ window.print(); }, 150);
 }
@@ -2737,6 +2750,7 @@ function printDailySheet(){
       '<td>'+(o.awb?esc(o.awb):"—")+'</td>'+
     '</tr>';
   }).join("");
+  setPrintPageSize(null);
   $("#print-area").innerHTML =
     '<div style="font-family:Segoe UI,Tahoma,sans-serif;padding:10px;direction:rtl;">'+
     '<h2 style="text-align:center;margin:0;">'+esc(STORE_NAME)+' — شيت الشحن</h2>'+
