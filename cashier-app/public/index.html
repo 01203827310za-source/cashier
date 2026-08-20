@@ -715,6 +715,13 @@ function flowNext(s){
   var i = ORDER_FLOW.indexOf(s);
   return (i>=0 && i<ORDER_FLOW.length-1) ? ORDER_FLOW[i+1] : null;
 }
+function isSaleCancelled(s){ return !!s && s.status === "cancelled"; }
+function activeSalesList(list){
+  return (list || DB.sales || []).filter(function(s){ return !isSaleCancelled(s); });
+}
+function saleStatusBadgeHTML(s){
+  return isSaleCancelled(s) ? ' <span class="badge badge-gray">ملغاة</span>' : "";
+}
 function shipPriceFor(gov){
   var sp = DB.shipPrices.find(function(s){ return s.governorate===gov; });
   return sp ? sp.price : 0;
@@ -722,7 +729,7 @@ function shipPriceFor(gov){
 
 /* ---------- الأرصدة والديون ---------- */
 function customerSalesCredit(cid){
-  return DB.sales.filter(function(s){ return s.customerId===cid && s.paymentMethod==="credit"; })
+  return activeSalesList(DB.sales).filter(function(s){ return s.customerId===cid && s.paymentMethod==="credit"; })
     .reduce(function(a,s){ return a+s.total; },0);
 }
 function customerOrdersCredit(cid){
@@ -741,6 +748,7 @@ function customerReturnsAdjustment(cid){
   (DB.returns||[]).forEach(function(r){
     if(r.customerId !== cid) return;
     var sale = DB.sales.find(function(s){ return s.id === r.saleId; });
+    if(isSaleCancelled(sale)) return;
     var wasCreditSale = !!(sale && sale.paymentMethod === "credit");
     if(wasCreditSale){
       v += r.type === "exchange" ? -(r.difference||0) : (r.returnedTotal||0);
@@ -765,9 +773,10 @@ function saleReturnedTotal(saleId){
 function returnsImpact(returnsList){
   var returnsTotal = 0, exchangeReplacementTotal = 0, profitImpact = 0;
   (returnsList||[]).forEach(function(r){
+    var sale = DB.sales.find(function(s){ return s.id===r.saleId; });
+    if(isSaleCancelled(sale)) return;
     returnsTotal += (r.returnedTotal||0);
     if(r.type === "exchange") exchangeReplacementTotal += (r.replacementTotal||0);
-    var sale = DB.sales.find(function(s){ return s.id===r.saleId; });
     (r.items||[]).forEach(function(it){
       var saleItem = sale ? sale.items.find(function(si){ return si.id===it.saleItemId; }) : null;
       var cost = (saleItem && saleItem.cost!=null) ? saleItem.cost : 0;
@@ -828,7 +837,7 @@ function incomeReceivedBy(i){ return i.receivedBy || i.userId; }
 /* الرصيد الجاري لكل شخص (كل الفلوس اللي معاه) */
 function userCashBalance(userId){
   var b = 0;
-  DB.sales.forEach(function(s){ if(s.paymentMethod==="cash" && saleCashBy(s)===userId) b += s.total; });
+  activeSalesList(DB.sales).forEach(function(s){ if(s.paymentMethod==="cash" && saleCashBy(s)===userId) b += s.total; });
   DB.orders.forEach(function(o){ if(o.collected && o.collectedBy===userId) b += (o.collectedAmount||o.total); });
   DB.otherIncome.forEach(function(i){ if(incomeReceivedBy(i)===userId) b += i.amount; });
   (DB.paymentsIn||[]).forEach(function(p){ if(payInReceivedBy(p)===userId) b += p.amount; });
@@ -842,7 +851,7 @@ function dayMovements(userId, day){
   var from = new Date(day+"T00:00:00").getTime(), to = new Date(day+"T23:59:59").getTime();
   function inR(t){ return t>=from && t<=to; }
   var m = {cashSales:0, cod:0, transfersIn:0, transfersOut:0, expenses:0, supplierPay:0, otherIncome:0, custPay:0, refunds:0};
-  DB.sales.forEach(function(s){ if(s.paymentMethod==="cash" && saleCashBy(s)===userId && inR(s.date)) m.cashSales += s.total; });
+  activeSalesList(DB.sales).forEach(function(s){ if(s.paymentMethod==="cash" && saleCashBy(s)===userId && inR(s.date)) m.cashSales += s.total; });
   DB.orders.forEach(function(o){ if(o.collected && o.collectedBy===userId && inR(o.collectedAt||o.date)) m.cod += (o.collectedAmount||o.total); });
   DB.otherIncome.forEach(function(i){ if(incomeReceivedBy(i)===userId && inR(i.date)) m.otherIncome += i.amount; });
   (DB.paymentsIn||[]).forEach(function(p){ if(payInReceivedBy(p)===userId && inR(p.date)) m.custPay += p.amount; });
@@ -1092,13 +1101,13 @@ function renderView(){
    ============================================================ */
 function viewDashboard(){
   var tKey = todayKey();
-  var todaySales = DB.sales.filter(function(s){ return dayKey(s.date) === tKey; });
+  var todaySales = activeSalesList(DB.sales).filter(function(s){ return dayKey(s.date) === tKey; });
   var revenue = todaySales.reduce(function(a,s){ return a+s.total; },0);
   var profit = todaySales.reduce(function(a,s){ return a+s.profit; },0);
   var items = todaySales.reduce(function(a,s){ return a+s.items.reduce(function(x,it){ return x+it.qty; },0); },0);
   var orderCount = DB.orders.filter(function(o){ return dayKey(o.date) === tKey; }).length;
   var low = DB.products.filter(function(p){ return p.stock <= DB.settings.lowStockThreshold; });
-  var recent = DB.sales.slice().sort(function(a,b){ return b.date-a.date; }).slice(0,7);
+  var recent = activeSalesList(DB.sales).slice().sort(function(a,b){ return b.date-a.date; }).slice(0,7);
 
   var todayReturns = (DB.returns||[]).filter(function(r){ return dayKey(r.date) === tKey; });
   var todayRi = returnsImpact(todayReturns);
@@ -1131,7 +1140,7 @@ function viewDashboard(){
     '<div class="card"><h3>'+icon("print",17)+' آخر الفواتير</h3>'+
     '<div class="table-wrap"><table><thead><tr><th>رقم الفاتورة</th><th>الوقت</th><th>الكاشير</th><th>الإجمالي</th><th></th></tr></thead><tbody>'+
     recent.map(function(s){
-      return '<tr><td class="bold">'+esc(s.number)+'</td><td>'+dateStr(s.date)+' '+timeStr(s.date)+'</td><td>'+esc(userById(s.userId) ? userById(s.userId).name : "-")+'</td>'+
+      return '<tr><td class="bold">'+esc(s.number)+saleStatusBadgeHTML(s)+'</td><td>'+dateStr(s.date)+' '+timeStr(s.date)+'</td><td>'+esc(userById(s.userId) ? userById(s.userId).name : "-")+'</td>'+
       '<td class="bold">'+fmt(s.total)+' '+esc(DB.settings.currency)+'</td>'+
       '<td><button class="icon-btn primary" onclick="viewSale(\''+s.id+'\')">'+icon("eye",16)+'</button></td></tr>';
     }).join("")+
@@ -1530,6 +1539,8 @@ function receiptHTML(sale){
   var payLbl = payMethodLabel(sale.paymentMethod);
   var cust = sale.customerId ? DB.customers.find(function(c){ return c.id===sale.customerId; }) : null;
   var returned = sale.id ? saleReturnedTotal(sale.id) : 0;
+  var cancelled = isSaleCancelled(sale);
+  var cancelledByUser = sale.cancelledBy ? userById(sale.cancelledBy) : null;
   var rows = sale.items.map(function(it){
     var opt = [it.size, it.color].filter(Boolean).join(" / ");
     return '<tr><td>'+esc(it.name)+ (opt?'<br><span style="font-size:10px">'+esc(opt)+'</span>':'') +'</td>'+
@@ -1542,6 +1553,10 @@ function receiptHTML(sale){
     '<div class="divider"></div>'+
     '<div class="rc">فاتورة رقم: '+esc(sale.number)+'</div>'+
     '<div class="rc">'+dateStr(sale.date)+' — '+timeStr(sale.date)+'</div>'+
+    (cancelled ? '<div class="rc" style="color:var(--red);font-weight:700;">ملغاة</div>' : '')+
+    (cancelled && sale.cancelledAt ? '<div class="rc">تاريخ الإلغاء: '+dateStr(sale.cancelledAt)+' — '+timeStr(sale.cancelledAt)+'</div>' : '')+
+    (cancelled && cancelledByUser ? '<div class="rc">بواسطة: '+esc(cancelledByUser.name)+'</div>' : '')+
+    (cancelled && sale.cancellationReason ? '<div class="rc">السبب: '+esc(sale.cancellationReason)+'</div>' : '')+
     (cust ? '<div class="rc">العميل: '+esc(cust.name)+'</div>' : '')+
     '<div class="divider"></div>'+
     '<table>'+rows+'</table>'+
@@ -1566,17 +1581,52 @@ function showReceipt(sale){
   setPrintPageSize("80mm");
   $("#print-area").innerHTML = receiptHTML(sale);
   openModal(
-    '<div class="modal-head"><h3>'+icon("print",18)+' فاتورة '+esc(sale.number)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-head"><h3>'+icon("print",18)+' فاتورة '+esc(sale.number)+saleStatusBadgeHTML(sale)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
     '<div class="modal-body" style="background:#f1f5f9;padding:20px;">'+
       '<div style="background:#fff;border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,.08);max-width:320px;margin:0 auto;">'+receiptHTML(sale)+'</div>'+
     '</div>'+
     '<div class="modal-foot">'+
       '<button class="btn btn-primary" onclick="window.print()">'+icon("print",16)+' طباعة</button>'+
-      (canManageReturnsUI() && sale.id ? '<button class="btn btn-soft-red" onclick="openReturnFlow(\''+sale.id+'\',\'return\')">'+icon("return",16)+' استرجاع</button>' : '')+
-      (canManageReturnsUI() && sale.id ? '<button class="btn btn-soft" onclick="openReturnFlow(\''+sale.id+'\',\'exchange\')">'+icon("return",16)+' استبدال</button>' : '')+
+      (canManageReturnsUI() && sale.id && !isSaleCancelled(sale) ? '<button class="btn btn-soft-red" onclick="openReturnFlow(\''+sale.id+'\',\'return\')">'+icon("return",16)+' استرجاع</button>' : '')+
+      (canManageReturnsUI() && sale.id && !isSaleCancelled(sale) ? '<button class="btn btn-soft" onclick="openReturnFlow(\''+sale.id+'\',\'exchange\')">'+icon("return",16)+' استبدال</button>' : '')+
+      (canManageReturnsUI() && sale.id && !isSaleCancelled(sale) ? '<button class="btn btn-red" onclick="openSaleCancelDialog(\''+sale.id+'\')">إلغاء الفاتورة</button>' : '')+
       '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
     '</div>'
   );
+}
+function openSaleCancelDialog(id){
+  var sale = DB.sales.find(function(x){ return x.id===id; });
+  if(!sale) return;
+  if(isSaleCancelled(sale)){ toast("الفاتورة ملغاة بالفعل","warn"); return; }
+  openModal(
+    '<div class="modal-head"><h3>إلغاء الفاتورة</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<p class="mb8 bold">هل أنت متأكد من إلغاء هذه الفاتورة؟</p>'+
+      '<div class="warn-banner" style="margin:0 0 12px 0;">سيتم إرجاع المخزون وعكس جميع التأثيرات المالية المرتبطة بالفاتورة.</div>'+
+      '<div class="field"><label>سبب الإلغاء (اختياري)</label><textarea id="sale-cancel-reason" placeholder="اكتب السبب إن وجد"></textarea></div>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+      '<button class="btn btn-red" id="sale-cancel-confirm">تأكيد إلغاء الفاتورة</button>'+
+    '</div>'
+  );
+  $("#sale-cancel-confirm").addEventListener("click", function(){
+    var btn = this;
+    btn.disabled = true;
+    api("POST", "/api/sale/" + id + "/cancel", { reason: ($("#sale-cancel-reason").value || "").trim() })
+      .then(function(r){
+        afterSync(r);
+        closeModal();
+        renderViewInPlace();
+        var fresh = DB.sales.find(function(x){ return x.id===id; });
+        if(fresh) showReceipt(fresh);
+        toast("تم إلغاء الفاتورة");
+      })
+      .catch(function(e){
+        btn.disabled = false;
+        toast(e.message, "err");
+      });
+  });
 }
 
 /* ============================================================
@@ -1904,12 +1954,13 @@ function viewCustomers(){
   });
   var rows = list.map(function(c){
     var sales = DB.sales.filter(function(s){ return s.customerId===c.id; });
-    var spent = sales.reduce(function(a,s){ return a+s.total; },0);
+    var activeSales = activeSalesList(sales);
+    var spent = activeSales.reduce(function(a,s){ return a+s.total; },0);
     var bal = customerBalance(c.id);
     return '<tr>'+
       '<td><div class="row"><div class="avatar" style="width:34px;height:34px;border-radius:50%;background:var(--primary-soft);color:var(--primary);display:flex;align-items:center;justify-content:center;font-weight:800;">'+esc(c.name.charAt(0))+ (c.name.charAt(1)||"") +'</div><div><div class="bold">'+esc(c.name)+'</div></div></div></td>'+
       '<td dir="ltr" style="text-align:right;">'+esc(c.phone||"—")+'</td>'+
-      '<td>'+sales.length+'</td>'+
+      '<td>'+activeSales.length+'</td>'+
       '<td class="bold">'+fmt(spent)+' '+esc(DB.settings.currency)+'</td>'+
       '<td class="bold" style="color:'+(bal>0?'var(--green)':'inherit')+';">'+(bal>0?fmt(bal):'—')+'</td>'+
       '<td>'+
@@ -2002,20 +2053,21 @@ function viewCustomer(id){
   var c = DB.customers.find(function(x){ return x.id===id; });
   if(!c) return;
   var sales = DB.sales.filter(function(s){ return s.customerId===id; }).sort(function(a,b){ return b.date-a.date; });
-  var spent = sales.reduce(function(a,s){ return a+s.total; },0);
+  var activeSales = activeSalesList(sales);
+  var spent = activeSales.reduce(function(a,s){ return a+s.total; },0);
   var bal = customerBalance(id);
   var pays = (DB.paymentsIn||[]).filter(function(p){ return p.customerId===id; }).sort(function(a,b){ return b.date-a.date; });
   var payRows = pays.map(function(p){
     return '<tr><td>'+dateStr(p.date)+' '+timeStr(p.date)+'</td><td class="muted">'+esc(p.note||"—")+'</td><td class="bold" style="color:var(--green);">+ '+fmt(p.amount)+'</td></tr>';
   }).join("");
   var rows = sales.map(function(s){
-    return '<tr><td class="bold">'+esc(s.number)+'</td><td>'+dateStr(s.date)+' '+timeStr(s.date)+'</td><td>'+s.items.length+'</td><td class="bold">'+fmt(s.total)+'</td><td>'+payMethodLabel(s.paymentMethod)+'</td><td><button class="icon-btn primary" onclick="viewSale(\''+s.id+'\')">'+icon("eye",16)+'</button></td></tr>';
+    return '<tr><td class="bold">'+esc(s.number)+saleStatusBadgeHTML(s)+'</td><td>'+dateStr(s.date)+' '+timeStr(s.date)+'</td><td>'+s.items.length+'</td><td class="bold">'+fmt(s.total)+'</td><td>'+payMethodLabel(s.paymentMethod)+'</td><td><button class="icon-btn primary" onclick="viewSale(\''+s.id+'\')">'+icon("eye",16)+'</button></td></tr>';
   }).join("");
   openModal(
     '<div class="modal-head"><h3>'+icon("user",18)+' '+esc(c.name)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
     '<div class="modal-body">'+
       '<div class="stats" style="grid-template-columns:1fr 1fr 1fr;">'+
-        '<div class="stat"><div class="lbl">عدد المشتريات</div><div class="val">'+sales.length+'</div></div>'+
+        '<div class="stat"><div class="lbl">عدد المشتريات</div><div class="val">'+activeSales.length+'</div></div>'+
         '<div class="stat"><div class="lbl">إجمالي الإنفاق</div><div class="val">'+fmt(spent)+'</div></div>'+
         '<div class="stat"><div class="lbl">الرصيد المستحق عليه</div><div class="val" style="color:'+(bal>0?"var(--green)":"inherit")+';">'+fmt(bal)+'</div></div>'+
       '</div>'+
@@ -2049,7 +2101,7 @@ function rangeFilter(){
 }
 function viewReports(){
   var f = rangeFilter();
-  var sales = DB.sales.filter(function(s){ return s.date>=f.from && s.date<=f.to; });
+  var sales = activeSalesList(DB.sales).filter(function(s){ return s.date>=f.from && s.date<=f.to; });
   var revenue = sales.reduce(function(a,s){ return a+s.total; },0);
   var profit = sales.reduce(function(a,s){ return a+s.profit; },0);
   var count = sales.length;
@@ -2116,7 +2168,7 @@ function viewReports(){
   var list = sales.slice().sort(function(a,b){ return b.date-a.date; });
   var rows = list.map(function(s){
     var returnedForRow = saleReturnedTotal(s.id);
-    return '<tr><td class="bold">'+esc(s.number)+'</td><td>'+dateStr(s.date)+' '+timeStr(s.date)+'</td>'+
+    return '<tr><td class="bold">'+esc(s.number)+saleStatusBadgeHTML(s)+'</td><td>'+dateStr(s.date)+' '+timeStr(s.date)+'</td>'+
       '<td>'+esc(userById(s.userId)?userById(s.userId).name:"-")+'</td>'+
       '<td>'+s.items.reduce(function(a,it){return a+it.qty;},0)+'</td>'+
       '<td class="bold">'+fmt(s.total)+(returnedForRow>0.004?'<div class="small" style="color:var(--red);">مرتجع: -'+fmt(returnedForRow)+'</div>':'')+'</td>'+
@@ -2165,13 +2217,6 @@ function viewSale(id){
   var s = DB.sales.find(function(x){ return x.id===id; });
   if(!s) return;
   showReceipt(s);
-}
-function returnSale(id){
-  var s = DB.sales.find(function(x){ return x.id===id; });
-  if(!s) return;
-  confirmBox("إرجاع الفاتورة "+s.number+"؟ سيتم إرجاع الكميات للمخزون وحذف الفاتورة.", function(){
-    api("POST", "/api/sale/" + id + "/return").then(function(r){ afterSync(r); renderViewInPlace(); toast("تم إرجاع الفاتورة واستعادة المخزون"); }).catch(function(e){ toast(e.message, "err"); });
-  }, true);
 }
 
 /* ============================================================
@@ -4088,7 +4133,7 @@ function viewCash(){
 function viewFinance(){
   if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
   var f = rangeFilter();
-  var sales = DB.sales.filter(function(s){ return s.date>=f.from && s.date<=f.to; });
+  var sales = activeSalesList(DB.sales).filter(function(s){ return s.date>=f.from && s.date<=f.to; });
   var orders = DB.orders.filter(function(o){ return o.date>=f.from && o.date<=f.to && ["returned","cancelled"].indexOf(o.status)===-1; });
   var expenses = DB.expenses.filter(function(e){ return e.date>=f.from && e.date<=f.to; });
   var incomes = DB.otherIncome.filter(function(i){ return i.date>=f.from && i.date<=f.to; });
@@ -4204,7 +4249,7 @@ function codReceivableValue(){
 }
 function electronicAssetsValue(){
   var v = 0;
-  DB.sales.forEach(function(s){ if(s.paymentMethod==="card"||s.paymentMethod==="wallet") v += s.total; });
+  activeSalesList(DB.sales).forEach(function(s){ if(s.paymentMethod==="card"||s.paymentMethod==="wallet") v += s.total; });
   DB.orders.forEach(function(o){ if(o.paymentStatus==="paid" && ["returned","cancelled"].indexOf(o.status)===-1) v += o.total; });
   return v;
 }

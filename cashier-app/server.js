@@ -207,6 +207,42 @@ async function restockSaleItem(tx, saleItem, qty){
   }
   if(saleItem.productId) await recomputeProductStock(tx, saleItem.productId);
 }
+function saleDataFromRow(row){
+  return {
+    ...(row.data || {}),
+    id: row.id,
+    number: row.number,
+    date: row.date ? row.date.getTime() : null,
+    userId: row.userId,
+    total: row.total
+  };
+}
+function isCancelledSaleRecord(row){
+  return !!row && !!row.data && row.data.status === "cancelled";
+}
+async function reverseSaleRelatedLedger(tx, saleId){
+  await deletePartnerLedgerFor(tx, "sale", saleId);
+  const relatedReturns = await tx.saleReturn.findMany({ where: { saleId }, select: { id: true } });
+  for(const r of relatedReturns){
+    await deletePartnerLedgerFor(tx, "return", r.id);
+    await deletePartnerLedgerFor(tx, "return", r.id + "-x");
+  }
+}
+async function restoreOutstandingSaleStock(tx, sale){
+  const returnedAgg = await tx.saleReturnItem.groupBy({
+    by: ["saleItemId"],
+    where: { saleReturn: { saleId: sale.id } },
+    _sum: { qty: true }
+  });
+  const returnedByItem = {};
+  for(const row of returnedAgg) returnedByItem[row.saleItemId] = row._sum.qty || 0;
+  for(const item of sale.items){
+    const soldQty = item.qty || 0;
+    const alreadyReturned = returnedByItem[item.id] || 0;
+    const remainingQty = Math.max(0, soldQty - alreadyReturned);
+    if(remainingQty > 0) await restockSaleItem(tx, item, remainingQty);
+  }
+}
 
 /* ---------- عناصر عامة (إضافة/تعديل/حذف) ---------- */
 const genericModels = {
@@ -439,6 +475,40 @@ const server = http.createServer(async function(req, res){
       await tx.sale.delete({ where: { id } });
       await tx.auditLog.create({ data: auditEntry(req, "إرجاع فاتورة", existing.number || "") });
     }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+  if(method === "POST" && /^\/api\/sale\/[^/]+\/cancel$/.test(url)){
+    const id = url.split("/")[3];
+    const b = await readBody(req);
+    const reason = (b.reason || "").trim() || null;
+    const existing = await prisma.sale.findUnique({ where: { id }, include: { items: true } });
+    if(!existing){ send(res, 404, { ok:false, error:"الفاتورة غير موجودة" }); return; }
+    if(isCancelledSaleRecord(existing)){ send(res, 409, { ok:false, error:"الفاتورة ملغاة بالفعل" }); return; }
+    try{
+      await prisma.$transaction(async function(tx){
+        const fresh = await tx.sale.findUnique({ where: { id }, include: { items: true } });
+        if(!fresh) throw httpError(404, "الفاتورة غير موجودة");
+        if(isCancelledSaleRecord(fresh)) throw httpError(409, "الفاتورة ملغاة بالفعل");
+
+        const merged = saleDataFromRow(fresh);
+        merged.status = "cancelled";
+        merged.cancelledAt = Date.now();
+        merged.cancelledBy = user.id;
+        merged.cancellationReason = reason;
+
+        await restoreOutstandingSaleStock(tx, fresh);
+        await reverseSaleRelatedLedger(tx, id);
+        await tx.sale.update({ where: { id }, data: { data: merged } });
+        await tx.auditLog.create({ data: auditEntry(req, "إلغاء فاتورة", (fresh.number || "") + (reason ? (" — " + reason) : "")) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+
     await db.trimAuditLog();
     const state = await db.buildStateFromDB();
     send(res, 200, { ok:true, db: state });
