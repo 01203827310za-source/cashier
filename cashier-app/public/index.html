@@ -741,6 +741,7 @@ function isSaleCancelled(s){ return !!s && s.status === "cancelled"; }
 function activeSalesList(list){
   return (list || DB.sales || []).filter(function(s){ return !isSaleCancelled(s); });
 }
+function isReturnCancelled(r){ return !!r && r.status === "ملغي"; }
 function saleStatusBadgeHTML(s){
   return isSaleCancelled(s) ? ' <span class="badge badge-gray">ملغاة</span>' : "";
 }
@@ -769,6 +770,7 @@ function customerReturnsAdjustment(cid){
   var v = 0;
   (DB.returns||[]).forEach(function(r){
     if(r.customerId !== cid) return;
+    if(isReturnCancelled(r)) return;
     var sale = DB.sales.find(function(s){ return s.id === r.saleId; });
     if(isSaleCancelled(sale)) return;
     var wasCreditSale = !!(sale && sale.paymentMethod === "credit");
@@ -783,7 +785,7 @@ function customerReturnsAdjustment(cid){
 // المرتجع الإجمالي المسجّل على فاتورة بيع معينة (يشمل الجزء المرتجع من أي عملية
 // استبدال أيضاً — القطعة القديمة رجعت فعلاً بغض النظر عن نوع العملية).
 function saleReturnedTotal(saleId){
-  return (DB.returns||[]).filter(function(r){ return r.saleId===saleId; })
+  return (DB.returns||[]).filter(function(r){ return r.saleId===saleId && !isReturnCancelled(r); })
     .reduce(function(a,r){ return a+(r.returnedTotal||0); },0);
 }
 // أثر مجموعة من عمليات الاسترجاع/الاستبدال على أرقام التقارير المالية:
@@ -795,6 +797,7 @@ function saleReturnedTotal(saleId){
 function returnsImpact(returnsList){
   var returnsTotal = 0, exchangeReplacementTotal = 0, profitImpact = 0;
   (returnsList||[]).forEach(function(r){
+    if(isReturnCancelled(r)) return;
     var sale = DB.sales.find(function(s){ return s.id===r.saleId; });
     if(isSaleCancelled(sale)) return;
     returnsTotal += (r.returnedTotal||0);
@@ -882,7 +885,7 @@ function dayMovements(userId, day){
   DB.expenses.forEach(function(e){ if(e.paymentMethod==="cash" && expensePaidBy(e)===userId && inR(e.date)) m.expenses += e.amount; });
   (DB.paymentsOut||[]).forEach(function(p){ if((p.paymentMethod||"cash")==="cash" && payOutPaidBy(p)===userId && inR(p.date)) m.supplierPay += p.amount; });
   (DB.returns||[]).forEach(function(r){
-    if(r.refundMethod !== "cash" || r.userId !== userId || !inR(r.date)) return;
+    if(isReturnCancelled(r) || r.refundMethod !== "cash" || r.userId !== userId || !inR(r.date)) return;
     if(r.type === "exchange"){
       if((r.difference||0) > 0) m.cashSales += r.difference; // العميل دفع فرق كاش زيادة
       else if((r.difference||0) < 0) m.refunds += -r.difference; // المحل رجّع فرق كاش
@@ -1028,7 +1031,6 @@ function render(){
     {id:"finance", label:"الحسابات (أرباح/خسائر)", ic:"banknote", roles:["admin"]},
     {id:"partners", label:"حسابات الشركاء", ic:"card", roles:["admin"]},
     {id:"assets", label:"الأصول والديون", ic:"pie", roles:["admin"]},
-    {id:"customers", label:"العملاء", ic:"users", roles:["admin","cashier"]},
     {id:"reports", label:"التقارير", ic:"chart", roles:["admin","cashier"]},
     {id:"audit", label:"سجل الحركات", ic:"history", roles:["admin"]},
     {id:"cashiers", label:"الكاشير والصلاحيات", ic:"shield", roles:["admin"]},
@@ -2343,7 +2345,7 @@ function viewSale(id){
    ============================================================ */
 function saleItemReturnedQty(saleItemId){
   var used = 0;
-  (DB.returns||[]).forEach(function(r){ (r.items||[]).forEach(function(it){ if(it.saleItemId===saleItemId) used += (it.qty||0); }); });
+  (DB.returns||[]).forEach(function(r){ if(isReturnCancelled(r)) return; (r.items||[]).forEach(function(it){ if(it.saleItemId===saleItemId) used += (it.qty||0); }); });
   return used;
 }
 function saleItemModelCode(saleId, saleItemId){
@@ -2355,7 +2357,8 @@ function saleItemModelCode(saleId, saleItemId){
 function returnRowHTML(r){
   var sale = DB.sales.find(function(s){ return s.id===r.saleId; });
   var cust = r.customerId ? DB.customers.find(function(c){ return c.id===r.customerId; }) : null;
-  var badgeColor = r.type==="exchange" ? "badge-blue" : (r.status==="مسترجع بالكامل" ? "badge-red" : "badge-amber");
+  var cancelled = isReturnCancelled(r);
+  var badgeColor = cancelled ? "badge-gray" : (r.type==="exchange" ? "badge-blue" : (r.status==="مسترجع بالكامل" ? "badge-red" : "badge-amber"));
   var modelCodes = Array.from(new Set((r.items||[]).map(function(it){ return it.modelCode; }).filter(Boolean))).join("، ");
   return '<tr>'+
     '<td class="bold">'+esc(r.number||"")+'<div class="small muted">'+(r.type==="exchange"?"استبدال":"استرجاع")+'</div></td>'+
@@ -2370,7 +2373,10 @@ function returnRowHTML(r){
       : '<td class="muted">—</td><td class="muted">—</td>')+
     '<td>'+esc(userById(r.userId)?userById(r.userId).name:"—")+'</td>'+
     '<td><span class="badge '+badgeColor+'">'+esc(r.status||"")+'</span></td>'+
-    '<td><button class="icon-btn primary" onclick="viewReturnDetail(\''+r.id+'\')">'+icon("eye",16)+'</button></td>'+
+    '<td style="white-space:nowrap;">'+
+      '<button class="icon-btn primary" title="عرض" onclick="viewReturnDetail(\''+r.id+'\')">'+icon("eye",16)+'</button>'+
+      (canManageReturnsUI() && !cancelled ? '<button class="icon-btn danger" title="إلغاء المرتجع" onclick="cancelReturn(\''+r.id+'\')">'+icon("x",16)+'</button>' : '')+
+    '</td>'+
   '</tr>';
 }
 function viewReturns(){
@@ -2629,10 +2635,29 @@ function viewReturnDetail(id){
         (r.type==="exchange" ? '<div class="ttl"><span>قيمة البديل</span><span class="bold">'+fmt(r.replacementTotal)+'</span></div><div class="ttl"><span>الفرق</span><span class="bold">'+fmt(r.difference)+'</span></div>' : '')+
         (r.refundMethod ? '<div class="ttl"><span>طريقة التسوية</span><span class="bold">'+(r.refundMethod==="cash"?"نقدي":"رصيد للعميل")+'</span></div>' : '')+
         (r.reason ? '<div class="ttl"><span>السبب</span><span>'+esc(r.reason)+'</span></div>' : '')+
+        (isReturnCancelled(r) ? '<div class="ttl"><span>تاريخ الإلغاء</span><span>'+(r.cancelledAt?dateStr(r.cancelledAt)+' '+timeStr(r.cancelledAt):"—")+'</span></div>'+
+          '<div class="ttl"><span>ألغاه</span><span>'+esc(userById(r.cancelledBy)?userById(r.cancelledBy).name:"—")+'</span></div>'+
+          (r.cancellationReason ? '<div class="ttl"><span>سبب الإلغاء</span><span>'+esc(r.cancellationReason)+'</span></div>' : '') : '')+
       '</div>'+
     '</div>'+
-    '<div class="modal-foot"><button class="btn btn-ghost" onclick="closeModal()">إغلاق</button></div>'
+    '<div class="modal-foot">'+
+      (canManageReturnsUI() && !isReturnCancelled(r) ? '<button class="btn btn-soft-red" onclick="cancelReturn(\''+r.id+'\')">'+icon("x",16)+' إلغاء المرتجع</button>' : '')+
+      '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
+    '</div>'
   , true);
+}
+function cancelReturn(id){
+  var r = (DB.returns||[]).find(function(x){ return x.id===id; });
+  if(!r) return;
+  if(isReturnCancelled(r)){ toast("هذا المرتجع ملغي بالفعل","warn"); return; }
+  var msg = (r.type==="exchange" ? "إلغاء الاستبدال " : "إلغاء المرتجع ")+(r.number||"")+
+    "؟ سيتم إرجاع الأصناف المرتجعة إلى حالتها قبل هذه العملية"+(r.type==="exchange"?" (بما في ذلك صنف الاستبدال)":"")+" وعكس أي حركة مالية مرتبطة بها.";
+  confirmBox(msg, function(){
+    api("POST", "/api/returns/" + id + "/cancel", {}).then(function(res){
+      afterSync(res); closeModal(); renderViewInPlace();
+      toast(r.type==="exchange" ? "تم إلغاء الاستبدال" : "تم إلغاء المرتجع");
+    }).catch(function(e){ toast(e.message, "err"); });
+  }, true);
 }
 
 /* ============================================================
@@ -3630,7 +3655,7 @@ function viewOrder(id){
       '<button class="btn btn-ghost" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+' طباعة</button>'+
       (canExchange ? '<button class="btn btn-ghost" onclick="closeModal();openOrderExchange(\''+o.id+'\')">'+icon("return",16)+' استبدال</button>' : '')+
       (["new","preparing","ready","shipped","transit","delivered"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="returnOrder(\''+o.id+'\')">'+icon("return",16)+' مرتجع</button>' : '')+
-      (["new","preparing","ready"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="cancelOrder(\''+o.id+'\')">إلغاء</button>' : '')+
+      (["new","preparing","ready"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="cancelOrder(\''+o.id+'\')">'+icon("x",16)+' إلغاء الأوردر</button>' : '')+
     '</div>'
   , true);
 }

@@ -231,7 +231,7 @@ async function reverseSaleRelatedLedger(tx, saleId){
 async function restoreOutstandingSaleStock(tx, sale){
   const returnedAgg = await tx.saleReturnItem.groupBy({
     by: ["saleItemId"],
-    where: { saleReturn: { saleId: sale.id } },
+    where: { saleReturn: { saleId: sale.id, status: { not: "ملغي" } } },
     _sum: { qty: true }
   });
   const returnedByItem = {};
@@ -698,7 +698,7 @@ const server = http.createServer(async function(req, res){
           const saleItem = sale.items.find(function(si){ return si.id === reqIt.saleItemId; });
           if(!saleItem) throw httpError(400, "صنف غير موجود في هذه الفاتورة");
 
-          const agg = await tx.saleReturnItem.aggregate({ where: { saleItemId: saleItem.id }, _sum: { qty: true } });
+          const agg = await tx.saleReturnItem.aggregate({ where: { saleItemId: saleItem.id, saleReturn: { status: { not: "ملغي" } } }, _sum: { qty: true } });
           const alreadyReturned = (agg._sum.qty || 0) + (requestedSoFar[saleItem.id] || 0);
           const remaining = (saleItem.qty || 0) - alreadyReturned;
           if(qty > remaining) throw httpError(400, "الكمية المطلوب استرجاعها ("+qty+") أكبر من المتاح للاسترجاع ("+remaining+")");
@@ -743,7 +743,7 @@ const server = http.createServer(async function(req, res){
           lineData.push(lineRec);
         }
 
-        const priorAgg = await tx.saleReturnItem.aggregate({ where: { saleReturn: { saleId: sale.id } }, _sum: { qty: true } });
+        const priorAgg = await tx.saleReturnItem.aggregate({ where: { saleReturn: { saleId: sale.id, status: { not: "ملغي" } } }, _sum: { qty: true } });
         const totalReturnedQty = (priorAgg._sum.qty || 0) + lineData.reduce(function(a,l){ return a + l.qty; }, 0);
         const totalSoldQty = sale.items.reduce(function(a,si){ return a + (si.qty||0); }, 0);
         const status = type === "exchange" ? "مستبدل" : (totalReturnedQty >= totalSoldQty ? "مسترجع بالكامل" : "مسترجع جزئيًا");
@@ -783,6 +783,55 @@ const server = http.createServer(async function(req, res){
     const state = await db.buildStateFromDB();
     const savedReturn = state.returns.find(function(r){ return r.id === returnId; });
     send(res, 200, { ok:true, db: state, saleReturn: savedReturn });
+    return;
+  }
+  // إلغاء استرجاع/استبدال قائم — بيعكس بالظبط الآثار اللي حصلت وقت إنشائه:
+  // (1) المخزون: القطعة المرتجعة الأصلية كانت اتضافت (restockSaleItem بفرق موجب)
+  //     → بنشيلها تاني بفرق سالب؛ والقطعة البديلة (لو استبدال) كانت اتخصمت
+  //     → بنرجّعها. (2) الدفتر: بنمسح قيدي "return" و"return-x" بالظبط (نفس آلية
+  //     reverseSaleRelatedLedger). السجل نفسه بيفضل موجود بحالة "ملغي" بدل ما يتحذف.
+  // idempotent: أي محاولة إلغاء تانية على سجل status="ملغي" بالفعل بترفض فوراً
+  // قبل ما تلمس أي مخزون أو دفتر.
+  if(method === "POST" && /^\/api\/returns\/[^/]+\/cancel$/.test(url)){
+    if(!canManageReturns(user)){ send(res, 403, {ok:false, error:"ليس لديك صلاحية إدارة الاسترجاع والاستبدال"}); return; }
+    const id = url.split("/")[3];
+    const b = await readBody(req);
+    const reason = (b.reason || "").trim() || null;
+    const existing = await prisma.saleReturn.findUnique({ where: { id }, include: { items: true } });
+    if(!existing){ send(res, 404, { ok:false, error:"سجل الاسترجاع غير موجود" }); return; }
+    if(existing.status === "ملغي"){ send(res, 409, { ok:false, error:"هذا السجل ملغي بالفعل" }); return; }
+    try{
+      await prisma.$transaction(async function(tx){
+        const fresh = await tx.saleReturn.findUnique({ where: { id }, include: { items: true } });
+        if(!fresh) throw httpError(404, "سجل الاسترجاع غير موجود");
+        if(fresh.status === "ملغي") throw httpError(409, "هذا السجل ملغي بالفعل");
+
+        for(const item of fresh.items){
+          if(item.qty){
+            const saleItem = await tx.saleItem.findUnique({ where: { id: item.saleItemId } });
+            if(saleItem) await restockSaleItem(tx, saleItem, -item.qty);
+          }
+          if(item.replacementVariantId && item.replacementQty){
+            await adjustVariantStock(tx, item.replacementVariantId, item.replacementQty);
+            if(item.replacementProductId) await recomputeProductStock(tx, item.replacementProductId);
+          }
+        }
+
+        await deletePartnerLedgerFor(tx, "return", id);
+        await deletePartnerLedgerFor(tx, "return", id + "-x");
+
+        const mergedData = { ...(fresh.data||{}), statusBeforeCancel: fresh.status, cancelledAt: Date.now(), cancelledBy: user.id, cancellationReason: reason };
+        await tx.saleReturn.update({ where: { id }, data: { status: "ملغي", data: mergedData } });
+
+        await tx.auditLog.create({ data: auditEntry(req, "إلغاء استرجاع/استبدال", (fresh.number || "") + (reason ? (" — " + reason) : "")) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
 
@@ -984,14 +1033,63 @@ const server = http.createServer(async function(req, res){
     send(res, 200, { ok:true, db: state });
     return;
   }
+  // إرجاع/إلغاء أوردر لازم يكونوا idempotent صراحة (مش بس عن طريق orderPatch
+  // العام) — restoreOrderStockAndLedger بيرجّع الكمية بلا شرط في كل استدعاء،
+  // فلو الأوردر بالفعل "returned"/"cancelled" واتنادت تاني (نداء API مباشر أو
+  // تسابق طلبات)، المخزون هيتزوّد مرتين. نفس نمط /api/sale/:id/cancel بالظبط:
+  // تحقق أولي + إعادة تحقق جوه الـ transaction على أحدث نسخة من الصف.
   if(method === "POST" && /^\/api\/order\/[^/]+\/return$/.test(url)){
     const id = url.split("/")[3];
-    await orderPatch(id, req, res, function(o){ o.status = "returned"; }, function(o){ return { action: "مرتجع أوردر", detail: o.number }; }, restoreOrderStockAndLedger);
+    const existing = await prisma.order.findUnique({ where: { id } });
+    if(!existing){ send(res, 404, { ok:false, error:"الأوردر غير موجود" }); return; }
+    if(existing.status === "returned"){ send(res, 409, { ok:false, error:"الأوردر مرتجع بالفعل" }); return; }
+    if(existing.status === "cancelled"){ send(res, 409, { ok:false, error:"الأوردر ملغي بالفعل، لا يمكن تسجيله كمرتجع" }); return; }
+    try{
+      await prisma.$transaction(async function(tx){
+        const fresh = await tx.order.findUnique({ where: { id } });
+        if(!fresh) throw httpError(404, "الأوردر غير موجود");
+        if(fresh.status === "returned") throw httpError(409, "الأوردر مرتجع بالفعل");
+        if(fresh.status === "cancelled") throw httpError(409, "الأوردر ملغي بالفعل، لا يمكن تسجيله كمرتجع");
+        const merged = { ...(fresh.data||{}), id: fresh.id, number: fresh.number, date: fresh.date?fresh.date.getTime():null,
+          userId: fresh.userId, customerName: fresh.customerName, total: fresh.total, status: "returned" };
+        await restoreOrderStockAndLedger(tx, id);
+        await tx.order.update({ where: { id }, data: { status: "returned", data: merged } });
+        await tx.auditLog.create({ data: auditEntry(req, "مرتجع أوردر", fresh.number || "") });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
   if(method === "POST" && /^\/api\/order\/[^/]+\/cancel$/.test(url)){
     const id = url.split("/")[3];
-    await orderPatch(id, req, res, function(o){ o.status = "cancelled"; }, function(o){ return { action: "إلغاء أوردر", detail: o.number }; }, restoreOrderStockAndLedger);
+    const existing = await prisma.order.findUnique({ where: { id } });
+    if(!existing){ send(res, 404, { ok:false, error:"الأوردر غير موجود" }); return; }
+    if(existing.status === "cancelled"){ send(res, 409, { ok:false, error:"الأوردر ملغي بالفعل" }); return; }
+    if(existing.status === "returned"){ send(res, 409, { ok:false, error:"الأوردر مرتجع بالفعل، لا يمكن إلغاؤه" }); return; }
+    try{
+      await prisma.$transaction(async function(tx){
+        const fresh = await tx.order.findUnique({ where: { id } });
+        if(!fresh) throw httpError(404, "الأوردر غير موجود");
+        if(fresh.status === "cancelled") throw httpError(409, "الأوردر ملغي بالفعل");
+        if(fresh.status === "returned") throw httpError(409, "الأوردر مرتجع بالفعل، لا يمكن إلغاؤه");
+        const merged = { ...(fresh.data||{}), id: fresh.id, number: fresh.number, date: fresh.date?fresh.date.getTime():null,
+          userId: fresh.userId, customerName: fresh.customerName, total: fresh.total, status: "cancelled" };
+        await restoreOrderStockAndLedger(tx, id);
+        await tx.order.update({ where: { id }, data: { status: "cancelled", data: merged } });
+        await tx.auditLog.create({ data: auditEntry(req, "إلغاء أوردر", fresh.number || "") });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
     return;
   }
 
