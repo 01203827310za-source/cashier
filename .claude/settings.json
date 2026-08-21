@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed -n '335,5483p' public/index.html)",
+      "Bash(node --check /tmp/order_check.js)"
+    ]
+  }
+}

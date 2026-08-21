@@ -3595,7 +3595,7 @@ function onOrderVariant(i, vid){ orderDraft.items[i].variantId = vid; refreshOrd
 function onOrderQty(i, v){ orderDraft.items[i].qty = Math.max(1, parseInt(v,10)||1); refreshOrderTotal(); }
 function onOrderPrice(i, v){ orderDraft.items[i].price = num(v); refreshOrderTotal(); }
 function addOrderLine(){ orderDraft.items.push(blankOrderLine()); refreshOrderLines(); }
-function removeOrderLine(i){ orderDraft.items.splice(i,1); if(!orderDraft.items.length) orderDraft.items.push(blankOrderLine()); refreshOrderLines(); }
+function removeOrderLine(i){ orderDraft.items.splice(i,1); refreshOrderLines(); }
 function refreshOrderLines(){ var el = $("#ord-lines"); if(el) el.innerHTML = orderLinesHTML(); refreshOrderTotal(); }
 function refreshOrderTotal(){
   var el = $("#ord-total");
@@ -3616,7 +3616,6 @@ async function saveOrder(){
   orderDraft.deposit = num($("#ord-deposit") ? $("#ord-deposit").value : 0);
   if(!orderDraft.customerName){ toast("اكتب اسم العميل","err"); return; }
   var lines = orderDraft.items.filter(function(it){ return it.productId && it.qty>0; });
-  if(!lines.length){ toast("أضف صنفاً واحداً على الأقل","err"); return; }
   for(var i=0;i<lines.length;i++){
     var p = DB.products.find(function(x){ return x.id===lines[i].productId; });
     var v = p && (p.variants||[]).find(function(x){ return x.id===lines[i].variantId; });
