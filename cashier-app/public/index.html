@@ -209,6 +209,24 @@ tbody tr:last-child td{border-bottom:none;}
 .receipt .bold{font-weight:800;}
 .receipt .barcode{text-align:center; margin-top:10px; letter-spacing:2px;}
 
+/* ---------- Inventory print report ---------- */
+.inv-report{background:#fff; color:#0f172a; font-family:"Segoe UI", Tahoma, sans-serif; direction:rtl; padding:16px; box-sizing:border-box;}
+.inv-report-head{text-align:center; margin-bottom:14px;}
+.inv-report-head h1{font-size:20px; margin:0 0 2px;}
+.inv-report-head h2{font-size:15px; font-weight:600; margin:0 0 4px; color:var(--muted);}
+.inv-report-head p{font-size:12px; color:var(--muted); margin:0;}
+.inv-report-table{width:100%; border-collapse:collapse; font-size:12px;}
+.inv-report-table th,.inv-report-table td{border:1px solid #cbd5e1; padding:6px 8px;}
+.inv-report-table thead th{background:#f1f5f9; font-weight:700;}
+.inv-report-totals{display:flex; flex-wrap:wrap; gap:18px; margin-top:14px; padding-top:10px; border-top:2px solid #0f172a;}
+.inv-report-totals div{display:flex; flex-direction:column; gap:2px; font-size:12px; min-width:130px;}
+.inv-report-totals b{font-size:15px;}
+@media print{
+  .inv-report-table thead{display:table-header-group;}
+  .inv-report-table tr{page-break-inside:avoid;}
+  .inv-report{padding:0;}
+}
+
 /* ---------- Reports ---------- */
 .bars{display:flex; align-items:flex-end; gap:6px; height:180px; padding:10px 4px 0;}
 .bar-col{flex:1; display:flex; flex-direction:column; align-items:center; gap:6px; height:100%; justify-content:flex-end; min-width:0;}
@@ -1650,13 +1668,21 @@ function openSaleCancelDialog(id){
 /* ============================================================
    المنتجات والمخزون
    ============================================================ */
-function viewProducts(){
+// نفس فلترة البحث/الفئة المستخدمة في viewProducts بالظبط — بتترجع لنفس المنتجات
+// المعروضة على الشاشة فعلياً، عشان تقرير الطباعة يعرض نفس البيانات المعروضة
+// بدون أي حساب أو فلترة مختلفة (مطلوب صراحة في مواصفات الطباعة).
+function filteredProductsList(){
   var q = $("#prod-q") ? $("#prod-q").value : "";
   var cat = $("#prod-cat") ? $("#prod-cat").value : "الكل";
-  var list = DB.products.filter(function(p){
+  return DB.products.filter(function(p){
     return (!q || p.name.toLowerCase().indexOf(q.toLowerCase())!==-1 || (p.sku||"").toLowerCase().indexOf(q.toLowerCase())!==-1 || (p.modelCode||"").toLowerCase().indexOf(q.toLowerCase())!==-1 || (p.variants||[]).some(function(v){ return String(v.barcode).indexOf(q)!==-1; })) &&
            (cat==="الكل" || p.category===cat);
   });
+}
+function viewProducts(){
+  var q = $("#prod-q") ? $("#prod-q").value : "";
+  var cat = $("#prod-cat") ? $("#prod-cat").value : "الكل";
+  var list = filteredProductsList();
   var cats = ["الكل"].concat(DB.categories).map(function(c){ return '<option value="'+esc(c)+'" '+(cat===c?"selected":"")+'>'+esc(c)+'</option>'; }).join("");
 
   var rows = list.map(function(p){
@@ -1690,6 +1716,7 @@ function viewProducts(){
         '<span style="position:absolute;right:11px;top:50%;transform:translateY(-50%);color:var(--muted)">'+icon("search",16)+'</span>'+
       '</div>'+
       '<select id="prod-cat" onchange="reloadProducts()">'+cats+'</select>'+
+      '<button class="btn btn-ghost" onclick="openInventoryPrint()">'+icon("print",16)+' طباعة</button>'+
       (isAdmin() ? '<button class="btn btn-primary" onclick="openProductForm()">'+icon("plus",16)+' إضافة منتج</button>' : '')+
       (isAdmin() ? '<button class="btn btn-ghost" onclick="openCategories()">'+icon("tag",16)+' الفئات</button>' : '')+
     '</div>';
@@ -1701,6 +1728,80 @@ function viewProducts(){
     '</table></div></div>';
 }
 function reloadProducts(){ renderViewInPlace(); }
+// صفوف تقرير الطباعة — سطر لكل مقاس/لون (variant)، من نفس المخزون المعروض
+// فعلياً (filteredProductsList) وبدون أي إعادة حساب. المخزون الحالي مفيهوش مفهوم
+// "محجوز" منفصل عن stock (الكمية بتتخصم من الـ variant فوراً وقت إنشاء أي أوردر
+// أو فاتورة بيع — راجع adjustVariantStock)، يعني مفيش رصيد تاني "محجوز" يتفرق عن
+// المتاح. فالمحجوز هنا = صفر دايماً، والمتاح = الفعلية بالظبط، طبقاً للمعادلة
+// المطلوبة (المتاح = الفعلية - المحجوز) لكن من غير اختلاق رقم مش موجود فعلاً في
+// النظام.
+function inventoryPrintRows(){
+  var rows = [];
+  filteredProductsList().forEach(function(p){
+    var variants = (p.variants && p.variants.length) ? p.variants : [{ size:null, color:null, stock:p.stock||0 }];
+    variants.forEach(function(v){
+      var actual = v.stock||0;
+      var reserved = 0;
+      rows.push({
+        name: p.name, sku: p.sku||"", modelCode: p.modelCode||"",
+        color: v.color||"", size: v.size||"",
+        actual: actual, reserved: reserved, available: actual - reserved
+      });
+    });
+  });
+  return rows;
+}
+function inventoryReportHTML(){
+  var rows = inventoryPrintRows();
+  var totalActual = rows.reduce(function(a,r){ return a+r.actual; },0);
+  var totalReserved = rows.reduce(function(a,r){ return a+r.reserved; },0);
+  var totalAvailable = rows.reduce(function(a,r){ return a+r.available; },0);
+  var now = Date.now();
+  var trs = rows.map(function(r){
+    return '<tr>'+
+      '<td>'+esc(r.name)+(r.sku?'<br><span style="font-size:10px;color:#64748b;">'+esc(r.sku)+'</span>':'')+'</td>'+
+      '<td dir="ltr" style="text-align:center;">'+esc(r.modelCode||"—")+'</td>'+
+      '<td style="text-align:center;">'+esc(r.color||"—")+'</td>'+
+      '<td style="text-align:center;">'+esc(r.size||"—")+'</td>'+
+      '<td style="text-align:center;">'+fmtInt(r.actual)+'</td>'+
+      '<td style="text-align:center;">'+fmtInt(r.reserved)+'</td>'+
+      '<td style="text-align:center;font-weight:700;">'+fmtInt(r.available)+'</td>'+
+    '</tr>';
+  }).join("") || '<tr><td colspan="7" style="text-align:center;padding:20px;color:#64748b;">لا توجد أصناف مطابقة</td></tr>';
+
+  return '<div class="inv-report">'+
+    '<div class="inv-report-head">'+
+      '<h1>'+esc(STORE_NAME)+'</h1>'+
+      '<h2>تقرير المنتجات والمخزون</h2>'+
+      '<p>تاريخ الطباعة: '+dateStr(now)+' — '+timeStr(now)+'</p>'+
+    '</div>'+
+    '<table class="inv-report-table">'+
+      '<thead><tr><th>كود/اسم المنتج</th><th>الموديل</th><th>اللون</th><th>المقاس</th><th>الكمية الفعلية</th><th>المحجوز</th><th>المتاح</th></tr></thead>'+
+      '<tbody>'+trs+'</tbody>'+
+    '</table>'+
+    '<div class="inv-report-totals">'+
+      '<div><span>إجمالي الأصناف</span><b>'+fmtInt(rows.length)+'</b></div>'+
+      '<div><span>إجمالي الكمية الفعلية</span><b>'+fmtInt(totalActual)+'</b></div>'+
+      '<div><span>إجمالي الكمية المحجوزة</span><b>'+fmtInt(totalReserved)+'</b></div>'+
+      '<div><span>إجمالي الكمية المتاحة</span><b>'+fmtInt(totalAvailable)+'</b></div>'+
+    '</div>'+
+  '</div>';
+}
+function openInventoryPrint(){
+  setPrintPageSize(null);
+  var html = inventoryReportHTML();
+  $("#print-area").innerHTML = html;
+  openModal(
+    '<div class="modal-head"><h3>'+icon("print",18)+' معاينة طباعة — تقرير المنتجات والمخزون</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body" style="background:#f1f5f9;padding:20px;">'+
+      '<div style="background:#fff;border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,.08);max-width:900px;margin:0 auto;max-height:65vh;overflow:auto;">'+html+'</div>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="window.print()">'+icon("print",16)+' طباعة</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
+    '</div>'
+  , true);
+}
 function openStockEditor(id){
   var p = DB.products.find(function(x){ return x.id===id; });
   if(!p) return;
