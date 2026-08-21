@@ -89,20 +89,38 @@ async function buildStateFromDB(){
   const debts = await prisma.debt.findMany();
   state.debts = debts.map(d => ({
     ...(d.data || {}),
-    id: d.id, type: d.type, entityType: d.entityType, entityId: d.entityId, personName: d.personName,
+    id: d.id, accountId: d.accountId, number: d.number, type: d.type, entityType: d.entityType, entityId: d.entityId, personName: d.personName,
     totalAmount: d.totalAmount, paidAmount: d.paidAmount, remainingAmount: d.remainingAmount, status: d.status,
     date: d.date ? d.date.getTime() : null, paymentMethod: d.paymentMethod, notes: d.notes, partner: d.partner,
     direction: d.direction, userId: d.userId
   }));
 
-  state.debtPayments = (await prisma.debtPayment.findMany()).map(p => ({
+  const debtPaymentRows = await prisma.debtPayment.findMany();
+  state.debtPayments = debtPaymentRows.map(p => ({
     ...(p.data || {}),
-    id: p.id, debtId: p.debtId, amount: p.amount, date: p.date ? p.date.getTime() : null,
+    id: p.id, accountId: p.accountId, debtId: p.debtId, amount: p.amount, date: p.date ? p.date.getTime() : null,
     paymentMethod: p.paymentMethod, notes: p.notes, partner: p.partner,
     payerType: p.payerType, payerId: p.payerId, payerName: p.payerName,
     direction: p.direction, userId: p.userId,
     createdAt: p.createdAt ? p.createdAt.getTime() : null, updatedAt: p.updatedAt ? p.updatedAt.getTime() : null
   }));
+
+  // نظام حسابات الأشخاص: الإجماليات دايمًا محسوبة حية من debts/debtPaymentRows
+  // اللي فوق (نفس الصفوف بالظبط، من غير أي استعلام إضافي) — مفيش رقم متراكم
+  // مخزّن يقدر يعمل drift عن السجل الفعلي.
+  state.debtAccounts = (await prisma.debtAccount.findMany()).map(a => {
+    const accDebts = debts.filter(d => d.accountId === a.id);
+    const accPayments = debtPaymentRows.filter(p => p.accountId === a.id);
+    const totalAmount = accDebts.reduce((s, d) => s + (d.totalAmount || 0), 0);
+    const paidAmount = accPayments.reduce((s, p) => s + (p.amount || 0), 0);
+    const remainingAmount = Math.max(0, totalAmount - paidAmount);
+    const status = paidAmount >= totalAmount - 0.004 ? 'paid' : (paidAmount > 0.004 ? 'partial' : 'unpaid');
+    return {
+      ...(a.data || {}),
+      id: a.id, name: a.name, notes: a.notes, userId: a.userId, createdAt: a.createdAt ? a.createdAt.getTime() : null,
+      totalAmount, paidAmount, remainingAmount, status, invoiceCount: accDebts.length, paymentCount: accPayments.length
+    };
+  });
 
   state.printingOrders = (await prisma.printingOrder.findMany()).map(o => ({
     ...(o.data || {}),
@@ -186,7 +204,7 @@ async function buildStateFromDB(){
   }));
 
   // Ensure arrays exist for compatibility
-  ["users", "categories", "products", "customers", "suppliers", "purchases", "purchasePayments", "debts", "debtPayments", "audit", "sales", "returns",
+  ["users", "categories", "products", "customers", "suppliers", "purchases", "purchasePayments", "debtAccounts", "debts", "debtPayments", "audit", "sales", "returns",
    "shippingCompanies", "shipPrices", "orders", "orderCollections", "orderExchanges", "expenseCategories", "expenses", "otherIncome",
    "paymentsIn", "paymentsOut", "cashClosings", "transfers", "partnerTransactions", "printingOrders"].forEach(function (k) { if (!state[k]) state[k] = []; });
 
@@ -218,6 +236,7 @@ async function replaceStateInDB(raw){
     await tx.purchasePayment.deleteMany({});
     await tx.debtPayment.deleteMany({});
     await tx.debt.deleteMany({});
+    await tx.debtAccount.deleteMany({});
     await tx.printingOrder.deleteMany({});
     await tx.orderCollection.deleteMany({});
     await tx.orderExchange.deleteMany({});
@@ -317,10 +336,20 @@ async function replaceStateInDB(raw){
       });
       count++;
     }
+    for (const a of (raw.debtAccounts || [])) {
+      await tx.debtAccount.create({
+        data: {
+          id: a.id, name: a.name, notes: a.notes || null, userId: a.userId || null,
+          createdAt: a.createdAt ? new Date(a.createdAt) : null, data: a
+        }
+      });
+      count++;
+    }
     for (const d of (raw.debts || [])) {
       await tx.debt.create({
         data: {
-          id: d.id, type: d.type || null, entityType: d.entityType || null, entityId: d.entityId || null, personName: d.personName || null,
+          id: d.id, accountId: d.accountId || null, number: d.number || null,
+          type: d.type || null, entityType: d.entityType || null, entityId: d.entityId || null, personName: d.personName || null,
           totalAmount: d.totalAmount != null ? d.totalAmount : null, paidAmount: d.paidAmount != null ? d.paidAmount : null,
           remainingAmount: d.remainingAmount != null ? d.remainingAmount : null, status: d.status || null,
           date: d.date ? new Date(d.date) : null, paymentMethod: d.paymentMethod || null, notes: d.notes || null,
@@ -332,7 +361,7 @@ async function replaceStateInDB(raw){
     for (const dp of (raw.debtPayments || [])) {
       await tx.debtPayment.create({
         data: {
-          id: dp.id || uid(), debtId: dp.debtId, amount: dp.amount != null ? dp.amount : null, date: dp.date ? new Date(dp.date) : null,
+          id: dp.id || uid(), accountId: dp.accountId || null, debtId: dp.debtId || null, amount: dp.amount != null ? dp.amount : null, date: dp.date ? new Date(dp.date) : null,
           paymentMethod: dp.paymentMethod || null, notes: dp.notes || null, partner: dp.partner || null,
           payerType: dp.payerType || null, payerId: dp.payerId || null, payerName: dp.payerName || null,
           direction: dp.direction || null, userId: dp.userId || null,
@@ -493,6 +522,36 @@ async function replaceStateInDB(raw){
  * the deploy logs immediately instead of surfacing later as a UI bug.
  * Throws on failure — the caller decides whether/how to keep the process alive.
  */
+// ترحيل تلقائي لمرة واحدة: نظام الديون القديم (نوع دين + Customer/Supplier)
+// بقى نظام حسابات أشخاص (DebtAccount → Debt → DebtPayment). أي صف Debt من قبل
+// الترحيل (accountId فاضي) بيتجمع حسب personName (بعد trim، بدون حساسية حالة
+// الأحرف) — حساب واحد لكل اسم مميز، يتربط بيه لو موجود أو يتعمل لو مش موجود.
+// آمن للتكرار تمامًا: بعد أول تشغيل ناجح مفيش صفوف accountId=null تاني، فبيبقى
+// no-op على أي تشغيل تاني للسيرفر.
+async function ensureDebtAccountsMigrated(){
+  const orphanDebts = await prisma.debt.findMany({ where: { accountId: null } });
+  if (!orphanDebts.length) return;
+  console.log('Migrating ' + orphanDebts.length + ' legacy debt record(s) into person accounts...');
+  await prisma.$transaction(async (tx) => {
+    const cache = {};
+    for (const d of orphanDebts) {
+      const name = (d.personName || '').trim() || 'غير مسمى';
+      const key = name.toLowerCase();
+      let account = cache[key];
+      if (!account) {
+        account = await tx.debtAccount.findFirst({ where: { name: { equals: name, mode: 'insensitive' } } });
+        if (!account) {
+          account = await tx.debtAccount.create({ data: { id: uid(), name, createdAt: d.date || new Date(), userId: d.userId || null } });
+        }
+        cache[key] = account;
+      }
+      await tx.debt.update({ where: { id: d.id }, data: { accountId: account.id, personName: account.name } });
+      await tx.debtPayment.updateMany({ where: { debtId: d.id }, data: { accountId: account.id } });
+    }
+  }, { timeout: 60000 });
+  console.log('Legacy debt migration completed.');
+}
+
 async function initializeDatabase(seedData){
   const userCount = await prisma.user.count();
   console.log('Database connected');
@@ -504,6 +563,8 @@ async function initializeDatabase(seedData){
   } else {
     console.log('Database already has data (' + userCount + ' users) — skipping seed');
   }
+
+  await ensureDebtAccountsMigrated();
 
   const counts = {
     users: await prisma.user.count(),

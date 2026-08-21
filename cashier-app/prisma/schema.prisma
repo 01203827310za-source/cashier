@@ -158,12 +158,30 @@ model PurchasePayment {
   purchase     Purchase @relation(fields: [purchaseId], references: [id])
 }
 
+// نظام حسابات أشخاص مستقل للديون: حساب واحد لكل اسم شخص (DebtAccount)، تحته أي
+// عدد من الفواتير (Debt)، وتحت كل فاتورة أو الحساب مباشرة أي عدد من الدفعات
+// (DebtPayment). مفيش نوع دين ولا اعتماد على Customer/Supplier — الاسم نفسه هو
+// مفتاح الحساب. الإجماليات دايمًا بتتحسب حية من SUM على الفواتير/الدفعات (نفس
+// مبدأ recomputeDebtTotals) — مفيش رقم متراكم مخزّن يقدر يعمل drift.
+model DebtAccount {
+  id        String    @id
+  name      String // اسم الشخص — البحث عن حساب مطابق بيتم على الاسم بعد trim
+  notes     String?
+  userId    String?
+  createdAt DateTime?
+  data      Json?
+  debts     Debt[]
+  payments  DebtPayment[]
+}
+
 model Debt {
   id            String @id
-  type          String?
-  entityType    String? // "customer" | "supplier" | "partner" | "person" | "other"
-  entityId      String?
-  personName    String?
+  accountId     String? // NEW — يشير لحساب الشخص المالك للفاتورة دي (null مؤقتًا لحد ما الترحيل التلقائي يشتغل على السجلات القديمة)
+  number        String? // NEW — رقم الفاتورة (إدخال يدوي، من فورم "إضافة فاتورة" فقط)
+  type          String? // legacy — مش بيتكتب من الكود الجديد، محتفظ بيه لبيانات قديمة فقط
+  entityType    String? // legacy // "customer" | "supplier" | "partner" | "person" | "other"
+  entityId      String? // legacy
+  personName    String? // نسخة من اسم الحساب وقت إنشاء الفاتورة
   totalAmount   Float?
   paidAmount    Float?
   remainingAmount Float?
@@ -171,30 +189,33 @@ model Debt {
   date          DateTime?
   paymentMethod String?
   notes         String?
-  partner       String? // "moamen" | "abdo" when linked to partner ledger
-  direction     String? // "in" | "out"
+  partner       String? // "moamen" | "abdo" — الحساب اللي استلم الدفعة المبدئية لهذه الفاتورة (لو فيه)
+  direction     String? // legacy — الفواتير الجديدة دايمًا فعليًا "in"
   userId        String?
   data          Json?
+  account       DebtAccount? @relation(fields: [accountId], references: [id])
   payments      DebtPayment[]
 }
 
 model DebtPayment {
   id            String @id
-  debtId        String
+  accountId     String? // NEW — دايمًا موجود في أي دفعة جديدة (دفعة عامة أو مرتبطة بفاتورة)
+  debtId        String? // بقت اختيارية — فاضية لو دفعة عامة على الحساب مش مرتبطة بفاتورة بعينها
   amount        Float?
   date          DateTime? // payment date
   paymentMethod String?
   notes         String?
-  partner       String? // "moamen" | "abdo" — set when payerType is "partner"; drives the PartnerTransaction ledger entry
-  payerType     String? // "partner" | "customer" — who actually paid ("مين دفع؟")
-  payerId       String? // partner code ("moamen"/"abdo") or Customer.id, matching payerType
-  payerName     String? // snapshot display name for payerId, resolved server-side
-  direction     String? // "in" | "out" — always derived from the parent Debt, never trusted from the client
-  userId        String? // "بواسطة" — the logged-in user who recorded the payment
+  partner       String? // "moamen" | "abdo" — إلزامي لأي دفعة جديدة؛ الحساب اللي استلم الفلوس فعليًا
+  payerType     String? // legacy // "partner" | "customer"
+  payerId       String? // legacy
+  payerName     String? // legacy
+  direction     String? // الدفعات الجديدة دايمًا "in" (فلوس بتتحصّل من الشخص)
+  userId        String? // "بواسطة" — المستخدم اللي سجّل الدفعة
   createdAt     DateTime?
   updatedAt     DateTime?
   data          Json?
-  debt          Debt @relation(fields: [debtId], references: [id])
+  account       DebtAccount? @relation(fields: [accountId], references: [id])
+  debt          Debt? @relation(fields: [debtId], references: [id])
 }
 
 model Sale {
