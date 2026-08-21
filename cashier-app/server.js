@@ -129,7 +129,7 @@ async function authUser(req){
   if(!token) return null;
   const userId = tokens.get(token);
   if(!userId) return null;
-  return prisma.user.findUnique({ where: { id: userId } });
+  return prisma.user.findUnique({ where: { id: userId }, include: { permissions: true } });
 }
 
 /* ---------- مساعدات المخزون ---------- */
@@ -169,13 +169,82 @@ async function restoreOrderStockAndLedger(tx, orderId){
   await tx.order.update({ where: { id: orderId }, data: { collectedTotal: 0, remaining: 0, collectionStatus: null } });
 }
 
-/* ---------- الاسترجاع والاستبدال ---------- */
-// افتراضي "مسموح": أي كاشير عنده صلاحية بيع أصلاً، إلا لو المدير عطّلها له
-// صراحة (canManageReturns === false). العمود جديد وقيمته NULL لكل المستخدمين
-// الحاليين، فمعاملتها كـ"غير معطّلة" (!== false) بدل "لازم تبقى true" مهم
-// عشان الكاشيرز الموجودين فعلاً في قاعدة بيانات الإنتاج ميتقفلوش فجأة.
-function canManageReturns(u){ return !!u && (u.role === "admin" || u.canManageReturns !== false); }
 function httpError(status, message){ const e = new Error(message); e.httpStatus = status; return e; }
+
+/* ---------- نظام الصلاحيات الدقيقة (صفحة + إجراء) ----------
+   مصدر الحقيقة الوحيد لأي تحقق صلاحية في السيرفر كله. المدير (role==="admin")
+   بيعدّي أي تحقق دايمًا (مينفعش يقفل على نفسه صفحة المستخدمين بالغلط). أي
+   مستخدم كاشير لسه معندوش أي صف UserPermission (يعني اتعمله seed أو اتضاف قبل
+   ما النظام ده يتعمل) بيرجعله نفس الصلاحيات اللي كانت شغالة فعليًا قبل كده
+   (nav roles + canManageReturns) — عشان النشر مايقفلش على أي حد فجأة. أول ما
+   المدير يحفظ صلاحيات صريحة لمستخدم، الـ fallback بيوقف له وبقى صفوف
+   UserPermission هي المصدر الوحيد. */
+const LEGACY_CASHIER_MODULES = {
+  dashboard: ["view"],
+  pos: ["view", "create", "edit"],
+  products: ["view", "create", "edit"],
+  orders: ["view", "create", "edit"],
+  reports: ["view"]
+};
+function legacyCan(user, module, action){
+  if(module === "returns" && (action === "return" || action === "exchange" || action === "cancel")){
+    return user.canManageReturns !== false;
+  }
+  const allowed = LEGACY_CASHIER_MODULES[module];
+  return !!allowed && allowed.indexOf(action) !== -1;
+}
+function can(user, module, action){
+  if(!user) return false;
+  if(user.role === "admin") return true;
+  const perms = user.permissions || [];
+  if(!perms.length) return legacyCan(user, module, action);
+  return perms.some(function(p){ return p.module === module && p.action === action; });
+}
+const PERMISSION_DENIED = "ليس لديك صلاحية للقيام بهذا الإجراء";
+// جدول الطرق اللي محددة بالكامل من method+url وحدهم (من غير الحاجة لقراءة الـ
+// body) — بيتفحص مرة واحدة بعد بوابة تسجيل الدخول مباشرة. الطرق اللي محتاجة
+// تفرّق بين create/edit أو نوع العملية من جوه الـ body (المنتجات/العملاء/
+// المصاريف/المستخدمين، و/api/returns) بتتفحص بمكانها جوه الكود نفسه بدل الجدول ده.
+const ROUTE_PERMISSIONS = [
+  { method:"POST", pattern:/^\/api\/sale$/, module:"pos", action:"create" },
+  { method:"POST", pattern:/^\/api\/sale\/[^/]+\/cancel$/, module:"pos", action:"cancel" },
+  { method:"POST", pattern:/^\/api\/sale\/[^/]+\/return$/, module:"pos", action:"cancel" },
+
+  { method:"POST", pattern:/^\/api\/products\/[^/]+\/stock$/, module:"products", action:"edit" },
+  { method:"POST", pattern:/^\/api\/printing-orders$/, module:"products", action:"edit" },
+  { method:"POST", pattern:/^\/api\/printing-orders\/[^/]+\/cancel$/, module:"products", action:"edit" },
+  { method:"POST", pattern:/^\/api\/categories$/, module:"products", action:"edit" },
+
+  { method:"POST", pattern:/^\/api\/order$/, module:"orders", action:"create" },
+  { method:"POST", pattern:/^\/api\/order\/[^/]+\/status$/, module:"orders", action:"edit" },
+  { method:"POST", pattern:/^\/api\/order\/[^/]+\/shipment$/, module:"orders", action:"edit" },
+  { method:"POST", pattern:/^\/api\/order\/[^/]+\/exchange$/, module:"orders", action:"edit" },
+  { method:"POST", pattern:/^\/api\/order\/[^/]+\/collection$/, module:"orders", action:"collect" },
+  { method:"POST", pattern:/^\/api\/order\/[^/]+\/cod$/, module:"orders", action:"collect" },
+  { method:"POST", pattern:/^\/api\/order\/[^/]+\/cancel$/, module:"orders", action:"cancel" },
+  { method:"POST", pattern:/^\/api\/order\/[^/]+\/return$/, module:"orders", action:"cancel" },
+  { method:"POST", pattern:/^\/api\/shipping-companies$/, module:"orders", action:"edit" },
+  { method:"POST", pattern:/^\/api\/ship-prices$/, module:"orders", action:"edit" },
+
+  { method:"POST", pattern:/^\/api\/returns\/[^/]+\/cancel$/, module:"returns", action:"cancel" },
+
+  { method:"POST", pattern:/^\/api\/expense-categories$/, module:"expenses", action:"edit" },
+
+  { method:"POST", pattern:/^\/api\/debts$/, module:"debts", action:"create" },
+  { method:"POST", pattern:/^\/api\/debts\/[^/]+\/edit$/, module:"debts", action:"edit" },
+  { method:"POST", pattern:/^\/api\/debts\/[^/]+\/delete$/, module:"debts", action:"delete" },
+  { method:"POST", pattern:/^\/api\/debts\/[^/]+\/payment$/, module:"debts", action:"payment" },
+  { method:"POST", pattern:/^\/api\/debts\/[^/]+\/payments\/[^/]+\/edit$/, module:"debts", action:"payment" },
+  { method:"POST", pattern:/^\/api\/debts\/[^/]+\/payments\/[^/]+\/delete$/, module:"debts", action:"payment" },
+
+  { method:"POST", pattern:/^\/api\/transfers$/, module:"cash", action:"create" },
+  { method:"POST", pattern:/^\/api\/closings$/, module:"cash", action:"edit" }
+];
+function checkRoutePermission(user, method, url){
+  const rule = ROUTE_PERMISSIONS.find(function(r){ return r.method === method && r.pattern.test(url); });
+  if(!rule) return null; // مفيش قاعدة لطريق زي ده — التحقق بيتم جوه الكود نفسه (أو الطريق مش محكوم أصلًا)
+  return can(user, rule.module, rule.action);
+}
 
 /* ---------- سجل حسابات الشركاء (مؤمن/عبدو) — المصدر الوحيد لحساب الأرصدة ----------
    referenceType/referenceId يحدّدان الحركة المالية الأصلية بشكل فريد (فاتورة بيع،
@@ -476,15 +545,45 @@ const genericModels = {
   users: {
     addLabel: "إضافة مستخدم", editLabel: "تعديل مستخدم", delLabel: "حذف مستخدم",
     logDetail: function(it){ return it.username; },
-    findOne: function(id){ return prisma.user.findUnique({ where: { id } }); },
+    findOne: function(id){ return prisma.user.findUnique({ where: { id }, include: { permissions: true } }); },
     async upsert(tx, it, isNew){
       const data = { name: it.name || null, username: it.username, password: it.password, role: it.role || null, canManageReturns: it.canManageReturns === false ? false : true };
       if(isNew) await tx.user.create({ data: { id: it.id, ...data } });
       else await tx.user.update({ where: { id: it.id }, data });
+
+      // صلاحيات المستخدم: استبدال كامل (مسح ثم إعادة إنشاء) — نفس أسلوب
+      // upsertPartnerLedger. بيتنفذ فقط لو الواجهة بعتت مصفوفة permissions
+      // صراحة (يعني نموذج الصلاحيات اتفتح واتحفظ)، عشان أي نداء API قديم
+      // مايمسحش صلاحيات موجودة بالغلط لو معندوش الحقل ده أصلاً.
+      if(Array.isArray(it.permissions)){
+        await tx.userPermission.deleteMany({ where: { userId: it.id } });
+        const rows = it.permissions.filter(function(p){ return p && p.module && p.action; });
+        for(const p of rows){
+          await tx.userPermission.create({ data: { id: uid(), userId: it.id, module: String(p.module), action: String(p.action) } });
+        }
+      }
     },
     async remove(tx, id){ await tx.user.delete({ where: { id } }); }
   }
 };
+// module لكل نوع عام — null يعني الطريق ده مش محكوم بنظام الصلاحيات (customers/
+// suppliers لسه ملهمش صفحة وصول في الواجهة، فبيفضلوا متاحين لأي مستخدم مسجل
+// دخول زي ما هما دلوقتي بالظبط).
+const GENERIC_MODULE_MAP = { products:"products", customers:null, suppliers:null, expenses:"expenses", income:"finance", users:"cashiers" };
+// ملخص التغيير في صلاحيات مستخدم — بيتضاف لتفصيل سجل الحركات عند حفظ مستخدم،
+// عشان نعرف مين غيّر ايه بالظبط (مطلوب صراحة في سجل الحركات/الأنشطة).
+function diffPermissions(oldRows, newRows){
+  function key(p){ return p.module + ":" + p.action; }
+  const oldKeys = (oldRows||[]).map(key);
+  const newKeys = (newRows||[]).map(key);
+  const added = newKeys.filter(function(k){ return oldKeys.indexOf(k) === -1; });
+  const removed = oldKeys.filter(function(k){ return newKeys.indexOf(k) === -1; });
+  if(!added.length && !removed.length) return "";
+  let s = "";
+  if(added.length) s += " — أُضيف: " + added.join("، ");
+  if(removed.length) s += " — أُزيل: " + removed.join("، ");
+  return s;
+}
 
 /* ---------- تحديث حالة أوردر (مشترك بين الحالة/الشحن/COD/الإرجاع/الإلغاء) ---------- */
 async function orderPatch(id, req, res, mutateFn, actionLabelFn, txExtraFn){
@@ -561,6 +660,12 @@ const server = http.createServer(async function(req, res){
   const user = await authUser(req);
   if(!user){ send(res, 401, {ok:false, error:"غير مسجل دخول"}); return; }
   req.user = user;
+
+  // بوابة الصلاحيات المركزية — لأي طريق قابل للتحديد بالكامل من method+url
+  // (راجع ROUTE_PERMISSIONS). الطرق اللي بتفرّق بين create/edit من جوه الـ body
+  // (المنتجات/المصاريف/الإيرادات/المستخدمين، و/api/returns) بتتفحص بمكانها.
+  const routeAllowed = checkRoutePermission(user, method, url);
+  if(routeAllowed === false){ send(res, 403, { ok:false, error: PERMISSION_DENIED }); return; }
 
   if(method === "GET" && url === "/api/state"){
     const state = await db.buildStateFromDB();
@@ -669,10 +774,12 @@ const server = http.createServer(async function(req, res){
 
   /* ---------- الاسترجاع والاستبدال (استرجاع جزئي/كامل لفاتورة قائمة — لا يحذف الفاتورة الأصلية) ---------- */
   if(method === "POST" && url === "/api/returns"){
-    if(!canManageReturns(user)){ send(res, 403, {ok:false, error:"ليس لديك صلاحية إدارة الاسترجاع والاستبدال"}); return; }
     const b = await readBody(req);
     const saleId = b.saleId;
     const type = b.type === "exchange" ? "exchange" : "return";
+    // نوع العملية (استرجاع/استبدال) بيحدد الصلاحية المطلوبة — الاتنين منفصلين
+    // عن بعض عمدًا عشان يقدر المدير يسمح باسترجاع من غير استبدال أو العكس.
+    if(!can(user, "returns", type)){ send(res, 403, { ok:false, error: PERMISSION_DENIED }); return; }
     const reqItems = Array.isArray(b.items) ? b.items : [];
     const reason = (b.reason||"").trim();
     const refundMethod = b.refundMethod === "credit" ? "credit" : (b.refundMethod === "cash" ? "cash" : null);
@@ -793,7 +900,7 @@ const server = http.createServer(async function(req, res){
   // idempotent: أي محاولة إلغاء تانية على سجل status="ملغي" بالفعل بترفض فوراً
   // قبل ما تلمس أي مخزون أو دفتر.
   if(method === "POST" && /^\/api\/returns\/[^/]+\/cancel$/.test(url)){
-    if(!canManageReturns(user)){ send(res, 403, {ok:false, error:"ليس لديك صلاحية إدارة الاسترجاع والاستبدال"}); return; }
+    // الصلاحية اتفحصت بالفعل في البوابة المركزية فوق (returns.cancel عبر ROUTE_PERMISSIONS).
     const id = url.split("/")[3];
     const b = await readBody(req);
     const reason = (b.reason || "").trim() || null;
@@ -1597,6 +1704,8 @@ const server = http.createServer(async function(req, res){
       const existing = it.id ? await cfg.findOne(it.id) : null;
       const isNew = !existing;
       it.id = it.id || uid();
+      const module = GENERIC_MODULE_MAP[g];
+      if(module && !can(user, module, isNew ? "create" : "edit")){ send(res, 403, { ok:false, error: PERMISSION_DENIED }); return; }
       if(g === "products"){
         const modelCode = (it.modelCode||"").trim();
         if(!modelCode){ send(res, 400, {ok:false, error:"كود الموديل مطلوب"}); return; }
@@ -1606,6 +1715,12 @@ const server = http.createServer(async function(req, res){
       }
       if(g === "expenses" || g === "income"){
         if(it.partner !== "moamen" && it.partner !== "abdo"){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
+      }
+      // ما ينفعش حد يغيّر آخر مدير في النظام لكاشير — هيقفل صفحة المستخدمين
+      // على الجميع بلا رجعة (نفس مبدأ منع حذف آخر مدير تحت).
+      if(g === "users" && !isNew && existing.role === "admin" && it.role !== "admin"){
+        const adminCount = await prisma.user.count({ where: { role: "admin" } });
+        if(adminCount <= 1){ send(res, 400, {ok:false, error:"لا يمكن تغيير صلاحية آخر مدير — لازم يفضل مدير واحد على الأقل بالنظام"}); return; }
       }
       try{
         await prisma.$transaction(async function(tx){
@@ -1617,7 +1732,11 @@ const server = http.createServer(async function(req, res){
             await upsertPartnerLedger(tx, { partner: it.partner, type: "OTHER_INCOME", direction: "in", amount: it.amount,
               referenceType: "otherIncome", referenceId: it.id, date: it.date, userId: it.userId || user.id, notes: it.note || null });
           }
-          await tx.auditLog.create({ data: auditEntry(req, isNew ? cfg.addLabel : cfg.editLabel, cfg.logDetail(it)) });
+          let detail = cfg.logDetail(it);
+          if(g === "users" && Array.isArray(it.permissions)){
+            detail += diffPermissions(existing ? existing.permissions : [], it.permissions);
+          }
+          await tx.auditLog.create({ data: auditEntry(req, isNew ? cfg.addLabel : cfg.editLabel, detail) });
         }, { timeout: 30000 });
       }catch(err){
         if(g === "products" && err && err.code === "P2002"){ send(res, 400, {ok:false, error:"كود الموديل مستخدم بالفعل لمنتج آخر"}); return; }
@@ -1632,6 +1751,8 @@ const server = http.createServer(async function(req, res){
       const id = url.split("/")[3];
       const existing = await cfg.findOne(id);
       if(!existing){ send(res, 404, {ok:false}); return; }
+      const module = GENERIC_MODULE_MAP[g];
+      if(module && !can(user, module, "delete")){ send(res, 403, { ok:false, error: PERMISSION_DENIED }); return; }
       if(g === "users"){
         if(existing.id === user.id){ send(res, 400, {ok:false, error:"لا يمكنك حذف حسابك الحالي"}); return; }
         if(existing.role === "admin"){

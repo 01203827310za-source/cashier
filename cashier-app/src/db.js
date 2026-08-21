@@ -45,7 +45,10 @@ async function buildStateFromDB(){
     phone: setting.phone
   }) : {};
 
-  state.users = await prisma.user.findMany();
+  state.users = (await prisma.user.findMany({ include: { permissions: true } })).map(u => ({
+    id: u.id, name: u.name, username: u.username, password: u.password, role: u.role, canManageReturns: u.canManageReturns,
+    permissions: (u.permissions || []).map(p => ({ id: p.id, module: p.module, action: p.action }))
+  }));
 
   const cats = await prisma.category.findMany();
   state.categories = cats.map(c => c.name);
@@ -236,6 +239,7 @@ async function replaceStateInDB(raw){
     await tx.cashClosing.deleteMany({});
     await tx.transfer.deleteMany({});
     await tx.auditLog.deleteMany({});
+    await tx.userPermission.deleteMany({});
     await tx.user.deleteMany({});
     await tx.setting.deleteMany({});
 
@@ -254,8 +258,14 @@ async function replaceStateInDB(raw){
     count++;
 
     for (const u of (raw.users || [])) {
-      await tx.user.create({ data: { id: u.id, name: u.name || null, username: u.username, password: u.password, role: u.role || null, canManageReturns: u.canManageReturns === false ? false : true } });
-      count++;
+      await tx.user.create({
+        data: {
+          id: u.id, name: u.name || null, username: u.username, password: u.password, role: u.role || null,
+          canManageReturns: u.canManageReturns === false ? false : true,
+          permissions: { create: (u.permissions || []).map(p => ({ id: p.id || uid(), module: p.module, action: p.action })) }
+        }
+      });
+      count += 1 + (u.permissions || []).length;
     }
     for (const name of (raw.categories || [])) {
       await tx.category.create({ data: { id: uid(), name } });

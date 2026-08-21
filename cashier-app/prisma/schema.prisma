@@ -14,6 +14,20 @@ model User {
   password         String
   role             String?
   canManageReturns Boolean?
+  permissions      UserPermission[]
+}
+
+// صلاحيات دقيقة لكل مستخدم: صف واحد لكل زوج (module, action) مسموح بيه. الحفظ
+// دايمًا delete-all-for-user ثم recreate للمجموعة الجديدة (نفس أسلوب
+// upsertPartnerLedger)، فمفيش داعي لـ @@unique. onDelete:Cascade لأنها ملكية
+// حقيقية للمستخدم (زي Product/ProductVariant) مش مرجع مالي تاريخي محتاج يفضل
+// موجود بعد حذف صاحبه (زي Debt/DebtPayment).
+model UserPermission {
+  id     String @id
+  userId String
+  module String // "products" | "orders" | ... (نفس ids الموجودة في nav بالواجهة)
+  action String // "view" | "create" | "edit" | "delete" | "print" | "collect" | "cancel" | "return" | "exchange" | "payment"
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model Category {

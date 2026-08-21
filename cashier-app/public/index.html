@@ -935,8 +935,66 @@ async function saveTransfer(){
 
 function currentUser(){ return DB.users.find(function(u){ return u.id === sessionId; }) || null; }
 function isAdmin(){ var u = currentUser(); return u && u.role === "admin"; }
-function canManageReturnsUI(){ var u = currentUser(); return !!u && (u.role === "admin" || u.canManageReturns !== false); }
 function userById(id){ return DB.users.find(function(u){ return u.id === id; }) || null; }
+
+/* ---------- نظام الصلاحيات الدقيقة (صفحة + إجراء) ----------
+   مرآة لنفس منطق can()/legacyCan()/LEGACY_CASHIER_MODULES في server.js —
+   هنا بس للتحكم في الواجهة (إخفاء/تعطيل عناصر)، الأمان الفعلي مفروض في
+   السيرفر. لازم أي تعديل هنا يترافق بنفس التعديل هناك. */
+var PERMISSION_MODULES = [
+  { id:"dashboard", label:"لوحة التحكم", actions:[{id:"view",label:"عرض"}] },
+  { id:"pos", label:"نقطة البيع", actions:[
+    {id:"view",label:"عرض"},{id:"create",label:"إضافة"},{id:"cancel",label:"إلغاء"},{id:"print",label:"طباعة"}
+  ]},
+  { id:"products", label:"المنتجات والمخزون", actions:[
+    {id:"view",label:"عرض"},{id:"create",label:"إضافة"},{id:"edit",label:"تعديل"},{id:"delete",label:"حذف"},{id:"print",label:"طباعة"}
+  ]},
+  { id:"orders", label:"الأوردرات والشحن", actions:[
+    {id:"view",label:"عرض"},{id:"create",label:"إضافة"},{id:"edit",label:"تعديل"},{id:"print",label:"طباعة"},{id:"collect",label:"تحصيل"},{id:"cancel",label:"إلغاء"}
+  ]},
+  { id:"returns", label:"الاسترجاع والاستبدال", actions:[
+    {id:"view",label:"عرض"},{id:"return",label:"استرجاع"},{id:"exchange",label:"استبدال"},{id:"cancel",label:"إلغاء المرتجع"}
+  ]},
+  { id:"expenses", label:"المصاريف", actions:[
+    {id:"view",label:"عرض"},{id:"create",label:"إضافة"},{id:"edit",label:"تعديل"},{id:"delete",label:"حذف"}
+  ]},
+  { id:"debts", label:"الديون", actions:[
+    {id:"view",label:"عرض"},{id:"create",label:"إضافة"},{id:"edit",label:"تعديل"},{id:"delete",label:"حذف"},{id:"payment",label:"تسجيل دفعة"}
+  ]},
+  { id:"cash", label:"الخزنة", actions:[
+    {id:"view",label:"عرض"},{id:"create",label:"إضافة"},{id:"edit",label:"تعديل"}
+  ]},
+  { id:"finance", label:"الحسابات (أرباح/خسائر)", actions:[
+    {id:"view",label:"عرض"},{id:"create",label:"إضافة"},{id:"edit",label:"تعديل"},{id:"delete",label:"حذف"}
+  ]},
+  { id:"partners", label:"حسابات الشركاء", actions:[{id:"view",label:"عرض"}] },
+  { id:"assets", label:"الأصول والديون", actions:[{id:"view",label:"عرض"}] },
+  { id:"reports", label:"التقارير", actions:[{id:"view",label:"عرض"}] },
+  { id:"audit", label:"سجل الحركات", actions:[{id:"view",label:"عرض"}] },
+  { id:"cashiers", label:"الكاشير والصلاحيات", actions:[
+    {id:"view",label:"عرض"},{id:"create",label:"إضافة"},{id:"edit",label:"تعديل"},{id:"delete",label:"حذف"}
+  ]}
+];
+// نفس الصلاحيات اللي كانت فعلية فعلاً قبل النظام ده (nav roles القديمة +
+// canManageReturns) — بتتطبق بس على كاشير معندوش ولا صف UserPermission واحد
+// (يعني لسه ما اتحفظش له صلاحيات صريحة من الشاشة الجديدة)، عشان محدش يتقفل
+// عليه فجأة أول ما الميزة دي تتنشر.
+var LEGACY_CASHIER_MODULES = { dashboard:["view"], pos:["view","create","edit"], products:["view","create","edit"], orders:["view","create","edit"], reports:["view"] };
+function legacyCan(u, module, action){
+  if(module === "returns" && (action === "return" || action === "exchange" || action === "cancel")){
+    return u.canManageReturns !== false;
+  }
+  var allowed = LEGACY_CASHIER_MODULES[module];
+  return !!allowed && allowed.indexOf(action) !== -1;
+}
+function can(module, action){
+  var u = currentUser();
+  if(!u) return false;
+  if(u.role === "admin") return true;
+  var perms = u.permissions || [];
+  if(!perms.length) return legacyCan(u, module, action);
+  return perms.some(function(p){ return p.module === module && p.action === action; });
+}
 
 /* ---------- Toast ---------- */
 function toast(msg, type){
@@ -1038,7 +1096,12 @@ function render(){
     {id:"cashiers", label:"الكاشير والصلاحيات", ic:"shield", roles:["admin"]},
     {id:"settings", label:"الإعدادات", ic:"gear", roles:["admin"]}
   ];
-  var navHTML = nav.filter(function(n){ return n.roles.indexOf(u.role) !== -1; }).map(function(n){
+  // الصفحات الأربعتاشر المشمولة بنظام الصلاحيات الدقيقة بتتفلتر بـ can(view)؛
+  // أي صفحة تانية (الإعدادات فقط دلوقتي) لسه بتتفلتر بـ role القديم زي ما هو.
+  var navHTML = nav.filter(function(n){
+    var isGated = PERMISSION_MODULES.some(function(m){ return m.id === n.id; });
+    return isGated ? can(n.id, "view") : (n.roles.indexOf(u.role) !== -1);
+  }).map(function(n){
     return '<button class="nav-item '+(currentView===n.id?"active":"")+'" onclick="go(\''+n.id+'\')">'+icon(n.ic,18)+'<span>'+n.label+'</span></button>';
   }).join("");
 
@@ -1101,6 +1164,13 @@ function toggleSidebar(force){
 function go(v){ currentView = v; posState.query=""; posState.category="الكل"; render(); }
 
 function renderView(){
+  // بوابة مركزية واحدة لكل الصفحات الأربعتاشر المشمولة بنظام الصلاحيات —
+  // بتمنع الوصول حتى لو currentView اتغيّر بأي طريقة تانية غير زرار الشريط
+  // الجانبي (اللي أصلاً مخفي عن الصفحة دي لو مفيش عرض).
+  var gated = PERMISSION_MODULES.some(function(m){ return m.id === currentView; });
+  if(gated && !can(currentView, "view")){
+    return '<div class="empty"><div class="big">🔒</div><p>ليس لديك صلاحية للوصول لهذه الصفحة</p></div>';
+  }
   switch(currentView){
     case "pos": return kioskMode ? viewKiosk() : viewPos();
     case "products": return viewProducts();
@@ -1463,7 +1533,7 @@ function cartHTML(){
       '<div class="tot-row grand"><span>الإجمالي</span><span>'+fmt(t.total)+' '+esc(DB.settings.currency)+'</span></div>'+
       '<div class="row mt8">'+
         '<button class="btn btn-ghost btn-sm" onclick="clearCart()">'+icon("trash",14)+' إفراغ</button>'+
-        '<button class="btn btn-green btn-sm grow" '+(cart.length?'onclick="openCheckout()"':'disabled style="opacity:.5;cursor:not-allowed"')+'>'+icon("card",16)+' إتمام البيع</button>'+
+        '<button class="btn btn-green btn-sm grow" '+((cart.length && can("pos","create"))?'onclick="openCheckout()"':'disabled style="opacity:.5;cursor:not-allowed"')+'>'+icon("card",16)+' إتمام البيع</button>'+
       '</div>'+
     '</div>';
 }
@@ -1626,10 +1696,10 @@ function showReceipt(sale){
       '<div style="background:#fff;border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,.08);max-width:320px;margin:0 auto;">'+receiptHTML(sale)+'</div>'+
     '</div>'+
     '<div class="modal-foot">'+
-      '<button class="btn btn-primary" onclick="window.print()">'+icon("print",16)+' طباعة</button>'+
-      (canManageReturnsUI() && sale.id && !isSaleCancelled(sale) ? '<button class="btn btn-soft-red" onclick="openReturnFlow(\''+sale.id+'\',\'return\')">'+icon("return",16)+' استرجاع</button>' : '')+
-      (canManageReturnsUI() && sale.id && !isSaleCancelled(sale) ? '<button class="btn btn-soft" onclick="openReturnFlow(\''+sale.id+'\',\'exchange\')">'+icon("return",16)+' استبدال</button>' : '')+
-      (canManageReturnsUI() && sale.id && !isSaleCancelled(sale) ? '<button class="btn btn-red" onclick="openSaleCancelDialog(\''+sale.id+'\')">إلغاء الفاتورة</button>' : '')+
+      (can("pos","print") ? '<button class="btn btn-primary" onclick="window.print()">'+icon("print",16)+' طباعة</button>' : '')+
+      (can("returns","return") && sale.id && !isSaleCancelled(sale) ? '<button class="btn btn-soft-red" onclick="openReturnFlow(\''+sale.id+'\',\'return\')">'+icon("return",16)+' استرجاع</button>' : '')+
+      (can("returns","exchange") && sale.id && !isSaleCancelled(sale) ? '<button class="btn btn-soft" onclick="openReturnFlow(\''+sale.id+'\',\'exchange\')">'+icon("return",16)+' استبدال</button>' : '')+
+      (can("pos","cancel") && sale.id && !isSaleCancelled(sale) ? '<button class="btn btn-red" onclick="openSaleCancelDialog(\''+sale.id+'\')">إلغاء الفاتورة</button>' : '')+
       '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
     '</div>'
   );
@@ -1688,6 +1758,7 @@ function viewProducts(){
   var cat = $("#prod-cat") ? $("#prod-cat").value : "الكل";
   var list = filteredProductsList();
   var cats = ["الكل"].concat(DB.categories).map(function(c){ return '<option value="'+esc(c)+'" '+(cat===c?"selected":"")+'>'+esc(c)+'</option>'; }).join("");
+  var canPrintProd = can("products","print"), canEditProd = can("products","edit"), canDeleteProd = can("products","delete");
 
   var rows = list.map(function(p){
     var out = p.stock<=0, low = !out && p.stock<=DB.settings.lowStockThreshold;
@@ -1702,12 +1773,12 @@ function viewProducts(){
       '<td>'+(out?'<span class="badge badge-red">نفد</span>':(low?'<span class="badge badge-amber">'+p.stock+' ⚠</span>':p.stock))+
         ((p.variants||[]).length>1 ? ' <span class="muted small" title="'+vhint+'">('+(p.variants||[]).length+' مقاس/لون)</span>' : '')+'</td>'+
       '<td>'+
-        (isAdmin() ?
+        ((canPrintProd || canEditProd || canDeleteProd) ?
           '<div class="row" style="gap:2px;">'+
-            '<button class="icon-btn" title="طباعة باركود" onclick="openBarcodePrint(\''+p.id+'\')">'+icon("tag",16)+'</button>'+
-            '<button class="icon-btn" title="تعديل المخزون" onclick="openStockEditor(\''+p.id+'\')">'+icon("box",16)+'</button>'+
-            '<button class="icon-btn primary" onclick="openProductForm(\''+p.id+'\')">'+icon("edit",16)+'</button>'+
-            '<button class="icon-btn danger" onclick="deleteProduct(\''+p.id+'\')">'+icon("trash",16)+'</button>'+
+            (canPrintProd ? '<button class="icon-btn" title="طباعة باركود" onclick="openBarcodePrint(\''+p.id+'\')">'+icon("tag",16)+'</button>' : '')+
+            (canEditProd ? '<button class="icon-btn" title="تعديل المخزون" onclick="openStockEditor(\''+p.id+'\')">'+icon("box",16)+'</button>' : '')+
+            (canEditProd ? '<button class="icon-btn primary" onclick="openProductForm(\''+p.id+'\')">'+icon("edit",16)+'</button>' : '')+
+            (canDeleteProd ? '<button class="icon-btn danger" onclick="deleteProduct(\''+p.id+'\')">'+icon("trash",16)+'</button>' : '')+
           '</div>' : '<span class="muted small">عرض فقط</span>')+
       '</td>'+
     '</tr>';
@@ -1720,11 +1791,11 @@ function viewProducts(){
         '<span style="position:absolute;right:11px;top:50%;transform:translateY(-50%);color:var(--muted)">'+icon("search",16)+'</span>'+
       '</div>'+
       '<select id="prod-cat" onchange="reloadProducts()">'+cats+'</select>'+
-      '<button class="btn btn-ghost" onclick="openInventoryPrint()">'+icon("print",16)+' طباعة</button>'+
-      (isAdmin() ? '<button class="btn btn-soft" onclick="openPrintingOrderForm()">'+icon("return",16)+' أمر طباعة</button>' : '')+
-      (isAdmin() ? '<button class="btn btn-ghost" onclick="openPrintingOrdersHistory()">'+icon("history",16)+' سجل أوامر الطباعة</button>' : '')+
-      (isAdmin() ? '<button class="btn btn-primary" onclick="openProductForm()">'+icon("plus",16)+' إضافة منتج</button>' : '')+
-      (isAdmin() ? '<button class="btn btn-ghost" onclick="openCategories()">'+icon("tag",16)+' الفئات</button>' : '')+
+      (canPrintProd ? '<button class="btn btn-ghost" onclick="openInventoryPrint()">'+icon("print",16)+' طباعة</button>' : '')+
+      (canEditProd ? '<button class="btn btn-soft" onclick="openPrintingOrderForm()">'+icon("return",16)+' أمر طباعة</button>' : '')+
+      (canEditProd ? '<button class="btn btn-ghost" onclick="openPrintingOrdersHistory()">'+icon("history",16)+' سجل أوامر الطباعة</button>' : '')+
+      (can("products","create") ? '<button class="btn btn-primary" onclick="openProductForm()">'+icon("plus",16)+' إضافة منتج</button>' : '')+
+      (canEditProd ? '<button class="btn btn-ghost" onclick="openCategories()">'+icon("tag",16)+' الفئات</button>' : '')+
     '</div>';
 
   return head +
@@ -2486,7 +2557,7 @@ function viewReports(){
       '<td><span class="badge '+(s.paymentMethod==="cash"?"badge-green":(s.paymentMethod==="card"?"badge-blue":(s.paymentMethod==="credit"?"badge-red":"badge-amber")))+'">'+(payMap[s.paymentMethod]||s.paymentMethod)+'</span></td>'+
       '<td><div class="row" style="gap:2px;">'+
         '<button class="icon-btn primary" onclick="viewSale(\''+s.id+'\')">'+icon("eye",16)+'</button>'+
-        (canManageReturnsUI() ? '<button class="icon-btn danger" onclick="openReturnFlow(\''+s.id+'\')" title="استرجاع/استبدال">'+icon("return",16)+'</button>' : '')+
+        ((can("returns","return")||can("returns","exchange")) ? '<button class="icon-btn danger" onclick="openReturnFlow(\''+s.id+'\')" title="استرجاع/استبدال">'+icon("return",16)+'</button>' : '')+
       '</div></td></tr>';
   }).join("");
 
@@ -2565,7 +2636,7 @@ function returnRowHTML(r){
     '<td><span class="badge '+badgeColor+'">'+esc(r.status||"")+'</span></td>'+
     '<td style="white-space:nowrap;">'+
       '<button class="icon-btn primary" title="عرض" onclick="viewReturnDetail(\''+r.id+'\')">'+icon("eye",16)+'</button>'+
-      (canManageReturnsUI() && !cancelled ? '<button class="icon-btn danger" title="إلغاء المرتجع" onclick="cancelReturn(\''+r.id+'\')">'+icon("x",16)+'</button>' : '')+
+      (can("returns","cancel") && !cancelled ? '<button class="icon-btn danger" title="إلغاء المرتجع" onclick="cancelReturn(\''+r.id+'\')">'+icon("x",16)+'</button>' : '')+
     '</td>'+
   '</tr>';
 }
@@ -2594,7 +2665,7 @@ function viewReturns(){
     '</select>'+
     '<input type="date" value="'+esc(returnsFrom)+'" onchange="setReturnsFrom(this.value)">'+
     '<input type="date" value="'+esc(returnsTo)+'" onchange="setReturnsTo(this.value)">'+
-    (canManageReturnsUI() ? '<button class="btn btn-primary" onclick="openReturnFlow()">'+icon("plus",16)+' استرجاع/استبدال جديد</button>' : '')+
+    ((can("returns","return")||can("returns","exchange")) ? '<button class="btn btn-primary" onclick="openReturnFlow()">'+icon("plus",16)+' استرجاع/استبدال جديد</button>' : '')+
   '</div>'+
   '<div class="stats">'+
     statCard("return","var(--red)", fmtInt(list.length), "عدد العمليات")+
@@ -2625,7 +2696,7 @@ function loadReturnSale(sale){
   });
 }
 function openReturnFlow(saleId, presetType){
-  if(!canManageReturnsUI()){ toast("ليس لديك صلاحية إدارة الاسترجاع والاستبدال","err"); return; }
+  if(!can("returns","return") && !can("returns","exchange")){ toast("ليس لديك صلاحية إدارة الاسترجاع والاستبدال","err"); return; }
   returnDraft = { saleId:null, invoiceInput:"", type: presetType||"return", lines:[], customerId:null, refundMethod:"cash", reason:"" };
   if(saleId){
     var sale = DB.sales.find(function(s){ return s.id===saleId; });
@@ -2831,7 +2902,7 @@ function viewReturnDetail(id){
       '</div>'+
     '</div>'+
     '<div class="modal-foot">'+
-      (canManageReturnsUI() && !isReturnCancelled(r) ? '<button class="btn btn-soft-red" onclick="cancelReturn(\''+r.id+'\')">'+icon("x",16)+' إلغاء المرتجع</button>' : '')+
+      (can("returns","cancel") && !isReturnCancelled(r) ? '<button class="btn btn-soft-red" onclick="cancelReturn(\''+r.id+'\')">'+icon("x",16)+' إلغاء المرتجع</button>' : '')+
       '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
     '</div>'
   , true);
@@ -3327,7 +3398,7 @@ function orderRowHTML(o){
   var payMethodBadge = o.paymentStatus==="cod" ? (orderCodDone(o) ? '<span class="badge badge-green">COD ✓</span>' : '<span class="badge badge-amber">COD معلق</span>') : (o.paymentStatus==="credit" ? '<span class="badge badge-red">آجل</span>' : '<span class="badge badge-blue">مدفوع مسبقاً</span>');
   var payStatus = orderPaymentStatus(o);
   var collected = orderCollectedTotal(o), remaining = orderRemaining(o);
-  var canCollect = remaining>0 && ["cancelled","returned"].indexOf(o.status)===-1;
+  var canCollect = remaining>0 && ["cancelled","returned"].indexOf(o.status)===-1 && can("orders","collect");
   return '<tr>'+
     '<td class="bold">'+esc(o.number)+(o.awb?'<div class="small muted" dir="ltr">'+esc(o.awb)+'</div>':'')+'</td>'+
     '<td>'+dateStr(o.date)+'</td>'+
@@ -3345,8 +3416,8 @@ function orderRowHTML(o){
     '<td><div class="row" style="gap:2px;">'+
       (canCollect ? '<button class="icon-btn" title="تسجيل تحصيل" onclick="openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+'</button>' : '')+
       '<button class="icon-btn primary" onclick="viewOrder(\''+o.id+'\')">'+icon("eye",16)+'</button>'+
-      (ORDER_FLOW.indexOf(o.status)!==-1 && flowNext(o.status) ? '<button class="icon-btn primary" title="تقدم للحالة التالية" onclick="advanceOrder(\''+o.id+'\')">'+icon("check",16)+'</button>' : '')+
-      '<button class="icon-btn" title="طباعة" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+'</button>'+
+      (can("orders","edit") && ORDER_FLOW.indexOf(o.status)!==-1 && flowNext(o.status) ? '<button class="icon-btn primary" title="تقدم للحالة التالية" onclick="advanceOrder(\''+o.id+'\')">'+icon("check",16)+'</button>' : '')+
+      (can("orders","print") ? '<button class="icon-btn" title="طباعة" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+'</button>' : '')+
     '</div></td>'+
   '</tr>';
 }
@@ -3437,9 +3508,9 @@ function viewOrders(){
     '<input type="date" value="'+orderFrom+'" onchange="setOrderFrom(this.value)">'+
     '<input type="date" value="'+orderTo+'" onchange="setOrderTo(this.value)">'+
     (hasFilters ? '<button class="btn btn-ghost" onclick="orderQ=\'\';orderStatusFilter=\'all\';orderCompanyFilter=\'all\';orderPayFilter=\'all\';orderFrom=\'\';orderTo=\'\';renderViewInPlace()">مسح الفلترة</button>' : '')+
-    '<button class="btn btn-primary" onclick="openOrderForm()">'+icon("plus",16)+' أوردر جديد</button>'+
-    '<button class="btn btn-ghost" onclick="printDailySheet()">'+icon("print",16)+' شيت الشحن</button>'+
-    (isAdmin() ? '<button class="btn btn-ghost" onclick="openShipCompanies()">'+icon("truck",16)+' شركات الشحن</button>'+
+    (can("orders","create") ? '<button class="btn btn-primary" onclick="openOrderForm()">'+icon("plus",16)+' أوردر جديد</button>' : '')+
+    (can("orders","print") ? '<button class="btn btn-ghost" onclick="printDailySheet()">'+icon("print",16)+' شيت الشحن</button>' : '')+
+    (can("orders","edit") ? '<button class="btn btn-ghost" onclick="openShipCompanies()">'+icon("truck",16)+' شركات الشحن</button>'+
     '<button class="btn btn-ghost" onclick="openShipPrices()">'+icon("cash",16)+' أسعار الشحن</button>' : '')+
   '</div>';
 
@@ -3845,13 +3916,13 @@ function viewOrder(id){
       orderExchangeHistoryHTML(o)+
     '</div>'+
     '<div class="modal-foot" style="flex-wrap:wrap;">'+
-      (flowNext(o.status) ? '<button class="btn btn-primary" onclick="advanceOrder(\''+o.id+'\')">'+icon("check",16)+' '+statusMeta(flowNext(o.status)).label+'</button>' : '')+
-      (orderRemaining(o)>0 && ["cancelled","returned"].indexOf(o.status)===-1 ? '<button class="btn btn-ghost" onclick="closeModal();openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+' تسجيل تحصيل</button>' : '')+
-      '<button class="btn btn-ghost" onclick="setShipment(\''+o.id+'\')">'+icon("truck",16)+' الشحنة</button>'+
-      '<button class="btn btn-ghost" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+' طباعة</button>'+
-      (canExchange ? '<button class="btn btn-ghost" onclick="closeModal();openOrderExchange(\''+o.id+'\')">'+icon("return",16)+' استبدال</button>' : '')+
-      (["new","preparing","ready","shipped","transit","delivered"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="returnOrder(\''+o.id+'\')">'+icon("return",16)+' مرتجع</button>' : '')+
-      (["new","preparing","ready"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="cancelOrder(\''+o.id+'\')">'+icon("x",16)+' إلغاء الأوردر</button>' : '')+
+      (can("orders","edit") && flowNext(o.status) ? '<button class="btn btn-primary" onclick="advanceOrder(\''+o.id+'\')">'+icon("check",16)+' '+statusMeta(flowNext(o.status)).label+'</button>' : '')+
+      (can("orders","collect") && orderRemaining(o)>0 && ["cancelled","returned"].indexOf(o.status)===-1 ? '<button class="btn btn-ghost" onclick="closeModal();openOrderCollection(\''+o.id+'\')">'+icon("banknote",16)+' تسجيل تحصيل</button>' : '')+
+      (can("orders","edit") ? '<button class="btn btn-ghost" onclick="setShipment(\''+o.id+'\')">'+icon("truck",16)+' الشحنة</button>' : '')+
+      (can("orders","print") ? '<button class="btn btn-ghost" onclick="printOrderSlip(\''+o.id+'\')">'+icon("print",16)+' طباعة</button>' : '')+
+      (can("orders","edit") && canExchange ? '<button class="btn btn-ghost" onclick="closeModal();openOrderExchange(\''+o.id+'\')">'+icon("return",16)+' استبدال</button>' : '')+
+      (can("orders","cancel") && ["new","preparing","ready","shipped","transit","delivered"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="returnOrder(\''+o.id+'\')">'+icon("return",16)+' مرتجع</button>' : '')+
+      (can("orders","cancel") && ["new","preparing","ready"].indexOf(o.status)!==-1 ? '<button class="btn btn-soft-red" onclick="cancelOrder(\''+o.id+'\')">'+icon("x",16)+' إلغاء الأوردر</button>' : '')+
     '</div>'
   , true);
 }
@@ -4146,7 +4217,7 @@ function setExpCat(v){ expCat = v; renderViewInPlace(); }
 function setExpFrom(v){ expFrom = v; renderViewInPlace(); }
 function setExpTo(v){ expTo = v; renderViewInPlace(); }
 function viewExpenses(){
-  if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
+  if(!can("expenses","view")){ return '<div class="empty"><div class="big">🔒</div><p>ليس لديك صلاحية للوصول لهذه الصفحة</p></div>'; }
   var from = expFrom ? new Date(expFrom+"T00:00:00").getTime() : 0;
   var to = expTo ? new Date(expTo+"T23:59:59").getTime() : Date.now()+86400000;
   var q = expQ.toLowerCase();
@@ -4170,15 +4241,15 @@ function viewExpenses(){
       '<td>'+payMethodLabel(e.paymentMethod)+'</td>'+
       '<td>'+(e.partner?partnerLabel(e.partner):'—')+'</td>'+
       '<td class="bold" style="color:var(--red);">- '+fmt(e.amount)+'</td>'+
-      '<td><button class="icon-btn danger" onclick="deleteExpense(\''+e.id+'\')">'+icon("trash",16)+'</button></td></tr>';
+      '<td>'+(can("expenses","delete") ? '<button class="icon-btn danger" onclick="deleteExpense(\''+e.id+'\')">'+icon("trash",16)+'</button>' : '')+'</td></tr>';
   }).join("");
   return '<div class="filterbar">'+
     '<input placeholder="ابحث في المصاريف..." style="flex:1;min-width:160px;padding:9px 12px;border:1px solid var(--border);border-radius:10px;" value="'+esc(expQ)+'" oninput="setExpQ(this.value)">'+
     '<select onchange="setExpCat(this.value)">'+catOpts+'</select>'+
     '<input type="date" value="'+expFrom+'" onchange="setExpFrom(this.value)">'+
     '<input type="date" value="'+expTo+'" onchange="setExpTo(this.value)">'+
-    '<button class="btn btn-primary" onclick="openExpenseForm()">'+icon("plus",16)+' تسجيل مصروف</button>'+
-    '<button class="btn btn-ghost" onclick="openExpenseCats()">'+icon("tag",16)+' الفئات</button>'+
+    (can("expenses","create") ? '<button class="btn btn-primary" onclick="openExpenseForm()">'+icon("plus",16)+' تسجيل مصروف</button>' : '')+
+    (can("expenses","edit") ? '<button class="btn btn-ghost" onclick="openExpenseCats()">'+icon("tag",16)+' الفئات</button>' : '')+
   '</div>'+
   '<div class="stats">'+
     statCard("coins","var(--red)", fmt(total), "إجمالي المصاريف المفلترة")+
@@ -4314,12 +4385,12 @@ function setDebtPayPersonFilter(v){ debtPayPersonFilter = v; renderViewInPlace()
 function setDebtPayPayerFilter(v){ debtPayPayerFilter = v; renderViewInPlace(); }
 function setDebtPayMethodFilter(v){ debtPayMethodFilter = v; renderViewInPlace(); }
 function viewDebts(){
-  if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
+  if(!can("debts","view")){ return '<div class="empty"><div class="big">🔒</div><p>ليس لديك صلاحية للوصول لهذه الصفحة</p></div>'; }
   var sum = debtsSummary();
   var header =
     '<div class="row mb16" style="justify-content:space-between;flex-wrap:wrap;gap:10px;">'+
       '<span class="muted small">كل ديون المحل — على العملاء، للموردين، الشخصية، وأي دين آخر — في مكان واحد.</span>'+
-      '<button class="btn btn-primary" onclick="openAddDebt()">'+icon("plus",16)+' إضافة دين</button>'+
+      (can("debts","create") ? '<button class="btn btn-primary" onclick="openAddDebt()">'+icon("plus",16)+' إضافة دين</button>' : '')+
     '</div>'+
     '<div class="stats mb16">'+
       statCard("scale","var(--primary)", fmt(sum.totalAmount), "إجمالي الديون")+
@@ -4349,9 +4420,9 @@ function debtsListSection(){
       '<td><span class="badge '+st.cls+'">'+st.label+'</span></td>'+
       '<td style="white-space:nowrap;">'+
         '<button class="icon-btn" title="عرض" onclick="openDebtDetail(\''+d.id+'\')">'+icon("eye",16)+'</button>'+
-        (rem>0.005 ? '<button class="icon-btn primary" title="إضافة دفعة" onclick="openDebtPayment(\''+d.id+'\')">'+icon("banknote",16)+'</button>' : '')+
-        '<button class="icon-btn" title="تعديل" onclick="openDebtEdit(\''+d.id+'\')">'+icon("edit",16)+'</button>'+
-        '<button class="icon-btn danger" title="حذف" onclick="deleteDebt(\''+d.id+'\')">'+icon("trash",16)+'</button>'+
+        (rem>0.005 && can("debts","payment") ? '<button class="icon-btn primary" title="إضافة دفعة" onclick="openDebtPayment(\''+d.id+'\')">'+icon("banknote",16)+'</button>' : '')+
+        (can("debts","edit") ? '<button class="icon-btn" title="تعديل" onclick="openDebtEdit(\''+d.id+'\')">'+icon("edit",16)+'</button>' : '')+
+        (can("debts","delete") ? '<button class="icon-btn danger" title="حذف" onclick="deleteDebt(\''+d.id+'\')">'+icon("trash",16)+'</button>' : '')+
       '</td>'+
     '</tr>';
   }).join("") || '<tr><td colspan="8" class="muted" style="text-align:center;padding:30px;">لا توجد ديون مسجّلة بعد</td></tr>';
@@ -4398,8 +4469,8 @@ function debtPaymentsHistorySection(){
       '<td>'+esc(debt?debtTypeLabel(debt.type):"—")+'</td>'+
       '<td>'+esc(by?by.name:"—")+'</td>'+
       '<td style="white-space:nowrap;">'+
-        '<button class="icon-btn" title="تعديل" onclick="openDebtPaymentEdit(\''+p.debtId+'\',\''+p.id+'\',false)">'+icon("edit",15)+'</button>'+
-        '<button class="icon-btn danger" title="حذف" onclick="deleteDebtPayment(\''+p.debtId+'\',\''+p.id+'\',false)">'+icon("trash",15)+'</button>'+
+        (can("debts","payment") ? '<button class="icon-btn" title="تعديل" onclick="openDebtPaymentEdit(\''+p.debtId+'\',\''+p.id+'\',false)">'+icon("edit",15)+'</button>' : '')+
+        (can("debts","payment") ? '<button class="icon-btn danger" title="حذف" onclick="deleteDebtPayment(\''+p.debtId+'\',\''+p.id+'\',false)">'+icon("trash",15)+'</button>' : '')+
       '</td>'+
     '</tr>';
   }).join("") || '<tr><td colspan="10" class="muted" style="text-align:center;padding:30px;">لا توجد دفعات مطابقة</td></tr>';
@@ -4584,8 +4655,8 @@ function openDebtDetail(id){
       '<td class="muted">'+esc(p.notes||"—")+'</td>'+
       '<td>'+esc(by?by.name:"—")+'</td>'+
       '<td style="white-space:nowrap;">'+
-        '<button class="icon-btn" title="تعديل" onclick="openDebtPaymentEdit(\''+d.id+'\',\''+p.id+'\',true)">'+icon("edit",15)+'</button>'+
-        '<button class="icon-btn danger" title="حذف" onclick="deleteDebtPayment(\''+d.id+'\',\''+p.id+'\',true)">'+icon("trash",15)+'</button>'+
+        (can("debts","payment") ? '<button class="icon-btn" title="تعديل" onclick="openDebtPaymentEdit(\''+d.id+'\',\''+p.id+'\',true)">'+icon("edit",15)+'</button>' : '')+
+        (can("debts","payment") ? '<button class="icon-btn danger" title="حذف" onclick="deleteDebtPayment(\''+d.id+'\',\''+p.id+'\',true)">'+icon("trash",15)+'</button>' : '')+
       '</td>'+
     '</tr>';
   }).join("");
@@ -4603,7 +4674,7 @@ function openDebtDetail(id){
       '</div>'+
       '<div class="row mb8" style="justify-content:space-between;align-items:center;">'+
         '<span class="bold">سجل الدفعات</span>'+
-        (rem>0.005 ? '<button class="btn btn-soft btn-sm" onclick="closeModal();openDebtPayment(\''+d.id+'\')">'+icon("plus",14)+' إضافة دفعة</button>' : '')+
+        (rem>0.005 && can("debts","payment") ? '<button class="btn btn-soft btn-sm" onclick="closeModal();openDebtPayment(\''+d.id+'\')">'+icon("plus",14)+' إضافة دفعة</button>' : '')+
       '</div>'+
       '<div class="table-wrap"><table><thead><tr><th>رقم الدفعة</th><th>مين دفع</th><th>التاريخ</th><th>المبلغ</th><th>طريقة الدفع</th><th>الملاحظات</th><th>بواسطة</th><th>الإجراءات</th></tr></thead>'+
       '<tbody>'+(payRows || '<tr><td colspan="8" class="muted" style="text-align:center;padding:20px;">لا توجد دفعات مسجّلة بعد</td></tr>')+'</tbody></table></div>'+
@@ -4813,7 +4884,7 @@ function saveClosing(i, userId){
   }).catch(function(e){ toast(e.message, "err"); });
 }
 function viewCash(){
-  if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
+  if(!can("cash","view")){ return '<div class="empty"><div class="big">🔒</div><p>ليس لديك صلاحية للوصول لهذه الصفحة</p></div>'; }
   var d = cashDay;
   var from = new Date(d+"T00:00:00").getTime();
   cashDayData = DB.users.map(function(u){
@@ -4856,7 +4927,7 @@ function viewCash(){
       '<div class="row mt16" style="flex-wrap:wrap;gap:14px;align-items:flex-end;">'+
         '<div class="field" style="margin:0;min-width:150px;"><label>المبلغ الفعلي معاه الآن</label><input id="cash-act-'+i+'" type="number" min="0" step="0.5" value="'+(c.closing?c.closing.actual:"")+'" placeholder="0.00" oninput="cashDiff('+i+')"></div>'+
         '<div style="min-width:150px;"><div class="small muted">الفرق عن المتوقع</div><div class="bold" style="font-size:18px;" id="cash-diff-'+i+'">'+diffTxt+'</div></div>'+
-        '<button class="btn btn-primary" onclick="saveClosing('+i+',\''+c.u.id+'\')">'+icon("check",16)+' حفظ الإقفال</button>'+
+        (can("cash","edit") ? '<button class="btn btn-primary" onclick="saveClosing('+i+',\''+c.u.id+'\')">'+icon("check",16)+' حفظ الإقفال</button>' : '')+
       '</div>'+
       (c.closing ? '<p class="small muted mt8">آخر إقفال: '+timeStr(c.closing.date)+'</p>' : '<p class="small muted mt8">لم يتم الإقفال لهذا اليوم بعد</p>')+
     '</div>';
@@ -4874,7 +4945,7 @@ function viewCash(){
   return '<div class="filterbar">'+
     '<input type="date" value="'+esc(cashDay)+'" onchange="setCashDay(this.value)">'+
     '<span class="muted small">اختر اليوم لعرض حركات كل شخص وإقفال الخزنة</span>'+
-    '<button class="btn btn-green" onclick="openTransfer()">'+icon("banknote",16)+' تحويل فلوس بين شخصين</button>'+
+    (can("cash","create") ? '<button class="btn btn-green" onclick="openTransfer()">'+icon("banknote",16)+' تحويل فلوس بين شخصين</button>' : '')+
   '</div>'+
   '<div class="stats">'+
     statCard("wallet","var(--primary)", fmt(totBal), "إجمالي الأرصدة مع الأشخاص")+
@@ -4891,7 +4962,7 @@ function viewCash(){
    الحسابات (أرباح وخسائر)
    ============================================================ */
 function viewFinance(){
-  if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
+  if(!can("finance","view")){ return '<div class="empty"><div class="big">🔒</div><p>ليس لديك صلاحية للوصول لهذه الصفحة</p></div>'; }
   var f = rangeFilter();
   var sales = activeSalesList(DB.sales).filter(function(s){ return s.date>=f.from && s.date<=f.to; });
   var orders = DB.orders.filter(function(o){ return o.date>=f.from && o.date<=f.to && ["returned","cancelled"].indexOf(o.status)===-1; });
@@ -4922,7 +4993,7 @@ function viewFinance(){
   }
   var incomeRows = incomes.map(function(i){
     return '<tr><td>'+dateStr(i.date)+'</td><td class="muted">'+esc(i.note||"—")+'</td><td>'+(i.partner?partnerLabel(i.partner):'—')+'</td><td class="bold" style="color:var(--green);">+ '+fmt(i.amount)+'</td>'+
-      '<td><button class="icon-btn danger" onclick="deleteIncome(\''+i.id+'\')">'+icon("trash",16)+'</button></td></tr>';
+      '<td>'+(can("finance","delete") ? '<button class="icon-btn danger" onclick="deleteIncome(\''+i.id+'\')">'+icon("trash",16)+'</button>' : '')+'</td></tr>';
   }).join("");
 
   return '<div class="filterbar">'+rangeSel+'</div>'+
@@ -4947,7 +5018,7 @@ function viewFinance(){
           '<span>صافي الربح</span><span>'+(net<0?"- ":"")+fmt(Math.abs(net))+' '+esc(DB.settings.currency)+'</span></div>'+
       '</div>'+
     '</div>'+
-    '<div class="card"><h3>'+icon("banknote",17)+' إيرادات أخرى <button class="btn btn-soft btn-sm" style="margin-inline-start:12px;" onclick="openIncomeForm()">'+icon("plus",14)+' إضافة</button></h3>'+
+    '<div class="card"><h3>'+icon("banknote",17)+' إيرادات أخرى '+(can("finance","create") ? '<button class="btn btn-soft btn-sm" style="margin-inline-start:12px;" onclick="openIncomeForm()">'+icon("plus",14)+' إضافة</button>' : '')+'</h3>'+
       '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>البيان</th><th>الحساب</th><th>المبلغ</th><th></th></tr></thead>'+
       '<tbody>'+(incomeRows || '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">لا توجد إيرادات أخرى</td></tr>')+'</tbody></table></div>'+
     '</div>';
@@ -5027,7 +5098,7 @@ function cashOnHandTotal(){
   return DB.users.reduce(function(a,u){ return a + userCashBalance(u.id); },0);
 }
 function viewAssets(){
-  if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
+  if(!can("assets","view")){ return '<div class="empty"><div class="big">🔒</div><p>ليس لديك صلاحية للوصول لهذه الصفحة</p></div>'; }
   var inv = inventoryCostValue();
   var cashTotal = cashOnHandTotal();
   var cod = codReceivableValue();
@@ -5099,7 +5170,7 @@ function setAuditQ(v){ auditQ = v; renderViewInPlace(); }
 function setAuditFrom(v){ auditFrom = v; renderViewInPlace(); }
 function setAuditTo(v){ auditTo = v; renderViewInPlace(); }
 function viewAudit(){
-  if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
+  if(!can("audit","view")){ return '<div class="empty"><div class="big">🔒</div><p>ليس لديك صلاحية للوصول لهذه الصفحة</p></div>'; }
   var from = auditFrom ? new Date(auditFrom+"T00:00:00").getTime() : 0;
   var to = auditTo ? new Date(auditTo+"T23:59:59").getTime() : Date.now()+86400000;
   var q = auditQ.toLowerCase();
@@ -5151,7 +5222,7 @@ function setPartnersTypeFilter(v){ partnersTypeFilter = v; renderViewInPlace(); 
 function setPartnersFrom(v){ partnersFrom = v; renderViewInPlace(); }
 function setPartnersTo(v){ partnersTo = v; renderViewInPlace(); }
 function viewPartners(){
-  if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
+  if(!can("partners","view")){ return '<div class="empty"><div class="big">🔒</div><p>ليس لديك صلاحية للوصول لهذه الصفحة</p></div>'; }
   var from = partnersFrom ? new Date(partnersFrom+"T00:00:00").getTime() : 0;
   var to = partnersTo ? new Date(partnersTo+"T23:59:59").getTime() : Date.now()+86400000;
   var all = partnersLedgerWithBalance();
@@ -5200,56 +5271,172 @@ function viewPartners(){
 /* ============================================================
    الكاشير والصلاحيات
    ============================================================ */
+// الصلاحيات الفعلية لمستخدم: لو معاه صفوف UserPermission صريحة بترجع هي زي
+// ما هي، ولو لسه معندوش (لسه مايتحفظش له نموذج الصلاحيات الجديد) بترجع
+// المكافئ المفكوك لقواعد legacyCan القديمة، عشان الشاشة تعرض الواقع الفعلي
+// مش فورمة فاضية. المدير بيرجّع null (صلاحية كاملة، مش قايمة محدودة).
+function userEffectivePermissions(u){
+  if(!u || u.role === "admin") return null;
+  if(u.permissions && u.permissions.length) return u.permissions;
+  var list = [];
+  PERMISSION_MODULES.forEach(function(m){
+    m.actions.forEach(function(a){
+      if(legacyCan(u, m.id, a.id)) list.push({module:m.id, action:a.id});
+    });
+  });
+  return list;
+}
 function viewCashiers(){
-  if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
+  if(!can("cashiers","view")){ return '<div class="empty"><div class="big">🔒</div><p>ليس لديك صلاحية للوصول لهذه الصفحة</p></div>'; }
   var rows = DB.users.map(function(u){
+    var eff = userEffectivePermissions(u);
     return '<tr>'+
       '<td><div class="row"><div class="avatar" style="width:34px;height:34px;border-radius:50%;background:var(--primary-soft);color:var(--primary);display:flex;align-items:center;justify-content:center;font-weight:800;">'+esc(u.name.charAt(0))+(u.name.charAt(1)||"")+'</div><div class="bold">'+esc(u.name)+'</div></div></td>'+
       '<td dir="ltr" style="text-align:right;">'+esc(u.username)+'</td>'+
       '<td><span class="badge '+(u.role==="admin"?"badge-blue":"badge-gray")+'">'+(u.role==="admin"?"مدير":"كاشير")+'</span></td>'+
+      '<td>'+(eff===null ? '<span class="muted small">كاملة</span>' : '<button class="btn btn-ghost btn-sm" onclick="viewUserPermissions(\''+u.id+'\')">'+icon("shield",14)+' '+eff.length+' صلاحية</button>')+'</td>'+
       '<td><div class="row" style="gap:2px;">'+
-        '<button class="icon-btn primary" onclick="openUserForm(\''+u.id+'\')">'+icon("edit",16)+'</button>'+
-        '<button class="icon-btn danger" onclick="deleteUser(\''+u.id+'\')">'+icon("trash",16)+'</button>'+
+        (can("cashiers","edit") ? '<button class="icon-btn primary" onclick="openUserForm(\''+u.id+'\')">'+icon("edit",16)+'</button>' : '')+
+        (can("cashiers","delete") ? '<button class="icon-btn danger" onclick="deleteUser(\''+u.id+'\')">'+icon("trash",16)+'</button>' : '')+
       '</div></td>'+
     '</tr>';
   }).join("");
-  return '<div class="filterbar"><button class="btn btn-primary" onclick="openUserForm()">'+icon("plus",16)+' إضافة كاشير</button></div>'+
+  return '<div class="filterbar">'+(can("cashiers","create") ? '<button class="btn btn-primary" onclick="openUserForm()">'+icon("plus",16)+' إضافة كاشير</button>' : '')+'</div>'+
     '<div class="card"><div class="table-wrap"><table>'+
-    '<thead><tr><th>الاسم</th><th>اسم المستخدم</th><th>الصلاحية</th><th></th></tr></thead>'+
+    '<thead><tr><th>الاسم</th><th>اسم المستخدم</th><th>الصلاحية</th><th>الصلاحيات التفصيلية</th><th></th></tr></thead>'+
     '<tbody>'+rows+'</tbody></table></div>'+
-    '<p class="muted small mt8">🔹 المدير: صلاحية كاملة. الكاشير: بيع وعرض المنتجات والعملاء والتقارير فقط.</p></div>';
+    '<p class="muted small mt8">🔹 المدير: صلاحية كاملة دائماً على كل الصفحات. الكاشير: حسب الصلاحيات المحددة له تحديدًا.</p></div>';
 }
-function openUserForm(id){
-  var u = id ? DB.users.find(function(x){ return x.id===id; }) : null;
+function viewUserPermissions(id){
+  var u = DB.users.find(function(x){ return x.id===id; });
+  if(!u) return;
+  var eff = userEffectivePermissions(u) || [];
+  var isLegacy = u.role !== "admin" && (!u.permissions || !u.permissions.length);
+  var body = PERMISSION_MODULES.map(function(m){
+    var granted = m.actions.filter(function(a){ return eff.some(function(p){ return p.module===m.id && p.action===a.id; }); });
+    if(!granted.length) return "";
+    return '<div class="tot-row"><span>'+esc(m.label)+'</span><span class="small">'+granted.map(function(a){ return esc(a.label); }).join("، ")+'</span></div>';
+  }).join("") || '<p class="muted small">لا توجد صلاحيات محددة لهذا المستخدم.</p>';
   openModal(
-    '<div class="modal-head"><h3>'+(u?"تعديل مستخدم":"إضافة مستخدم")+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-head"><h3>'+icon("shield",18)+' صلاحيات: '+esc(u.name)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
     '<div class="modal-body">'+
-      '<div class="field"><label>الاسم *</label><input id="u-name" value="'+(u?esc(u.name):"")+'"></div>'+
-      '<div class="form-grid">'+
-        '<div class="field"><label>اسم المستخدم *</label><input id="u-user" dir="ltr" value="'+(u?esc(u.username):"")+'"></div>'+
-        '<div class="field"><label>كلمة المرور *</label><input id="u-pass" dir="ltr" value="'+(u?esc(u.password):"")+'"></div>'+
-      '</div>'+
-      '<div class="field"><label>الصلاحية</label><select id="u-role">'+
-        '<option value="cashier" '+(!u||u.role==="cashier"?"selected":"")+'>كاشير (بيع فقط)</option>'+
-        '<option value="admin" '+(u&&u.role==="admin"?"selected":"")+'>مدير (صلاحية كاملة)</option>'+
-      '</select></div>'+
-      '<div class="field full"><label class="row" style="gap:8px;align-items:center;"><input type="checkbox" id="u-return-perm" style="width:auto;" '+((!u || u.canManageReturns!==false)?"checked":"")+'> صلاحية إدارة الاسترجاع والاستبدال</label></div>'+
+      (isLegacy ? '<p class="small" style="color:var(--amber);margin-bottom:10px;">⚠️ لسه معندوش صلاحيات محددة صراحةً — الصلاحيات المعروضة دي القيمة الافتراضية القديمة. افتح «تعديل» واحفظ عشان تخصصها.</p>' : '')+
+      body+
     '</div>'+
     '<div class="modal-foot">'+
-      '<button class="btn btn-primary" onclick="saveUser(\''+(u?u.id:"")+'\')">حفظ</button>'+
-      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+      (can("cashiers","edit") ? '<button class="btn btn-primary" onclick="closeModal();openUserForm(\''+u.id+'\')">'+icon("edit",16)+' تعديل الصلاحيات</button>' : '')+
+      '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
     '</div>'
   );
 }
-function saveUser(id){
+var userPermDraft = null;
+function openUserForm(id){
+  var u = id ? DB.users.find(function(x){ return x.id===id; }) : null;
+  var initialPerms = u ? (userEffectivePermissions(u) || []) : [];
+  userPermDraft = {
+    id: u ? u.id : "",
+    name: u ? u.name : "", username: u ? u.username : "", password: u ? u.password : "",
+    role: u ? (u.role||"cashier") : "cashier",
+    perms: initialPerms.map(function(p){ return {module:p.module, action:p.action}; })
+  };
+  openModal(userFormModalHTML(), true);
+}
+function onUserRoleChange(v){ userPermDraft.role = v; refreshUserFormModal(); }
+function refreshUserFormModal(){ var m = $("#modal"); if(m) m.innerHTML = userFormModalHTML(); }
+function userHasPerm(module, action){
+  return userPermDraft.perms.some(function(p){ return p.module===module && p.action===action; });
+}
+function toggleUserPerm(module, action, checked){
+  var idx = userPermDraft.perms.findIndex(function(p){ return p.module===module && p.action===action; });
+  if(checked && idx===-1) userPermDraft.perms.push({module:module, action:action});
+  if(!checked && idx!==-1) userPermDraft.perms.splice(idx,1);
+}
+function selectAllPerms(on){
+  userPermDraft.perms = [];
+  if(on){
+    PERMISSION_MODULES.forEach(function(m){ m.actions.forEach(function(a){ userPermDraft.perms.push({module:m.id, action:a.id}); }); });
+  }
+  refreshUserFormModal();
+}
+function toggleModulePerms(moduleId, on){
+  var m = PERMISSION_MODULES.find(function(x){ return x.id===moduleId; });
+  if(!m) return;
+  m.actions.forEach(function(a){ toggleUserPerm(moduleId, a.id, on); });
+  refreshUserFormModal();
+}
+function permissionsSectionHTML(){
+  if(userPermDraft.role === "admin"){
+    return '<div class="field full"><div class="card" style="background:#f8fafc;padding:12px;margin-top:8px;">'+
+      '<div class="bold mb8">صلاحيات المستخدم</div>'+
+      '<p class="muted small">المدير لديه صلاحية كاملة دائماً على كل صفحات النظام — لا حاجة لتحديد صلاحيات.</p>'+
+    '</div></div>';
+  }
+  var moduleBlocks = PERMISSION_MODULES.map(function(m){
+    var allOn = m.actions.every(function(a){ return userHasPerm(m.id, a.id); });
+    var checks = m.actions.map(function(a){
+      var checked = userHasPerm(m.id, a.id);
+      return '<label style="display:inline-flex;gap:6px;align-items:center;margin-inline-end:14px;margin-top:6px;">'+
+        '<input type="checkbox" style="width:auto;" '+(checked?"checked":"")+' onchange="toggleUserPerm(\''+m.id+'\',\''+a.id+'\',this.checked)"> '+esc(a.label)+
+      '</label>';
+    }).join("");
+    return '<div class="card" style="background:#f8fafc;padding:12px;margin-top:10px;">'+
+      '<div class="row" style="justify-content:space-between;align-items:center;">'+
+        '<span class="bold">'+esc(m.label)+'</span>'+
+        '<button type="button" class="btn btn-ghost btn-sm" onclick="toggleModulePerms(\''+m.id+'\', '+(!allOn)+')">'+(allOn?"إلغاء تحديد الكل":"تحديد الكل")+'</button>'+
+      '</div>'+
+      '<div style="margin-top:4px;">'+checks+'</div>'+
+    '</div>';
+  }).join("");
+  return '<div class="field full" style="margin-top:8px;">'+
+    '<div class="row" style="justify-content:space-between;align-items:center;">'+
+      '<label class="bold">صلاحيات المستخدم</label>'+
+      '<div class="row" style="gap:8px;">'+
+        '<button type="button" class="btn btn-ghost btn-sm" onclick="selectAllPerms(true)">تحديد الكل</button>'+
+        '<button type="button" class="btn btn-ghost btn-sm" onclick="selectAllPerms(false)">إلغاء تحديد الكل</button>'+
+      '</div>'+
+    '</div>'+
+    moduleBlocks+
+  '</div>';
+}
+function userFormModalHTML(){
+  var d = userPermDraft;
+  var isEdit = !!d.id;
+  return '<div class="modal-head"><h3>'+(isEdit?"تعديل مستخدم":"إضافة مستخدم")+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="field"><label>الاسم *</label><input id="u-name" value="'+esc(d.name)+'" onchange="userPermDraft.name=this.value"></div>'+
+      '<div class="form-grid">'+
+        '<div class="field"><label>اسم المستخدم *</label><input id="u-user" dir="ltr" value="'+esc(d.username)+'" onchange="userPermDraft.username=this.value"></div>'+
+        '<div class="field"><label>كلمة المرور *</label><input id="u-pass" dir="ltr" value="'+esc(d.password)+'" onchange="userPermDraft.password=this.value"></div>'+
+      '</div>'+
+      '<div class="field"><label>الصلاحية</label><select id="u-role" onchange="onUserRoleChange(this.value)">'+
+        '<option value="cashier" '+(d.role==="cashier"?"selected":"")+'>كاشير (بيع فقط)</option>'+
+        '<option value="admin" '+(d.role==="admin"?"selected":"")+'>مدير (صلاحية كاملة)</option>'+
+      '</select></div>'+
+      permissionsSectionHTML()+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="saveUser()">حفظ</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+    '</div>';
+}
+function saveUser(){
+  var d = userPermDraft;
   var name = $("#u-name").value.trim();
   var username = $("#u-user").value.trim();
   var password = $("#u-pass").value;
   if(!name || !username || !password){ toast("أكمل كل الحقول","err"); return; }
-  var dup = DB.users.find(function(x){ return x.username===username && x.id!==id; });
+  var dup = DB.users.find(function(x){ return x.username===username && x.id!==d.id; });
   if(dup){ toast("اسم المستخدم مستخدم بالفعل","err"); return; }
-  var data = {name:name, username:username, password:password, role:$("#u-role").value, canManageReturns: $("#u-return-perm").checked};
-  var item = id ? Object.assign({}, DB.users.find(function(x){ return x.id===id; }), data) : Object.assign({id:uid()}, data);
+  var role = $("#u-role").value;
+  // canManageReturns القديم بيتحدد تلقائيًا من صلاحيات returns الجديدة، عشان
+  // أي كود لسه بيقرا الحقل القديم مباشرة (لو موجود) يفضل شغال صح.
+  var canManageReturnsFlag = role === "admin" || d.perms.some(function(p){ return p.module==="returns" && (p.action==="return"||p.action==="exchange"||p.action==="cancel"); });
+  var data = {
+    name: name, username: username, password: password, role: role,
+    canManageReturns: canManageReturnsFlag,
+    permissions: role === "admin" ? [] : d.perms
+  };
+  var item = d.id ? Object.assign({}, DB.users.find(function(x){ return x.id===d.id; }), data) : Object.assign({id:uid()}, data);
   api("POST", "/api/users", { item: item }).then(function(r){
     afterSync(r);
     closeModal(); renderViewInPlace(); toast("تم حفظ المستخدم");
