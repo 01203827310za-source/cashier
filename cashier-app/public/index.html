@@ -3548,32 +3548,19 @@ function blankOrderLine(){
 function govOptionsHTML(sel){
   return DB.shipPrices.map(function(s){ return '<option value="'+esc(s.governorate)+'" '+(sel===s.governorate?"selected":"")+'>'+esc(s.governorate)+'</option>'; }).join("");
 }
-function customerAddressOptions(cid){
-  var c = DB.customers.find(function(x){ return x.id===cid; });
-  if(!c || !c.addresses || !c.addresses.length) return '<option value="">لا توجد عناوين محفوظة</option>';
-  return c.addresses.map(function(a){
-    return '<option value="'+a.id+'">'+esc([a.governorate,a.city,a.street,a.label].filter(Boolean).join("، "))+'</option>';
-  }).join("");
-}
 function openOrderForm(){
-  orderDraft = {customerId:null, customerName:"", phone:"", governorate:(DB.shipPrices[0]?DB.shipPrices[0].governorate:""), city:"", street:"", items:[blankOrderLine()], paymentStatus:"cod", shipping:0, discount:0, deposit:0, note:""};
-  orderDraft.shipping = shipPriceFor(orderDraft.governorate);
+  orderDraft = {customerId:null, customerName:"", phone:"", street:"", awb:"", items:[blankOrderLine()], paymentStatus:"cod", shipping:0, discount:0, deposit:0, note:""};
   openModal(orderModalHTML(), true);
   refreshOrderLines();
   refreshOrderTotal();
 }
 function orderModalHTML(){
-  var custOpts = '<option value="">— اختر عميلاً —</option>' + DB.customers.map(function(c){ return '<option value="'+c.id+'" '+(orderDraft.customerId===c.id?"selected":"")+'>'+esc(c.name)+'</option>'; }).join("");
-  var addrOpts = orderDraft.customerId ? customerAddressOptions(orderDraft.customerId) : '<option value="">—</option>';
   return '<div class="modal-head"><h3>'+icon("send",18)+' أوردر شحن جديد</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
   '<div class="modal-body">'+
     '<div class="form-grid">'+
-      '<div class="field"><label>العميل</label><select id="ord-cust" onchange="onOrderCustomer(this.value)">'+custOpts+'</select></div>'+
       '<div class="field"><label>اسم العميل *</label><input id="ord-name" value="'+esc(orderDraft.customerName)+'" onchange="orderDraft.customerName=this.value"></div>'+
       '<div class="field"><label>تليفون الشحن</label><input id="ord-phone" dir="ltr" value="'+esc(orderDraft.phone)+'" onchange="orderDraft.phone=this.value"></div>'+
-      '<div class="field"><label>عنوان محفوظ للعميل</label><select id="ord-addr" onchange="onOrderAddress(this.value)">'+addrOpts+'</select></div>'+
-      '<div class="field"><label>المحافظة *</label><select id="ord-gov" onchange="onOrderGov(this.value)">'+govOptionsHTML(orderDraft.governorate)+'</select></div>'+
-      '<div class="field"><label>المدينة/المركز</label><input id="ord-city" value="'+esc(orderDraft.city)+'" onchange="orderDraft.city=this.value"></div>'+
+      '<div class="field"><label>رقم البوليصة</label><input id="ord-awb" dir="ltr" value="'+esc(orderDraft.awb)+'" onchange="orderDraft.awb=this.value"></div>'+
       '<div class="field full"><label>الشارع/العنوان التفصيلي</label><input id="ord-street" value="'+esc(orderDraft.street)+'" onchange="orderDraft.street=this.value"></div>'+
       '<div class="field"><label>حالة الدفع</label><select id="ord-pay" onchange="orderDraft.paymentStatus=this.value">'+
         '<option value="cod" '+(orderDraft.paymentStatus==="cod"?"selected":"")+'>COD — الدفع عند الاستلام</option>'+
@@ -3608,48 +3595,6 @@ function orderLinesHTML(){
     '</div>';
   }).join("");
 }
-function onOrderCustomer(cid){
-  orderDraft.customerId = cid || null;
-  var c = DB.customers.find(function(x){ return x.id===cid; });
-  if(c){
-    orderDraft.customerName = c.name;
-    orderDraft.phone = c.phone || "";
-    if(c.addresses && c.addresses.length){
-      var a = c.addresses[0];
-      orderDraft.governorate = a.governorate || orderDraft.governorate;
-      orderDraft.city = a.city || "";
-      orderDraft.street = a.street || "";
-    }
-  }
-  refreshOrderFormFields();
-}
-function onOrderAddress(aid){
-  var c = DB.customers.find(function(x){ return x.id===orderDraft.customerId; });
-  if(!c) return;
-  var a = (c.addresses||[]).find(function(x){ return x.id===aid; });
-  if(a){
-    orderDraft.governorate = a.governorate || orderDraft.governorate;
-    orderDraft.city = a.city || "";
-    orderDraft.street = a.street || "";
-    if(!orderDraft.phone && a.phone) orderDraft.phone = a.phone;
-    refreshOrderFormFields();
-  }
-}
-function onOrderGov(gov){
-  orderDraft.governorate = gov;
-  orderDraft.shipping = shipPriceFor(gov);
-  var sh = $("#ord-ship"); if(sh) sh.value = orderDraft.shipping;
-  refreshOrderTotal();
-}
-function refreshOrderFormFields(){
-  var n = $("#ord-name"); if(n) n.value = orderDraft.customerName;
-  var ph = $("#ord-phone"); if(ph) ph.value = orderDraft.phone;
-  var ad = $("#ord-addr"); if(ad) ad.innerHTML = customerAddressOptions(orderDraft.customerId);
-  var gv = $("#ord-gov"); if(gv) gv.value = orderDraft.governorate;
-  var ci = $("#ord-city"); if(ci) ci.value = orderDraft.city;
-  var st = $("#ord-street"); if(st) st.value = orderDraft.street;
-  refreshOrderTotal();
-}
 function onOrderProduct(i, pid){
   var p = DB.products.find(function(x){ return x.id===pid; });
   orderDraft.items[i].productId = pid;
@@ -3674,15 +3619,13 @@ function refreshOrderTotal(){
 async function saveOrder(){
   orderDraft.customerName = ($("#ord-name") ? $("#ord-name").value : orderDraft.customerName).trim();
   orderDraft.phone = ($("#ord-phone") ? $("#ord-phone").value : orderDraft.phone).trim();
-  orderDraft.governorate = $("#ord-gov") ? $("#ord-gov").value : orderDraft.governorate;
-  orderDraft.city = ($("#ord-city") ? $("#ord-city").value : "").trim();
+  orderDraft.awb = ($("#ord-awb") ? $("#ord-awb").value : orderDraft.awb || "").trim();
   orderDraft.street = ($("#ord-street") ? $("#ord-street").value : "").trim();
   orderDraft.note = ($("#ord-note") ? $("#ord-note").value : "").trim();
   orderDraft.shipping = num($("#ord-ship") ? $("#ord-ship").value : orderDraft.shipping);
   orderDraft.discount = num($("#ord-disc") ? $("#ord-disc").value : 0);
   orderDraft.deposit = num($("#ord-deposit") ? $("#ord-deposit").value : 0);
   if(!orderDraft.customerName){ toast("اكتب اسم العميل","err"); return; }
-  if(!orderDraft.governorate){ toast("اختر المحافظة","err"); return; }
   var lines = orderDraft.items.filter(function(it){ return it.productId && it.qty>0; });
   if(!lines.length){ toast("أضف صنفاً واحداً على الأقل","err"); return; }
   for(var i=0;i<lines.length;i++){
@@ -3703,10 +3646,10 @@ async function saveOrder(){
   var order = {
     id:uid(),
     customerId:orderDraft.customerId, customerName:orderDraft.customerName, phone:orderDraft.phone,
-    governorate:orderDraft.governorate, city:orderDraft.city, street:orderDraft.street,
+    governorate:"", city:"", street:orderDraft.street,
     items:items, subtotal:subtotal, shipping:orderDraft.shipping, discount:orderDraft.discount, total:total, deposit:deposit,
     paymentStatus:orderDraft.paymentStatus, collected:false, status:"new",
-    companyId:null, awb:"", note:orderDraft.note
+    companyId:null, awb:orderDraft.awb, note:orderDraft.note
   };
   var r = await api("POST", "/api/order", { order: order, decrements: decrements });
   afterSync(r);
@@ -3898,7 +3841,8 @@ function viewOrder(id){
         '<div class="tot-row"><span>العميل</span><b>'+esc(o.customerName)+'</b></div>'+
         '<div class="tot-row"><span>التليفون</span><b dir="ltr">'+esc(o.phone||"—")+'</b></div>'+
         '<div class="tot-row"><span>العنوان</span><b>'+esc(addr||"—")+'</b></div>'+
-        '<div class="tot-row"><span>شركة الشحن</span><b>'+(comp?esc(comp.name):"—")+' '+(o.awb?'<span dir="ltr">'+esc(o.awb)+'</span>':'')+'</b></div>'+
+        '<div class="tot-row"><span>شركة الشحن</span><b>'+(comp?esc(comp.name):"—")+'</b></div>'+
+        '<div class="tot-row"><span>رقم البوليصة</span><b dir="ltr">'+esc(o.awb||"—")+'</b></div>'+
         (o.shippedDate ? '<div class="tot-row"><span>تاريخ الشحن</span><b>'+dateStr(o.shippedDate)+'</b></div>' : '')+
         (o.deliveredDate ? '<div class="tot-row"><span>تاريخ التسليم</span><b>'+dateStr(o.deliveredDate)+'</b></div>' : '')+
         '<div class="tot-row"><span>طريقة الدفع</span><b>'+pay+'</b></div>'+
