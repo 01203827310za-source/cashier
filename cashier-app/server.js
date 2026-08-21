@@ -305,45 +305,95 @@ async function reverseDebtLedger(tx, debtId){
     await deletePartnerLedgerFor(tx, "debtPayment", p.id);
   }
 }
+const PARTNER_LABELS = { moamen: "مؤمن", abdo: "عبدو" };
+// الديون: المدفوع/المتبقي/الحالة دايمًا محسوبة من SUM(DebtPayment) — مش قيمة
+// متراكمة بتتزود يدويًا — عشان التعديل/الحذف الجزئي لأي دفعة يفضل متسق مهما كان
+// ترتيب العمليات (نفس مبدأ recomputeProductStock مع ProductVariant).
+async function recomputeDebtTotals(tx, debtId){
+  const debt = await tx.debt.findUnique({ where: { id: debtId } });
+  if(!debt) return null;
+  const agg = await tx.debtPayment.aggregate({ where: { debtId }, _sum: { amount: true } });
+  const paid = agg._sum.amount || 0;
+  const remaining = Math.max(0, (debt.totalAmount || 0) - paid);
+  const status = debtStatusFromAmounts(debt.totalAmount || 0, paid);
+  const data = { ...(debt.data || {}), paidAmount: paid, remainingAmount: remaining, status };
+  return tx.debt.update({ where: { id: debtId }, data: { paidAmount: paid, remainingAmount: remaining, status, data } });
+}
+// بيبني ويتحقق من بيانات دفعة دين — "مين دفع؟" إلزامي دايمًا، ومحدد حسب اتجاه
+// الدين نفسه (مش حسب اختيار الواجهة): دين "لنا" (in) → المدفوع لازم يكون عميل
+// حقيقي من جدول Customer؛ أي دين "علينا" (out) → لازم حساب شريك حقيقي
+// (مؤمن/عبدو). الاسم المعروض (payerName) بيتحسب من السيرفر مش من اللي بعتته
+// الواجهة، عشان محدش يقدر يزوّر الاسم المعروض في سجل الدفعات.
+// existingPaidExcluded: مجموع الدفعات التانية غير الدفعة الحالية (لازم يتحسب في
+// حالة التعديل قبل ما تتنادى الدالة دي، عشان "المتبقي" يتحسب صح مستبعد الدفعة
+// اللي بتتعدل من حسابها).
+async function buildDebtPaymentPayload(tx, debt, input, existingPaidExcluded){
+  const amount = Number(input.amount);
+  if(!(amount > 0)) throw httpError(400, "أدخل مبلغاً صحيحاً");
+  if(!input.date) throw httpError(400, "تاريخ الدفعة مطلوب");
+
+  const paidSoFar = existingPaidExcluded != null ? existingPaidExcluded : (debt.paidAmount || 0);
+  const remainingBefore = Math.max(0, (debt.totalAmount || 0) - paidSoFar);
+  if(remainingBefore <= 0.004) throw httpError(400, "الدين مدفوع بالكامل بالفعل");
+  if(amount > remainingBefore + 0.004) throw httpError(400, "قيمة الدفعة أكبر من المبلغ المتبقي.");
+
+  const direction = debt.direction || "out";
+  let payerType, payerId, payerName, partner = null;
+  if(direction === "in"){
+    payerId = (input.payerId || "").toString().trim();
+    if(!payerId) throw httpError(400, "اختر مين دفع");
+    const customer = await tx.customer.findUnique({ where: { id: payerId } });
+    if(!customer) throw httpError(400, "اختر مين دفع");
+    payerType = "customer";
+    payerName = customer.name;
+  } else {
+    partner = input.partner === "abdo" ? "abdo" : (input.partner === "moamen" ? "moamen" : null);
+    if(!partner) throw httpError(400, "اختر مين دفع");
+    payerType = "partner";
+    payerId = partner;
+    payerName = PARTNER_LABELS[partner];
+  }
+
+  return {
+    amount, date: Number(input.date), paymentMethod: input.paymentMethod || null,
+    notes: (input.notes || "").trim() || null,
+    payerType, payerId, payerName, partner, direction
+  };
+}
 async function createDebtPayment(tx, opts){
   const debt = opts.debt;
-  const amount = Number(opts.amount);
-  if(!(amount > 0)) throw httpError(400, "أدخل مبلغاً صحيحاً");
-  const remainingBefore = Math.max(0, (debt.remainingAmount != null ? debt.remainingAmount : ((debt.totalAmount||0) - (debt.paidAmount||0))));
-  if(amount > remainingBefore + 0.004) throw httpError(400, "المبلغ أكبر من المتبقي على الدين");
-
+  const payload = opts.payload;
   const paymentId = opts.id || uid();
-  const paymentDate = opts.date ? Number(opts.date) : Date.now();
-  const newPaid = (debt.paidAmount || 0) + amount;
-  const newRemaining = Math.max(0, (debt.totalAmount || 0) - newPaid);
-  const newStatus = debtStatusFromAmounts(debt.totalAmount || 0, newPaid);
+  const now = new Date();
 
   await tx.debtPayment.create({ data: {
-    id: paymentId, debtId: debt.id, amount, date: new Date(paymentDate),
-    paymentMethod: opts.paymentMethod || null, notes: (opts.notes || "").trim() || null,
-    partner: opts.partner || null, direction: debt.direction || null, userId: opts.userId || null,
+    id: paymentId, debtId: debt.id, amount: payload.amount, date: new Date(payload.date),
+    paymentMethod: payload.paymentMethod, notes: payload.notes,
+    partner: payload.partner, payerType: payload.payerType, payerId: payload.payerId, payerName: payload.payerName,
+    direction: payload.direction, userId: opts.userId || null, createdAt: now, updatedAt: now,
     data: {
-      id: paymentId, debtId: debt.id, amount, date: paymentDate, paymentMethod: opts.paymentMethod || null,
-      notes: (opts.notes || "").trim() || null, partner: opts.partner || null, direction: debt.direction || null, userId: opts.userId || null
+      id: paymentId, debtId: debt.id, amount: payload.amount, date: payload.date, paymentMethod: payload.paymentMethod,
+      notes: payload.notes, partner: payload.partner, payerType: payload.payerType, payerId: payload.payerId,
+      payerName: payload.payerName, direction: payload.direction, userId: opts.userId || null
     }
   }});
 
-  await tx.debt.update({ where: { id: debt.id }, data: { paidAmount: newPaid, remainingAmount: newRemaining, status: newStatus } });
-
-  if(opts.partner === "moamen" || opts.partner === "abdo"){
+  if(payload.partner === "moamen" || payload.partner === "abdo"){
     await upsertPartnerLedger(tx, {
-      partner: opts.partner,
+      partner: payload.partner,
       type: "DEBT_PAYMENT",
-      direction: debt.direction || "out",
-      amount,
+      direction: payload.direction || "out",
+      amount: payload.amount,
       referenceType: "debtPayment",
       referenceId: paymentId,
-      date: paymentDate,
+      date: payload.date,
       userId: opts.userId || null,
       notes: "دفعة دين — " + (debt.personName || debt.id)
     });
   }
-  return { paymentId, newPaid, newRemaining, newStatus };
+
+  await recomputeDebtTotals(tx, debt.id);
+  return paymentId;
 }
 
 /* ---------- عناصر عامة (إضافة/تعديل/حذف) ---------- */
@@ -1277,11 +1327,17 @@ const server = http.createServer(async function(req, res){
           partner: normalized.partner, direction: normalized.direction, userId: user.id, data: debtData
         }});
         if(normalized.paidAmount > 0){
-          await createDebtPayment(tx, {
-            debt: { id: debtId, totalAmount: normalized.totalAmount, paidAmount: 0, remainingAmount: normalized.totalAmount, direction: normalized.direction, personName: normalized.personName },
-            amount: normalized.paidAmount, date: normalized.date, paymentMethod: normalized.paymentMethod, notes: "دفعة مبدئية عند إنشاء الدين",
-            partner: normalized.partner, userId: user.id
+          // مين دفع الدفعة المبدئية: لو الدين "لنا" (دائن عميل) فالدافع هو نفس
+          // العميل المرتبط بالدين تلقائياً؛ ولو "علينا" فلازم الواجهة تبعت
+          // partner (مؤمن/عبدو) — نفس منطق buildDebtPaymentPayload بالظبط.
+          const freshDebt = { id: debtId, totalAmount: normalized.totalAmount, paidAmount: 0, direction: normalized.direction, personName: normalized.personName };
+          const payload = await buildDebtPaymentPayload(tx, freshDebt, {
+            amount: normalized.paidAmount, date: normalized.date, paymentMethod: normalized.paymentMethod,
+            notes: "دفعة مبدئية عند إنشاء الدين",
+            partner: debtIn.partner || normalized.partner,
+            payerId: normalized.direction === "in" ? normalized.entityId : debtIn.payerId
           });
+          await createDebtPayment(tx, { debt: freshDebt, payload, userId: user.id });
         }
         await tx.auditLog.create({ data: auditEntry(req, "إضافة دين", (normalized.personName || normalized.entityId || "") + " — " + normalized.totalAmount) });
       }, { timeout: 30000 });
@@ -1337,30 +1393,82 @@ const server = http.createServer(async function(req, res){
   if(method === "POST" && /^\/api\/debts\/[^/]+\/payment$/.test(url)){
     const id = url.split("/")[3];
     const b = await readBody(req);
-    const amount = Number(b.amount);
     const existing = await prisma.debt.findUnique({ where: { id } });
     if(!existing){ send(res, 404, { ok:false, error:"الدين غير موجود" }); return; }
     try{
       await prisma.$transaction(async function(tx){
         const fresh = await tx.debt.findUnique({ where: { id } });
-        const partner = b.partner === "abdo" ? "abdo" : (b.partner === "moamen" ? "moamen" : null);
-        if(fresh.entityType === "partner" && !partner) throw httpError(400, "اختر الحساب (مؤمن/عبدو)");
-        if(fresh.entityType !== "partner" && partner == null && fresh.partner != null) throw httpError(400, "اختر الحساب (مؤمن/عبدو)");
-        await createDebtPayment(tx, {
-          debt: fresh,
-          amount,
-          date: b.date,
-          paymentMethod: b.paymentMethod || "cash",
-          notes: b.notes || null,
-          partner: partner || fresh.partner || null,
-          userId: user.id
-        });
-        await tx.auditLog.create({ data: auditEntry(req, "دفعة على دين", (fresh.personName || fresh.id) + " — " + amount) });
+        const payload = await buildDebtPaymentPayload(tx, fresh, b);
+        await createDebtPayment(tx, { debt: fresh, payload, userId: user.id });
+        await tx.auditLog.create({ data: auditEntry(req, "دفعة على دين", (fresh.personName || fresh.id) + " — " + payload.amount + " — " + payload.payerName) });
       }, { timeout: 30000 });
     }catch(err){
       if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
       throw err;
     }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+  if(method === "POST" && /^\/api\/debts\/[^/]+\/payments\/[^/]+\/edit$/.test(url)){
+    const parts = url.split("/"); // "", "api", "debts", debtId, "payments", paymentId, "edit"
+    const debtId = parts[3], paymentId = parts[5];
+    const b = await readBody(req);
+    const existingPayment = await prisma.debtPayment.findUnique({ where: { id: paymentId } });
+    if(!existingPayment || existingPayment.debtId !== debtId){ send(res, 404, { ok:false, error:"الدفعة غير موجودة" }); return; }
+    try{
+      await prisma.$transaction(async function(tx){
+        const debt = await tx.debt.findUnique({ where: { id: debtId } });
+        if(!debt) throw httpError(404, "الدين غير موجود");
+        // نعكس أثر الدفعة القديمة على دفتر الشركاء الأول، قبل أي تحقق من القيمة
+        // الجديدة — لو التحقق فشل بعد كده، الـ transaction كله بيترجع زي ما كان.
+        await deletePartnerLedgerFor(tx, "debtPayment", paymentId);
+        const agg = await tx.debtPayment.aggregate({ where: { debtId, NOT: { id: paymentId } }, _sum: { amount: true } });
+        const otherPaid = agg._sum.amount || 0;
+        const payload = await buildDebtPaymentPayload(tx, debt, b, otherPaid);
+        const now = new Date();
+        await tx.debtPayment.update({ where: { id: paymentId }, data: {
+          amount: payload.amount, date: new Date(payload.date), paymentMethod: payload.paymentMethod, notes: payload.notes,
+          partner: payload.partner, payerType: payload.payerType, payerId: payload.payerId, payerName: payload.payerName,
+          direction: payload.direction, updatedAt: now,
+          data: {
+            ...(existingPayment.data || {}), amount: payload.amount, date: payload.date, paymentMethod: payload.paymentMethod,
+            notes: payload.notes, partner: payload.partner, payerType: payload.payerType, payerId: payload.payerId,
+            payerName: payload.payerName, direction: payload.direction
+          }
+        }});
+        if(payload.partner === "moamen" || payload.partner === "abdo"){
+          await upsertPartnerLedger(tx, {
+            partner: payload.partner, type: "DEBT_PAYMENT", direction: payload.direction || "out", amount: payload.amount,
+            referenceType: "debtPayment", referenceId: paymentId, date: payload.date, userId: existingPayment.userId || user.id,
+            notes: "دفعة دين (معدّلة) — " + (debt.personName || debt.id)
+          });
+        }
+        await recomputeDebtTotals(tx, debtId);
+        await tx.auditLog.create({ data: auditEntry(req, "تعديل دفعة دين", (debt.personName || debtId) + " — " + payload.amount + " — " + payload.payerName) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+  if(method === "POST" && /^\/api\/debts\/[^/]+\/payments\/[^/]+\/delete$/.test(url)){
+    const parts = url.split("/");
+    const debtId = parts[3], paymentId = parts[5];
+    const existingPayment = await prisma.debtPayment.findUnique({ where: { id: paymentId } });
+    if(!existingPayment || existingPayment.debtId !== debtId){ send(res, 404, { ok:false, error:"الدفعة غير موجودة" }); return; }
+    const debt = await prisma.debt.findUnique({ where: { id: debtId } });
+    await prisma.$transaction(async function(tx){
+      await deletePartnerLedgerFor(tx, "debtPayment", paymentId);
+      await tx.debtPayment.delete({ where: { id: paymentId } });
+      await recomputeDebtTotals(tx, debtId);
+      await tx.auditLog.create({ data: auditEntry(req, "حذف دفعة دين", (debt ? (debt.personName || debtId) : debtId) + " — " + existingPayment.amount) });
+    }, { timeout: 30000 });
     await db.trimAuditLog();
     const state = await db.buildStateFromDB();
     send(res, 200, { ok:true, db: state });

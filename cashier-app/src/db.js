@@ -95,7 +95,10 @@ async function buildStateFromDB(){
   state.debtPayments = (await prisma.debtPayment.findMany()).map(p => ({
     ...(p.data || {}),
     id: p.id, debtId: p.debtId, amount: p.amount, date: p.date ? p.date.getTime() : null,
-    paymentMethod: p.paymentMethod, notes: p.notes, partner: p.partner, direction: p.direction, userId: p.userId
+    paymentMethod: p.paymentMethod, notes: p.notes, partner: p.partner,
+    payerType: p.payerType, payerId: p.payerId, payerName: p.payerName,
+    direction: p.direction, userId: p.userId,
+    createdAt: p.createdAt ? p.createdAt.getTime() : null, updatedAt: p.updatedAt ? p.updatedAt.getTime() : null
   }));
 
   const sales = await prisma.sale.findMany({ include: { items: true } });
@@ -307,7 +310,11 @@ async function replaceStateInDB(raw){
         data: {
           id: dp.id || uid(), debtId: dp.debtId, amount: dp.amount != null ? dp.amount : null, date: dp.date ? new Date(dp.date) : null,
           paymentMethod: dp.paymentMethod || null, notes: dp.notes || null, partner: dp.partner || null,
-          direction: dp.direction || null, userId: dp.userId || null, data: dp
+          payerType: dp.payerType || null, payerId: dp.payerId || null, payerName: dp.payerName || null,
+          direction: dp.direction || null, userId: dp.userId || null,
+          createdAt: dp.createdAt ? new Date(dp.createdAt) : (dp.date ? new Date(dp.date) : null),
+          updatedAt: dp.updatedAt ? new Date(dp.updatedAt) : null,
+          data: dp
         }
       });
       count++;

@@ -136,12 +136,17 @@ model DebtPayment {
   id            String @id
   debtId        String
   amount        Float?
-  date          DateTime?
+  date          DateTime? // payment date
   paymentMethod String?
   notes         String?
-  partner       String? // "moamen" | "abdo"
-  direction     String? // "in" | "out"
-  userId        String?
+  partner       String? // "moamen" | "abdo" — set when payerType is "partner"; drives the PartnerTransaction ledger entry
+  payerType     String? // "partner" | "customer" — who actually paid ("مين دفع؟")
+  payerId       String? // partner code ("moamen"/"abdo") or Customer.id, matching payerType
+  payerName     String? // snapshot display name for payerId, resolved server-side
+  direction     String? // "in" | "out" — always derived from the parent Debt, never trusted from the client
+  userId        String? // "بواسطة" — the logged-in user who recorded the payment
+  createdAt     DateTime?
+  updatedAt     DateTime?
   data          Json?
   debt          Debt @relation(fields: [debtId], references: [id])
 }
