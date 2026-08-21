@@ -1664,14 +1664,12 @@ function receiptHTML(sale){
     '<div class="divider"></div>'+
     '<div class="ttl"><span>الإجمالي الفرعي</span><span>'+fmt(sale.subtotal)+'</span></div>'+
     (sale.discount>0 ? '<div class="ttl"><span>الخصم</span><span>-'+fmt(sale.discount)+'</span></div>' : '')+
-    (sale.tax>0 ? '<div class="ttl"><span>الضريبة</span><span>'+fmt(sale.tax)+'</span></div>' : '')+
     '<div class="ttl bold" style="font-size:14px"><span>الإجمالي</span><span>'+fmt(sale.total)+' '+esc(DB.settings.currency)+'</span></div>'+
     (returned>0.004 ?
       '<div class="ttl" style="color:var(--red);"><span>المرتجع</span><span>-'+fmt(returned)+'</span></div>'+
       '<div class="ttl bold" style="font-size:14px"><span>الصافي</span><span>'+fmt(sale.total-returned)+' '+esc(DB.settings.currency)+'</span></div>'
       : '')+
     '<div class="ttl"><span>طريقة الدفع</span><span>'+payLbl+'</span></div>'+
-    (sale.paymentMethod==="cash" ? '<div class="ttl"><span>المدفوع</span><span>'+fmt(sale.cashReceived)+'</span></div><div class="ttl"><span>الباقي</span><span>'+fmt(sale.change)+'</span></div>' : '')+
     '<div class="divider"></div>'+
     '<div class="rc">الكاشير: '+esc(userById(sale.userId) ? userById(sale.userId).name : "-")+'</div>'+
     '<div class="rc">شكراً لزيارتكم 🌟</div>'+
