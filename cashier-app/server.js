@@ -1672,6 +1672,123 @@ const server = http.createServer(async function(req, res){
     return;
   }
 
+  /* ---------- أوامر الطباعة (تحويل مخزون داخلي بين موديلين — بدون أي أثر مالي) ----------
+     مش بيع ولا شراء ولا مرتجع؛ خصم من موديل مصدر + إضافة نفس الكمية بالظبط لموديل
+     ناتج، فوق نفس بنية Product/ProductVariant الموجودة (نفس adjustVariantStock/
+     recomputeProductStock المستخدمة في كل عمليات المخزون الأخرى). "المتاح" هنا =
+     stock الحالي مباشرة — النظام مفيهوش رصيد "محجوز" منفصل (الكمية بتتخصم من
+     الـ variant فورًا وقت أي بيع/أوردر، مش عند التسليم)، فمفيش رصيد تاني يتفرق عنه. */
+  if(method === "POST" && url === "/api/printing-orders"){
+    const b = await readBody(req);
+    const sourceVariantId = b.sourceVariantId || "";
+    const targetVariantId = b.targetVariantId || "";
+    const quantity = parseInt(b.quantity, 10) || 0;
+    const notes = (b.notes || "").trim() || null;
+    const dateVal = b.date ? Number(b.date) : Date.now();
+
+    if(!sourceVariantId){ send(res, 400, { ok:false, error:"الموديل المصدر مطلوب" }); return; }
+    if(!targetVariantId){ send(res, 400, { ok:false, error:"الموديل الناتج مطلوب" }); return; }
+    if(sourceVariantId === targetVariantId){ send(res, 400, { ok:false, error:"لا يمكن أن يكون الموديل المصدر هو نفس الموديل الناتج" }); return; }
+    if(!(quantity > 0)){ send(res, 400, { ok:false, error:"الكمية يجب أن تكون أكبر من صفر" }); return; }
+
+    const printingOrderId = uid();
+    try{
+      await prisma.$transaction(async function(tx){
+        const sourceVariant = await tx.productVariant.findUnique({ where: { id: sourceVariantId } });
+        if(!sourceVariant) throw httpError(400, "الموديل المصدر غير موجود");
+        const targetVariant = await tx.productVariant.findUnique({ where: { id: targetVariantId } });
+        if(!targetVariant) throw httpError(400, "الموديل الناتج غير موجود");
+
+        const available = sourceVariant.stock || 0;
+        if(quantity > available) throw httpError(400, "الكمية المطلوبة أكبر من الكمية المتاحة");
+
+        const sourceProduct = sourceVariant.productId ? await tx.product.findUnique({ where: { id: sourceVariant.productId } }) : null;
+        const targetProduct = targetVariant.productId ? await tx.product.findUnique({ where: { id: targetVariant.productId } }) : null;
+
+        await adjustVariantStock(tx, sourceVariantId, -quantity);
+        await recomputeProductStock(tx, sourceVariant.productId);
+        await adjustVariantStock(tx, targetVariantId, quantity);
+        await recomputeProductStock(tx, targetVariant.productId);
+
+        const setting = await tx.setting.findUnique({ where: { id: 'main' } });
+        const settings = (setting && setting.data) || {};
+        const counter = settings.printingOrderCounter || 1001;
+        const orderNumber = "TP-" + counter;
+        settings.printingOrderCounter = counter + 1;
+        await tx.setting.update({ where: { id: 'main' }, data: { printingOrderCounter: settings.printingOrderCounter, data: settings } });
+
+        const rec = {
+          id: printingOrderId, orderNumber, date: dateVal,
+          sourceProductId: sourceVariant.productId, sourceVariantId: sourceVariant.id,
+          sourceModelCode: sourceProduct ? sourceProduct.modelCode : null, sourceProductName: sourceProduct ? sourceProduct.name : null,
+          sourceColor: sourceVariant.color || null, sourceSize: sourceVariant.size || null,
+          targetProductId: targetVariant.productId, targetVariantId: targetVariant.id,
+          targetModelCode: targetProduct ? targetProduct.modelCode : null, targetProductName: targetProduct ? targetProduct.name : null,
+          targetColor: targetVariant.color || null, targetSize: targetVariant.size || null,
+          quantity, status: "منفذ", notes, userId: user.id
+        };
+        await tx.printingOrder.create({ data: {
+          id: printingOrderId, orderNumber, date: new Date(dateVal),
+          sourceProductId: rec.sourceProductId, sourceVariantId: rec.sourceVariantId,
+          sourceModelCode: rec.sourceModelCode, sourceProductName: rec.sourceProductName,
+          sourceColor: rec.sourceColor, sourceSize: rec.sourceSize,
+          targetProductId: rec.targetProductId, targetVariantId: rec.targetVariantId,
+          targetModelCode: rec.targetModelCode, targetProductName: rec.targetProductName,
+          targetColor: rec.targetColor, targetSize: rec.targetSize,
+          quantity: quantity, status: "منفذ", notes: notes, userId: user.id,
+          createdAt: new Date(), updatedAt: new Date(), data: rec
+        }});
+
+        await tx.auditLog.create({ data: auditEntry(req, "أمر طباعة",
+          orderNumber + " — " + (rec.sourceModelCode||"") + " → " + (rec.targetModelCode||"") + " — " + quantity) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+  if(method === "POST" && /^\/api\/printing-orders\/[^/]+\/cancel$/.test(url)){
+    const id = url.split("/")[3];
+    const existing = await prisma.printingOrder.findUnique({ where: { id } });
+    if(!existing){ send(res, 404, { ok:false, error:"أمر الطباعة غير موجود" }); return; }
+    if(existing.status === "ملغي"){ send(res, 409, { ok:false, error:"أمر الطباعة ملغي بالفعل" }); return; }
+    try{
+      await prisma.$transaction(async function(tx){
+        const fresh = await tx.printingOrder.findUnique({ where: { id } });
+        if(!fresh) throw httpError(404, "أمر الطباعة غير موجود");
+        if(fresh.status === "ملغي") throw httpError(409, "أمر الطباعة ملغي بالفعل");
+
+        const qty = fresh.quantity || 0;
+        if(fresh.sourceVariantId){
+          await adjustVariantStock(tx, fresh.sourceVariantId, qty);
+          if(fresh.sourceProductId) await recomputeProductStock(tx, fresh.sourceProductId);
+        }
+        if(fresh.targetVariantId){
+          await adjustVariantStock(tx, fresh.targetVariantId, -qty);
+          if(fresh.targetProductId) await recomputeProductStock(tx, fresh.targetProductId);
+        }
+
+        const mergedData = { ...(fresh.data||{}), statusBeforeCancel: fresh.status, cancelledAt: Date.now(), cancelledBy: user.id };
+        await tx.printingOrder.update({ where: { id }, data: {
+          status: "ملغي", cancelledAt: new Date(), cancelledBy: user.id, updatedAt: new Date(), data: mergedData
+        }});
+
+        await tx.auditLog.create({ data: auditEntry(req, "إلغاء أمر طباعة", fresh.orderNumber || id) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+
   // الفئات (منتجات ومصاريف)
   if(method === "POST" && url === "/api/categories"){
     const b = await readBody(req);

@@ -1719,6 +1719,8 @@ function viewProducts(){
       '</div>'+
       '<select id="prod-cat" onchange="reloadProducts()">'+cats+'</select>'+
       '<button class="btn btn-ghost" onclick="openInventoryPrint()">'+icon("print",16)+' طباعة</button>'+
+      (isAdmin() ? '<button class="btn btn-soft" onclick="openPrintingOrderForm()">'+icon("return",16)+' أمر طباعة</button>' : '')+
+      (isAdmin() ? '<button class="btn btn-ghost" onclick="openPrintingOrdersHistory()">'+icon("history",16)+' سجل أوامر الطباعة</button>' : '')+
       (isAdmin() ? '<button class="btn btn-primary" onclick="openProductForm()">'+icon("plus",16)+' إضافة منتج</button>' : '')+
       (isAdmin() ? '<button class="btn btn-ghost" onclick="openCategories()">'+icon("tag",16)+' الفئات</button>' : '')+
     '</div>';
@@ -1804,6 +1806,192 @@ function openInventoryPrint(){
     '</div>'
   , true);
 }
+
+/* ============================================================
+   أمر طباعة — تحويل مخزون داخلي بين موديلين (بدون أي أثر مالي)
+   ============================================================ */
+var printingOrderDraft = null;
+function resolveVariant(productId, color, size){
+  var p = DB.products.find(function(x){ return x.id===productId; });
+  if(!p) return null;
+  return (p.variants||[]).find(function(v){ return (v.color||"")===(color||"") && (v.size||"")===(size||""); }) || null;
+}
+function productModelOptionsHTML(selected){
+  return '<option value="">— اختر الموديل —</option>'+DB.products.map(function(p){
+    return '<option value="'+p.id+'" '+(selected===p.id?"selected":"")+'>'+esc(p.modelCode?(p.modelCode+" — "+p.name):p.name)+'</option>';
+  }).join("");
+}
+function productColorOptionsHTML(productId, selected){
+  var p = DB.products.find(function(x){ return x.id===productId; });
+  var colors = p ? Array.from(new Set((p.variants||[]).map(function(v){ return v.color||""; }))) : [];
+  if(!colors.length) return '<option value="">—</option>';
+  return colors.map(function(c){ return '<option value="'+esc(c)+'" '+(selected===c?"selected":"")+'>'+esc(c||"بدون لون")+'</option>'; }).join("");
+}
+function productSizeOptionsHTML(productId, color, selected){
+  var p = DB.products.find(function(x){ return x.id===productId; });
+  var sizes = p ? Array.from(new Set((p.variants||[]).filter(function(v){ return (v.color||"")===(color||""); }).map(function(v){ return v.size||""; }))) : [];
+  if(!sizes.length) return '<option value="">—</option>';
+  return sizes.map(function(s){ return '<option value="'+esc(s)+'" '+(selected===s?"selected":"")+'>'+esc(s||"بدون مقاس")+'</option>'; }).join("");
+}
+function openPrintingOrderForm(){
+  printingOrderDraft = {
+    date: todayKey(),
+    sourceProductId: "", sourceColor: "", sourceSize: "",
+    targetProductId: "", targetColor: "", targetSize: "",
+    quantity: "", notes: ""
+  };
+  openModal(printingOrderModalHTML(), true);
+}
+function setPOSourceProduct(pid){ printingOrderDraft.sourceProductId = pid; printingOrderDraft.sourceColor = ""; printingOrderDraft.sourceSize = ""; refreshPrintingOrderModal(); }
+function setPOSourceColor(c){ printingOrderDraft.sourceColor = c; printingOrderDraft.sourceSize = ""; refreshPrintingOrderModal(); }
+function setPOSourceSize(s){ printingOrderDraft.sourceSize = s; refreshPrintingOrderModal(); }
+function setPOTargetProduct(pid){ printingOrderDraft.targetProductId = pid; printingOrderDraft.targetColor = ""; printingOrderDraft.targetSize = ""; refreshPrintingOrderModal(); }
+function setPOTargetColor(c){ printingOrderDraft.targetColor = c; printingOrderDraft.targetSize = ""; refreshPrintingOrderModal(); }
+function setPOTargetSize(s){ printingOrderDraft.targetSize = s; refreshPrintingOrderModal(); }
+function refreshPrintingOrderModal(){ var m = $("#modal"); if(m) m.innerHTML = printingOrderModalHTML(); }
+function printingOrderModalHTML(){
+  var d = printingOrderDraft;
+  var sourceVariant = resolveVariant(d.sourceProductId, d.sourceColor, d.sourceSize);
+  var availableHint = sourceVariant
+    ? '<div class="small muted" style="margin-top:4px;">الكمية المتاحة من الموديل المصدر: <b>'+(sourceVariant.stock||0)+'</b></div>'
+    : '';
+  return '<div class="modal-head"><h3>'+icon("return",18)+' أمر طباعة</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="form-grid">'+
+        '<div class="field"><label>التاريخ</label><input id="po-date" type="date" value="'+esc(d.date||todayKey())+'" onchange="printingOrderDraft.date=this.value"></div>'+
+      '</div>'+
+      '<div class="row mt16 mb8"><span class="bold grow">الموديل المصدر (السادة)</span></div>'+
+      '<div class="form-grid">'+
+        '<div class="field"><label>الموديل *</label><select onchange="setPOSourceProduct(this.value)">'+productModelOptionsHTML(d.sourceProductId)+'</select></div>'+
+        '<div class="field"><label>اللون</label><select onchange="setPOSourceColor(this.value)">'+productColorOptionsHTML(d.sourceProductId, d.sourceColor)+'</select></div>'+
+        '<div class="field"><label>المقاس</label><select onchange="setPOSourceSize(this.value)">'+productSizeOptionsHTML(d.sourceProductId, d.sourceColor, d.sourceSize)+'</select></div>'+
+      '</div>'+
+      availableHint+
+      '<div class="form-grid mt8">'+
+        '<div class="field full"><label>الكمية المراد طباعتها *</label><input id="po-qty" type="number" min="1" step="1" value="'+esc(d.quantity)+'" onchange="printingOrderDraft.quantity=this.value"></div>'+
+      '</div>'+
+      '<div class="row mt16 mb8"><span class="bold grow">الموديل الناتج (المطبوع)</span></div>'+
+      '<div class="form-grid">'+
+        '<div class="field"><label>الموديل *</label><select onchange="setPOTargetProduct(this.value)">'+productModelOptionsHTML(d.targetProductId)+'</select></div>'+
+        '<div class="field"><label>اللون</label><select onchange="setPOTargetColor(this.value)">'+productColorOptionsHTML(d.targetProductId, d.targetColor)+'</select></div>'+
+        '<div class="field"><label>المقاس</label><select onchange="setPOTargetSize(this.value)">'+productSizeOptionsHTML(d.targetProductId, d.targetColor, d.targetSize)+'</select></div>'+
+      '</div>'+
+      '<div class="form-grid mt8">'+
+        '<div class="field full"><label>ملاحظات</label><textarea onchange="printingOrderDraft.notes=this.value">'+esc(d.notes||"")+'</textarea></div>'+
+      '</div>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="savePrintingOrder()">'+icon("check",16)+' تنفيذ أمر الطباعة</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+    '</div>';
+}
+async function savePrintingOrder(){
+  var d = printingOrderDraft;
+  var sourceVariant = resolveVariant(d.sourceProductId, d.sourceColor, d.sourceSize);
+  var targetVariant = resolveVariant(d.targetProductId, d.targetColor, d.targetSize);
+  var qty = parseInt(d.quantity, 10) || 0;
+  if(!sourceVariant){ toast("اختر الموديل المصدر (والمقاس/اللون)","err"); return; }
+  if(!targetVariant){ toast("اختر الموديل الناتج (والمقاس/اللون)","err"); return; }
+  if(sourceVariant.id === targetVariant.id){ toast("لا يمكن أن يكون الموديل المصدر هو نفس الموديل الناتج","err"); return; }
+  if(qty <= 0){ toast("الكمية يجب أن تكون أكبر من صفر","err"); return; }
+  if(qty > (sourceVariant.stock||0)){ toast("الكمية المطلوبة أكبر من الكمية المتاحة","err"); return; }
+  try{
+    var r = await api("POST", "/api/printing-orders", {
+      sourceVariantId: sourceVariant.id, targetVariantId: targetVariant.id, quantity: qty,
+      date: new Date((d.date||todayKey())+"T12:00:00").getTime(), notes: (d.notes||"").trim()
+    });
+    afterSync(r);
+    closeModal(); renderViewInPlace(); toast("تم تنفيذ أمر الطباعة بنجاح");
+  }catch(e){ toast(e.message, "err"); }
+}
+function printingOrderStatusMeta(s){
+  if(s === "ملغي") return {label:"ملغي", cls:"badge-gray"};
+  return {label: s || "منفذ", cls:"badge-green"};
+}
+function openPrintingOrdersHistory(){
+  var list = (DB.printingOrders||[]).slice().sort(function(a,b){ return (b.date||0)-(a.date||0); });
+  var rows = list.map(function(o){
+    var st = printingOrderStatusMeta(o.status);
+    return '<tr>'+
+      '<td class="bold">'+esc(o.orderNumber||"—")+'</td>'+
+      '<td>'+dateStr(o.date)+'</td>'+
+      '<td dir="ltr">'+esc(o.sourceModelCode||"—")+'</td>'+
+      '<td>'+esc(o.sourceColor||"—")+'</td>'+
+      '<td>'+esc(o.sourceSize||"—")+'</td>'+
+      '<td class="bold">'+fmtInt(o.quantity)+'</td>'+
+      '<td dir="ltr">'+esc(o.targetModelCode||"—")+'</td>'+
+      '<td>'+esc(o.targetColor||"—")+'</td>'+
+      '<td>'+esc(o.targetSize||"—")+'</td>'+
+      '<td>'+esc(userById(o.userId)?userById(o.userId).name:"—")+'</td>'+
+      '<td class="small muted">'+esc(o.notes||"—")+'</td>'+
+      '<td><span class="badge '+st.cls+'">'+st.label+'</span></td>'+
+      '<td style="white-space:nowrap;">'+
+        '<button class="icon-btn" title="عرض التفاصيل" onclick="viewPrintingOrderDetail(\''+o.id+'\')">'+icon("eye",16)+'</button>'+
+        (o.status!=="ملغي" ? '<button class="icon-btn danger" title="إلغاء أمر الطباعة" onclick="cancelPrintingOrder(\''+o.id+'\')">'+icon("x",16)+'</button>' : '')+
+      '</td>'+
+    '</tr>';
+  }).join("") || '<tr><td colspan="13" class="muted" style="text-align:center;padding:24px;">لا توجد أوامر طباعة بعد</td></tr>';
+  openModal(
+    '<div class="modal-head"><h3>'+icon("history",18)+' سجل أوامر الطباعة</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="table-wrap"><table><thead><tr><th>رقم أمر الطباعة</th><th>التاريخ</th><th>الموديل المصدر</th><th>اللون</th><th>المقاس</th><th>الكمية</th><th>الموديل الناتج</th><th>اللون</th><th>المقاس</th><th>المستخدم</th><th>الملاحظات</th><th>الحالة</th><th>الإجراءات</th></tr></thead>'+
+      '<tbody>'+rows+'</tbody></table></div>'+
+    '</div>'+
+    '<div class="modal-foot"><button class="btn btn-ghost" onclick="closeModal()">إغلاق</button></div>'
+  , true);
+}
+function viewPrintingOrderDetail(id){
+  var o = (DB.printingOrders||[]).find(function(x){ return x.id===id; });
+  if(!o) return;
+  var st = printingOrderStatusMeta(o.status);
+  openModal(
+    '<div class="modal-head"><h3>'+icon("return",18)+' أمر طباعة '+esc(o.orderNumber||"")+' <span class="badge '+st.cls+'">'+st.label+'</span></h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="row" style="gap:16px;flex-wrap:wrap;">'+
+        '<div class="card" style="flex:1;min-width:220px;background:#f8fafc;padding:12px;">'+
+          '<div class="bold mb8">المصدر</div>'+
+          '<div class="ttl"><span>الموديل</span><span class="bold" dir="ltr">'+esc(o.sourceModelCode||"—")+'</span></div>'+
+          '<div class="ttl"><span>اللون</span><span>'+esc(o.sourceColor||"—")+'</span></div>'+
+          '<div class="ttl"><span>المقاس</span><span>'+esc(o.sourceSize||"—")+'</span></div>'+
+          '<div class="ttl"><span>الكمية</span><span class="bold">'+fmtInt(o.quantity)+' قطعة</span></div>'+
+        '</div>'+
+        '<div class="card" style="flex:1;min-width:220px;background:#f8fafc;padding:12px;">'+
+          '<div class="bold mb8">الناتج</div>'+
+          '<div class="ttl"><span>الموديل</span><span class="bold" dir="ltr">'+esc(o.targetModelCode||"—")+'</span></div>'+
+          '<div class="ttl"><span>اللون</span><span>'+esc(o.targetColor||"—")+'</span></div>'+
+          '<div class="ttl"><span>المقاس</span><span>'+esc(o.targetSize||"—")+'</span></div>'+
+          '<div class="ttl"><span>الكمية</span><span class="bold">'+fmtInt(o.quantity)+' قطعة</span></div>'+
+        '</div>'+
+      '</div>'+
+      '<div class="card mt16" style="background:#f8fafc;padding:12px;">'+
+        '<div class="ttl"><span>التاريخ</span><span class="bold">'+dateStr(o.date)+'</span></div>'+
+        '<div class="ttl"><span>بواسطة</span><span class="bold">'+esc(userById(o.userId)?userById(o.userId).name:"—")+'</span></div>'+
+        (o.notes ? '<div class="ttl"><span>ملاحظات</span><span>'+esc(o.notes)+'</span></div>' : '')+
+        (o.status==="ملغي" ? (
+          '<div class="ttl"><span>تاريخ الإلغاء</span><span>'+(o.cancelledAt?dateStr(o.cancelledAt)+' '+timeStr(o.cancelledAt):"—")+'</span></div>'+
+          '<div class="ttl"><span>ألغاه</span><span>'+esc(userById(o.cancelledBy)?userById(o.cancelledBy).name:"—")+'</span></div>'
+        ) : '')+
+      '</div>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      (o.status!=="ملغي" ? '<button class="btn btn-soft-red" onclick="cancelPrintingOrder(\''+o.id+'\')">'+icon("x",16)+' إلغاء أمر الطباعة</button>' : '')+
+      '<button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>'+
+    '</div>'
+  , true);
+}
+function cancelPrintingOrder(id){
+  var o = (DB.printingOrders||[]).find(function(x){ return x.id===id; });
+  if(!o) return;
+  if(o.status==="ملغي"){ toast("أمر الطباعة ملغي بالفعل","warn"); return; }
+  confirmBox("إلغاء أمر الطباعة "+(o.orderNumber||"")+"؟ سيتم إرجاع "+fmtInt(o.quantity)+" قطعة للموديل المصدر وخصمها من الموديل الناتج.", function(){
+    api("POST", "/api/printing-orders/" + id + "/cancel").then(function(r){
+      afterSync(r); renderViewInPlace();
+      openPrintingOrdersHistory();
+      toast("تم إلغاء أمر الطباعة");
+    }).catch(function(e){ toast(e.message, "err"); });
+  }, true);
+}
+
 function openStockEditor(id){
   var p = DB.products.find(function(x){ return x.id===id; });
   if(!p) return;

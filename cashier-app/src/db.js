@@ -101,6 +101,18 @@ async function buildStateFromDB(){
     createdAt: p.createdAt ? p.createdAt.getTime() : null, updatedAt: p.updatedAt ? p.updatedAt.getTime() : null
   }));
 
+  state.printingOrders = (await prisma.printingOrder.findMany()).map(o => ({
+    ...(o.data || {}),
+    id: o.id, orderNumber: o.orderNumber, date: o.date ? o.date.getTime() : null,
+    sourceProductId: o.sourceProductId, sourceVariantId: o.sourceVariantId, sourceModelCode: o.sourceModelCode,
+    sourceProductName: o.sourceProductName, sourceColor: o.sourceColor, sourceSize: o.sourceSize,
+    targetProductId: o.targetProductId, targetVariantId: o.targetVariantId, targetModelCode: o.targetModelCode,
+    targetProductName: o.targetProductName, targetColor: o.targetColor, targetSize: o.targetSize,
+    quantity: o.quantity, status: o.status, notes: o.notes, userId: o.userId,
+    cancelledAt: o.cancelledAt ? o.cancelledAt.getTime() : null, cancelledBy: o.cancelledBy,
+    createdAt: o.createdAt ? o.createdAt.getTime() : null, updatedAt: o.updatedAt ? o.updatedAt.getTime() : null
+  }));
+
   const sales = await prisma.sale.findMany({ include: { items: true } });
   state.sales = sales.map(s => ({
     ...(s.data || {}),
@@ -173,7 +185,7 @@ async function buildStateFromDB(){
   // Ensure arrays exist for compatibility
   ["users", "categories", "products", "customers", "suppliers", "purchases", "purchasePayments", "debts", "debtPayments", "audit", "sales", "returns",
    "shippingCompanies", "shipPrices", "orders", "orderCollections", "orderExchanges", "expenseCategories", "expenses", "otherIncome",
-   "paymentsIn", "paymentsOut", "cashClosings", "transfers", "partnerTransactions"].forEach(function (k) { if (!state[k]) state[k] = []; });
+   "paymentsIn", "paymentsOut", "cashClosings", "transfers", "partnerTransactions", "printingOrders"].forEach(function (k) { if (!state[k]) state[k] = []; });
 
   return state;
 }
@@ -203,6 +215,7 @@ async function replaceStateInDB(raw){
     await tx.purchasePayment.deleteMany({});
     await tx.debtPayment.deleteMany({});
     await tx.debt.deleteMany({});
+    await tx.printingOrder.deleteMany({});
     await tx.orderCollection.deleteMany({});
     await tx.orderExchange.deleteMany({});
     await tx.partnerTransaction.deleteMany({});
@@ -233,6 +246,7 @@ async function replaceStateInDB(raw){
         lowStockThreshold: settings.lowStockThreshold != null ? settings.lowStockThreshold : null, invoicePrefix: settings.invoicePrefix || null,
         invoiceCounter: settings.invoiceCounter != null ? settings.invoiceCounter : null, purchaseCounter: settings.purchaseCounter != null ? settings.purchaseCounter : null,
         orderCounter: settings.orderCounter != null ? settings.orderCounter : null, returnCounter: settings.returnCounter != null ? settings.returnCounter : null,
+        printingOrderCounter: settings.printingOrderCounter != null ? settings.printingOrderCounter : null,
         receiptFooter: settings.receiptFooter || null, phone: settings.phone || null,
         data: settings
       }
@@ -315,6 +329,25 @@ async function replaceStateInDB(raw){
           createdAt: dp.createdAt ? new Date(dp.createdAt) : (dp.date ? new Date(dp.date) : null),
           updatedAt: dp.updatedAt ? new Date(dp.updatedAt) : null,
           data: dp
+        }
+      });
+      count++;
+    }
+    for (const o of (raw.printingOrders || [])) {
+      await tx.printingOrder.create({
+        data: {
+          id: o.id || uid(), orderNumber: o.orderNumber || null, date: o.date ? new Date(o.date) : null,
+          sourceProductId: o.sourceProductId || null, sourceVariantId: o.sourceVariantId || null,
+          sourceModelCode: o.sourceModelCode || null, sourceProductName: o.sourceProductName || null,
+          sourceColor: o.sourceColor || null, sourceSize: o.sourceSize || null,
+          targetProductId: o.targetProductId || null, targetVariantId: o.targetVariantId || null,
+          targetModelCode: o.targetModelCode || null, targetProductName: o.targetProductName || null,
+          targetColor: o.targetColor || null, targetSize: o.targetSize || null,
+          quantity: o.quantity != null ? o.quantity : null, status: o.status || null, notes: o.notes || null, userId: o.userId || null,
+          cancelledAt: o.cancelledAt ? new Date(o.cancelledAt) : null, cancelledBy: o.cancelledBy || null,
+          createdAt: o.createdAt ? new Date(o.createdAt) : (o.date ? new Date(o.date) : null),
+          updatedAt: o.updatedAt ? new Date(o.updatedAt) : null,
+          data: o
         }
       });
       count++;

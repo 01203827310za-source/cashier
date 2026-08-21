@@ -47,6 +47,38 @@ model ProductVariant {
   product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
 }
 
+// أمر طباعة — تحويل مخزون داخلي بحت بين موديلين (مثلاً قطعة "سادة" إلى نفس
+// القطعة "مطبوعة"): خصم من موديل مصدر وإضافة لموديل ناتج بنفس الكمية بالظبط.
+// لا علاقة له بالمبيعات/المشتريات ولا بأي حساب شريك أو عميل — مرجع نصي بسيط
+// لـ Product/ProductVariant (بدون FK) بنفس مبدأ PurchaseItem، عشان لو الموديل
+// اتعدّل أو اتحذف لاحقًا يفضل سجل أمر الطباعة التاريخي موجود وقابل للقراءة.
+model PrintingOrder {
+  id                String    @id
+  orderNumber       String?
+  date              DateTime?
+  sourceProductId   String?
+  sourceVariantId   String?
+  sourceModelCode   String?
+  sourceProductName String?
+  sourceColor       String?
+  sourceSize        String?
+  targetProductId   String?
+  targetVariantId   String?
+  targetModelCode   String?
+  targetProductName String?
+  targetColor       String?
+  targetSize        String?
+  quantity          Int?
+  status            String?   // "منفذ" | "ملغي"
+  notes             String?
+  userId            String?
+  cancelledAt       DateTime?
+  cancelledBy       String?
+  createdAt         DateTime?
+  updatedAt         DateTime?
+  data              Json?
+}
+
 model Customer {
   id        String @id
   name      String
@@ -416,6 +448,7 @@ model Setting {
   purchaseCounter Int?
   orderCounter Int?
   returnCounter Int?
+  printingOrderCounter Int?
   receiptFooter String?
   phone        String?
   data         Json?
