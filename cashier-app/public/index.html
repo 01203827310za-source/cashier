@@ -1563,7 +1563,7 @@ function openCheckout(){
         '</select></div>'+
         '<div class="field" id="ck-person-field"><label>من استلم الفلوس</label><select id="ck-person">'+userOptionsHTML(currentUser()?currentUser().id:"", false)+'</select></div>'+
         '<div class="field"><label>خصم ('+DB.settings.currency+')</label><input id="ck-discount" type="number" min="0" step="0.5" value="0" oninput="liveCheckout()"></div>'+
-        '<div class="field" id="ck-cash-field"><label>المبلغ المدفوع</label><input id="ck-cash" type="number" min="0" step="0.5" value="'+Math.ceil(t.total)+'" oninput="liveCheckout()"></div>'+
+        '<div class="field" id="ck-cash-field"><label>الإجمالي</label><input id="ck-cash" type="number" min="0" step="0.5" value="'+Math.ceil(t.total)+'" oninput="liveCheckout()"></div>'+
       '</div>'+
       '<div class="row mt8" style="flex-wrap:wrap;">'+
         '<span class="small muted">دفع سريع:</span>'+
