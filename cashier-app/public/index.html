@@ -742,6 +742,13 @@ function activeSalesList(list){
   return (list || DB.sales || []).filter(function(s){ return !isSaleCancelled(s); });
 }
 function isReturnCancelled(r){ return !!r && r.status === "ملغي"; }
+// طلب ملغي لازم يتفضل ظاهر في السجل بحالة "ملغي" لكن يتشال من أي إجمالي مالي/عدّاد
+// نشط (قيمة الأوردر، العربون، المحصل، المتبقي...) — المرتجع/المستبدل مختلفين ومقصود
+// إنهم يفضلوا محسوبين زي ما هما (منطقهم الحالي متطلوبش تغيير هنا).
+function isOrderCancelled(o){ return !!o && o.status === "cancelled"; }
+function activeOrdersList(list){
+  return (list || DB.orders || []).filter(function(o){ return !isOrderCancelled(o); });
+}
 function saleStatusBadgeHTML(s){
   return isSaleCancelled(s) ? ' <span class="badge badge-gray">ملغاة</span>' : "";
 }
@@ -3357,6 +3364,7 @@ function shippingCompanyStats(){
   });
   return buckets.filter(function(b){ return b.orders.length>0; }).map(function(b){
     var orders = b.orders;
+    var activeOrders = activeOrdersList(orders);
     return {
       id: b.id, name: b.name, count: orders.length,
       delivered: orders.filter(function(o){ return o.status==="delivered"; }).length,
@@ -3364,10 +3372,10 @@ function shippingCompanyStats(){
       exchanged: orders.filter(function(o){ return o.status==="exchanged"; }).length,
       cancelled: orders.filter(function(o){ return o.status==="cancelled"; }).length,
       pending: orders.filter(function(o){ return ["new","preparing","ready","shipped","transit"].indexOf(o.status)!==-1; }).length,
-      totalValue: orders.reduce(function(a,o){ return a+(o.total||0); },0),
-      totalDeposit: orders.reduce(function(a,o){ return a+(o.deposit||0); },0),
-      totalCollected: orders.reduce(function(a,o){ return a+orderCollectedTotal(o); },0),
-      totalRemaining: orders.reduce(function(a,o){ return a+orderRemaining(o); },0),
+      totalValue: activeOrders.reduce(function(a,o){ return a+(o.total||0); },0),
+      totalDeposit: activeOrders.reduce(function(a,o){ return a+(o.deposit||0); },0),
+      totalCollected: activeOrders.reduce(function(a,o){ return a+orderCollectedTotal(o); },0),
+      totalRemaining: activeOrders.reduce(function(a,o){ return a+orderRemaining(o); },0),
       returnedValue: orders.filter(function(o){ return o.status==="returned"; }).reduce(function(a,o){ return a+(o.total||0); },0)
     };
   }).sort(function(a,b){ return b.count-a.count; });
@@ -3402,11 +3410,16 @@ function viewOrders(){
     return okQ && okS && okC && okP && okD;
   });
 
-  var totalOrders = list.length;
-  var totalValue = list.reduce(function(a,o){ return a+(o.total||0); },0);
-  var totalDeposit = list.reduce(function(a,o){ return a+(o.deposit||0); },0);
-  var totalCollected = list.reduce(function(a,o){ return a+orderCollectedTotal(o); },0);
-  var totalRemaining = list.reduce(function(a,o){ return a+orderRemaining(o); },0);
+  // إجماليات الكروت لازم تستبعد الأوردرات الملغية دايمًا — الأوردر الملغي يفضل
+  // ظاهر في جدول القائمة تحته (list) بحالة "ملغي"، لكنه ملوش أي وجود في أي رقم
+  // مالي/عدّاد "نشط" هنا. المرتجع/المستبدل بيفضلوا محسوبين زي ما هما (منطقهم
+  // الحالي متطلوبش تغيير).
+  var statsList = activeOrdersList(list);
+  var totalOrders = statsList.length;
+  var totalValue = statsList.reduce(function(a,o){ return a+(o.total||0); },0);
+  var totalDeposit = statsList.reduce(function(a,o){ return a+(o.deposit||0); },0);
+  var totalCollected = statsList.reduce(function(a,o){ return a+orderCollectedTotal(o); },0);
+  var totalRemaining = statsList.reduce(function(a,o){ return a+orderRemaining(o); },0);
   var shippingCount = list.filter(function(o){ return ["shipped","transit"].indexOf(o.status)!==-1; }).length;
   var deliveredCount = list.filter(function(o){ return o.status==="delivered"; }).length;
   var returnedCount = list.filter(function(o){ return o.status==="returned"; }).length;
