@@ -1003,7 +1003,6 @@ function render(){
     {id:"products", label:"المنتجات والمخزون", ic:"box", roles:["admin","cashier"]},
     {id:"orders", label:"الأوردرات والشحن", ic:"send", roles:["admin","cashier"]},
     {id:"returns", label:"الاسترجاع والاستبدال", ic:"return", roles:["admin","cashier"]},
-    {id:"purchases", label:"المشتريات والموردين", ic:"truck", roles:["admin"]},
     {id:"expenses", label:"المصاريف", ic:"coins", roles:["admin"]},
     {id:"debts", label:"الديون", ic:"scale", roles:["admin"]},
     {id:"cash", label:"الخزنة", ic:"wallet", roles:["admin"]},
@@ -1184,7 +1183,21 @@ function viewDashboard(){
       '</div>';
   }
 
-  return '<h3 class="muted mb16" style="font-weight:600;">نظرة عامة على أداء المحل</h3>' + quick + stats + lowHTML + recentHTML + partnersSection;
+  var debtsSection = "";
+  if(isAdmin()){
+    var ds = debtsSummary();
+    debtsSection =
+      '<h3 class="muted mb16" style="font-weight:600;margin-top:24px;">الديون المسجّلة (الديون)</h3>'+
+      '<div class="stats">'+
+        statCard("scale","var(--primary)", fmt(ds.totalAmount), "إجمالي الديون")+
+        statCard("banknote","var(--green)", fmt(ds.totalPaid), "المدفوع")+
+        statCard("scale","var(--amber)", fmt(ds.totalRemaining), "المتبقي")+
+        statCard("scale","var(--green)", fmt(ds.toUs), "ديون لنا")+
+        statCard("scale","var(--red)", fmt(ds.onUs), "ديون علينا")+
+      '</div>';
+  }
+
+  return '<h3 class="muted mb16" style="font-weight:600;">نظرة عامة على أداء المحل</h3>' + quick + stats + lowHTML + recentHTML + partnersSection + debtsSection;
 }
 function ledgerSum(filterFn){
   return (DB.partnerTransactions||[]).filter(filterFn).reduce(function(a,t){ return a + (t.amount||0); }, 0);
@@ -3932,42 +3945,281 @@ function deleteExpenseCat(c){
 }
 
 /* ============================================================
-   الديون
+   الديون — المكان المركزي لكل ديون المحل (يدوية: عميل/مورد/شخصي/أخرى)
    ============================================================ */
+var DEBT_TYPES = [
+  {id:"customer_receivable", label:"دين على عميل"},
+  {id:"supplier_payable", label:"دين لمورد"},
+  {id:"partner_personal", label:"دين شخصي"},
+  {id:"other", label:"أخرى"}
+];
+function debtTypeLabel(t){ var x = DEBT_TYPES.find(function(o){ return o.id===t; }); return x ? x.label : (t || "—"); }
+function debtStatusMeta(s){
+  if(s==="paid") return {label:"مدفوع", cls:"badge-green"};
+  if(s==="partial") return {label:"مدفوع جزئياً", cls:"badge-amber"};
+  return {label:"غير مدفوع", cls:"badge-red"};
+}
+function debtRemaining(d){ return d.remainingAmount!=null ? d.remainingAmount : Math.max(0, (d.totalAmount||0)-(d.paidAmount||0)); }
+function debtsSummary(){
+  var totalAmount=0, totalPaid=0, totalRemaining=0, toUs=0, onUs=0;
+  (DB.debts||[]).forEach(function(d){
+    totalAmount += (d.totalAmount||0);
+    totalPaid += (d.paidAmount||0);
+    var rem = debtRemaining(d);
+    totalRemaining += rem;
+    if(d.direction==="in") toUs += rem; else onUs += rem;
+  });
+  return {totalAmount:totalAmount, totalPaid:totalPaid, totalRemaining:totalRemaining, toUs:toUs, onUs:onUs};
+}
 function viewDebts(){
   if(!isAdmin()){ return '<div class="empty"><div class="big">🔒</div><p>هذه الصفحة للمدير فقط</p></div>'; }
-  // ديون علينا (للموردين)
-  var supRows = DB.suppliers.map(function(s){
-    var bal = supplierBalance(s.id);
-    return '<tr><td class="bold">'+esc(s.name)+'</td>'+
-      '<td>'+fmt(supplierPurchasesTotal(s.id))+'</td>'+
-      '<td>'+fmt(supplierPaid(s.id))+'</td>'+
-      '<td class="bold" style="color:'+(bal>0?'var(--red)':'var(--green)')+';">'+fmt(bal)+'</td>'+
-      '<td><button class="btn btn-sm btn-ghost" onclick="openSupplierPayment(\''+s.id+'\')">'+icon("banknote",15)+' تسجيل دفعة</button></td></tr>';
-  }).join("") || '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">لا يوجد موردون</td></tr>';
-  var supTotalBal = DB.suppliers.reduce(function(a,s){ return a+supplierBalance(s.id); },0);
+  var sum = debtsSummary();
+  var list = (DB.debts||[]).slice().sort(function(a,b){ return (b.date||0)-(a.date||0); });
+  var rows = list.map(function(d){
+    var st = debtStatusMeta(d.status);
+    var rem = debtRemaining(d);
+    return '<tr>'+
+      '<td class="bold" style="cursor:pointer;" onclick="openDebtDetail(\''+d.id+'\')">'+esc(d.personName||"—")+'</td>'+
+      '<td>'+esc(debtTypeLabel(d.type))+'</td>'+
+      '<td>'+dateStr(d.date)+'</td>'+
+      '<td>'+fmt(d.totalAmount)+'</td>'+
+      '<td>'+fmt(d.paidAmount)+'</td>'+
+      '<td class="bold" style="color:'+(rem>0.005?'var(--red)':'var(--green)')+';">'+fmt(rem)+'</td>'+
+      '<td><span class="badge '+st.cls+'">'+st.label+'</span></td>'+
+      '<td style="white-space:nowrap;">'+
+        '<button class="icon-btn" title="عرض" onclick="openDebtDetail(\''+d.id+'\')">'+icon("eye",16)+'</button>'+
+        (rem>0.005 ? '<button class="icon-btn primary" title="إضافة دفعة" onclick="openDebtPayment(\''+d.id+'\')">'+icon("banknote",16)+'</button>' : '')+
+        '<button class="icon-btn" title="تعديل" onclick="openDebtEdit(\''+d.id+'\')">'+icon("edit",16)+'</button>'+
+        '<button class="icon-btn danger" title="حذف" onclick="deleteDebt(\''+d.id+'\')">'+icon("trash",16)+'</button>'+
+      '</td>'+
+    '</tr>';
+  }).join("") || '<tr><td colspan="8" class="muted" style="text-align:center;padding:30px;">لا توجد ديون مسجّلة بعد</td></tr>';
 
-  // ديون لنا (على العملاء)
-  var custList = DB.customers.filter(function(c){ return customerBalance(c.id) > 0.005; });
-  var custRows = custList.map(function(c){
-    var bal = customerBalance(c.id);
-    return '<tr><td class="bold">'+esc(c.name)+(c.phone?'<div class="small muted" dir="ltr">'+esc(c.phone)+'</div>':'')+'</td>'+
-      '<td>'+fmt(customerSalesCredit(c.id)+customerOrdersCredit(c.id))+'</td>'+
-      '<td>'+fmt(customerPaid(c.id))+'</td>'+
-      '<td class="bold" style="color:var(--green);">'+fmt(bal)+'</td>'+
-      '<td><button class="btn btn-sm btn-ghost" onclick="openCustomerPayment(\''+c.id+'\')">'+icon("banknote",15)+' استلام دفعة</button></td></tr>';
-  }).join("") || '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">لا توجد ديون مستحقة على العملاء 🎉</td></tr>';
-  var custTotalBal = DB.customers.reduce(function(a,c){ return a+customerBalance(c.id); },0);
-
-  return '<div class="stats">'+
-    statCard("scale","var(--red)", fmt(supTotalBal), "إجمالي ديون علينا (موردين)")+
-    statCard("scale","var(--green)", fmt(custTotalBal), "إجمالي ديون لنا (عملاء)")+
-  '</div>'+
-  '<div class="card mb16"><h3>'+icon("truck",17)+' ديون للموردين (علينا)</h3>'+
-    '<div class="table-wrap"><table><thead><tr><th>المورد</th><th>إجمالي المشتريات</th><th>المسدد</th><th>المتبقي</th><th></th></tr></thead><tbody>'+supRows+'</tbody></table></div></div>'+
-  '<div class="card"><h3>'+icon("users",17)+' ديون العملاء (لنا)</h3>'+
-    '<div class="table-wrap"><table><thead><tr><th>العميل</th><th>إجمالي عليه</th><th>المسدد</th><th>المتبقي</th><th></th></tr></thead><tbody>'+custRows+'</tbody></table></div></div>';
+  return '<div class="row mb16" style="justify-content:space-between;flex-wrap:wrap;gap:10px;">'+
+      '<span class="muted small">كل ديون المحل — على العملاء، للموردين، الشخصية، وأي دين آخر — في مكان واحد.</span>'+
+      '<button class="btn btn-primary" onclick="openAddDebt()">'+icon("plus",16)+' إضافة دين</button>'+
+    '</div>'+
+    '<div class="stats">'+
+      statCard("scale","var(--primary)", fmt(sum.totalAmount), "إجمالي الديون")+
+      statCard("banknote","var(--green)", fmt(sum.totalPaid), "المدفوع")+
+      statCard("scale","var(--amber)", fmt(sum.totalRemaining), "المتبقي")+
+      statCard("scale","var(--green)", fmt(sum.toUs), "ديون لنا")+
+      statCard("scale","var(--red)", fmt(sum.onUs), "ديون علينا")+
+    '</div>'+
+    '<div class="card"><h3>'+icon("scale",17)+' سجل الديون ('+list.length+')</h3>'+
+      '<div class="table-wrap"><table><thead><tr><th>الشخص / الجهة</th><th>نوع الدين</th><th>التاريخ</th><th>إجمالي الدين</th><th>المدفوع</th><th>المتبقي</th><th>الحالة</th><th>الإجراءات</th></tr></thead>'+
+      '<tbody>'+rows+'</tbody></table></div>'+
+    '</div>';
 }
+function openAddDebt(){
+  debtDraft = { id:null, type:"customer_receivable", entityId:"", partner:"", personNameOther:"", totalAmount:"", paidAmount:"", date:todayKey(), paymentMethod:"cash", notes:"" };
+  openModal(debtModalHTML(), true);
+}
+function openDebtEdit(id){
+  var d = DB.debts.find(function(x){ return x.id===id; });
+  if(!d) return;
+  debtDraft = {
+    id: d.id, type: d.type || "other", entityId: d.entityId || "", partner: d.partner || "",
+    personNameOther: (d.entityType==="customer"||d.entityType==="supplier"||d.entityType==="partner") ? "" : (d.personName||""),
+    totalAmount: d.totalAmount, paidAmount: d.paidAmount || 0,
+    date: dayKey(d.date), paymentMethod: d.paymentMethod || "cash", notes: d.notes || ""
+  };
+  openModal(debtModalHTML(), true);
+}
+function setDebtType(t){ debtDraft.type = t; var m = $("#modal"); if(m) m.innerHTML = debtModalHTML(); }
+function debtEntityFieldHTML(){
+  if(debtDraft.type === "customer_receivable"){
+    if(!DB.customers.length) return '<div class="field full"><p class="muted small">لا يوجد عملاء بعد — أضف عميلاً أولاً من صفحة العملاء.</p></div>';
+    var opts = '<option value="">— اختر عميلاً —</option>'+DB.customers.map(function(c){ return '<option value="'+c.id+'" '+(debtDraft.entityId===c.id?"selected":"")+'>'+esc(c.name)+(c.phone?" — "+esc(c.phone):"")+'</option>'; }).join("");
+    return '<div class="field"><label>الشخص / الجهة (عميل) *</label><select id="debt-customer" onchange="debtDraft.entityId=this.value">'+opts+'</select></div>';
+  }
+  if(debtDraft.type === "supplier_payable"){
+    if(!DB.suppliers.length) return '<div class="field full"><p class="muted small">لا يوجد موردون بعد.</p></div>';
+    var opts2 = '<option value="">— اختر مورداً —</option>'+DB.suppliers.map(function(s){ return '<option value="'+s.id+'" '+(debtDraft.entityId===s.id?"selected":"")+'>'+esc(s.name)+'</option>'; }).join("");
+    return '<div class="field"><label>الشخص / الجهة (مورد) *</label><select id="debt-supplier" onchange="debtDraft.entityId=this.value">'+opts2+'</select></div>';
+  }
+  if(debtDraft.type === "partner_personal"){
+    return '<div class="field"><label>الشخص / الجهة (الحساب) *</label>'+partnerSelectHTML("debt-partner", debtDraft.partner).replace('<select ','<select onchange="debtDraft.partner=this.value" ')+'</div>';
+  }
+  return '<div class="field"><label>الشخص / الجهة *</label><input id="debt-person" value="'+esc(debtDraft.personNameOther||"")+'" placeholder="اسم الشخص أو الجهة" onchange="debtDraft.personNameOther=this.value"></div>';
+}
+function debtModalHTML(){
+  var isEdit = !!debtDraft.id;
+  var typeOpts = DEBT_TYPES.map(function(t){ return '<option value="'+t.id+'" '+(debtDraft.type===t.id?"selected":"")+'>'+t.label+'</option>'; }).join("");
+  var paidBlock = isEdit
+    ? '<div class="field"><label>المدفوع</label><input value="'+fmt(debtDraft.paidAmount||0)+'" disabled title="يُعدَّل فقط عبر إضافة دفعة"></div>'
+    : '<div class="field"><label>المدفوع</label><input id="debt-paid" type="number" min="0" step="0.5" value="'+esc(debtDraft.paidAmount)+'" oninput="onDebtAmountInput()"></div>';
+  var remaining = Math.max(0, num(debtDraft.totalAmount) - num(debtDraft.paidAmount||0));
+  return '<div class="modal-head"><h3>'+icon("scale",18)+' '+(isEdit?"تعديل دين":"إضافة دين")+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="form-grid">'+
+        '<div class="field"><label>نوع الدين *</label><select id="debt-type" onchange="setDebtType(this.value)">'+typeOpts+'</select></div>'+
+        debtEntityFieldHTML()+
+        '<div class="field"><label>المبلغ (الإجمالي) *</label><input id="debt-total" type="number" min="0" step="0.5" value="'+esc(debtDraft.totalAmount)+'" oninput="onDebtAmountInput()"></div>'+
+        paidBlock+
+        '<div class="field"><label>المتبقي</label><input id="debt-remaining" value="'+fmt(remaining)+'" disabled></div>'+
+        '<div class="field"><label>التاريخ</label><input id="debt-date" type="date" value="'+esc(debtDraft.date||todayKey())+'" onchange="debtDraft.date=this.value"></div>'+
+        '<div class="field"><label>طريقة الدفع</label><select id="debt-method" onchange="debtDraft.paymentMethod=this.value">'+
+          '<option value="cash" '+(debtDraft.paymentMethod==="cash"?"selected":"")+'>نقدي</option>'+
+          '<option value="card" '+(debtDraft.paymentMethod==="card"?"selected":"")+'>كارت</option>'+
+          '<option value="wallet" '+(debtDraft.paymentMethod==="wallet"?"selected":"")+'>محفظة</option>'+
+        '</select></div>'+
+        '<div class="field full"><label>ملاحظات</label><textarea id="debt-notes" onchange="debtDraft.notes=this.value">'+esc(debtDraft.notes||"")+'</textarea></div>'+
+      '</div>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="saveDebt()">'+icon("check",16)+' حفظ</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+    '</div>';
+}
+function onDebtAmountInput(){
+  var totalEl = $("#debt-total"), paidEl = $("#debt-paid");
+  if(totalEl) debtDraft.totalAmount = totalEl.value;
+  if(paidEl) debtDraft.paidAmount = paidEl.value;
+  var el = $("#debt-remaining");
+  if(el) el.value = fmt(Math.max(0, num(debtDraft.totalAmount)-num(debtDraft.paidAmount||0)));
+}
+async function saveDebt(){
+  var type = debtDraft.type;
+  var total = num(debtDraft.totalAmount);
+  var isEdit = !!debtDraft.id;
+  if(total <= 0){ toast("إجمالي الدين يجب أن يكون أكبر من صفر","err"); return; }
+
+  var personName = "", entityId = null, partner = null;
+  if(type === "customer_receivable"){
+    var c = DB.customers.find(function(x){ return x.id===debtDraft.entityId; });
+    if(!c){ toast("اختر العميل","err"); return; }
+    entityId = c.id; personName = c.name;
+  } else if(type === "supplier_payable"){
+    var s = DB.suppliers.find(function(x){ return x.id===debtDraft.entityId; });
+    if(!s){ toast("اختر المورد","err"); return; }
+    entityId = s.id; personName = s.name;
+  } else if(type === "partner_personal"){
+    if(!debtDraft.partner){ toast("اختر الحساب (مؤمن/عبدو)","err"); return; }
+    partner = debtDraft.partner; personName = partnerLabel(partner);
+  } else {
+    personName = (debtDraft.personNameOther||"").trim();
+    if(!personName){ toast("اسم الشخص / الجهة مطلوب","err"); return; }
+  }
+
+  var dateMs = new Date((debtDraft.date||todayKey())+"T12:00:00").getTime();
+
+  if(isEdit){
+    var existing = DB.debts.find(function(x){ return x.id===debtDraft.id; });
+    if(existing && total < (existing.paidAmount||0) - 0.004){
+      toast("لا يمكن أن يكون إجمالي الدين أقل من المبلغ المدفوع.","err"); return;
+    }
+    try{
+      var r = await api("POST", "/api/debts/" + debtDraft.id + "/edit", {
+        type: type, entityId: entityId, personName: personName, totalAmount: total,
+        date: dateMs, paymentMethod: debtDraft.paymentMethod, notes: (debtDraft.notes||"").trim(), partner: partner
+      });
+      afterSync(r);
+      closeModal(); renderViewInPlace(); toast("تم تعديل الدين");
+    }catch(e){ toast(e.message, "err"); }
+    return;
+  }
+
+  var paid = num(debtDraft.paidAmount || 0);
+  if(paid < 0){ toast("المبلغ المدفوع لا يمكن أن يكون أقل من صفر","err"); return; }
+  if(paid > total){ toast("المبلغ المدفوع لا يمكن أن يتجاوز إجمالي الدين","err"); return; }
+  var item = {
+    id: uid(), type: type, entityId: entityId, personName: personName,
+    totalAmount: total, paidAmount: paid, date: dateMs,
+    paymentMethod: debtDraft.paymentMethod, notes: (debtDraft.notes||"").trim(), partner: partner
+  };
+  try{
+    var r2 = await api("POST", "/api/debts", { item: item });
+    afterSync(r2);
+    closeModal(); renderViewInPlace(); toast("تم تسجيل الدين");
+  }catch(e){ toast(e.message, "err"); }
+}
+function openDebtDetail(id){
+  var d = DB.debts.find(function(x){ return x.id===id; });
+  if(!d) return;
+  var st = debtStatusMeta(d.status);
+  var rem = debtRemaining(d);
+  var pays = (DB.debtPayments||[]).filter(function(p){ return p.debtId===id; }).sort(function(a,b){ return (b.date||0)-(a.date||0); });
+  var payRows = pays.map(function(p, i){
+    var by = userById(p.userId);
+    return '<tr><td>'+(pays.length-i)+'</td><td>'+dateStr(p.date)+' '+timeStr(p.date)+'</td><td class="bold">'+fmt(p.amount)+'</td><td>'+payMethodLabel(p.paymentMethod)+'</td><td class="muted">'+esc(p.notes||"—")+'</td><td>'+esc(by?by.name:"—")+'</td></tr>';
+  }).join("");
+  openModal(
+    '<div class="modal-head"><h3>'+icon("scale",18)+' تفاصيل الدين — '+esc(d.personName||"—")+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="card mb16" style="background:#f8fafc;padding:12px;">'+
+        '<div class="ttl"><span>الشخص / الجهة</span><span class="bold">'+esc(d.personName||"—")+'</span></div>'+
+        '<div class="ttl"><span>نوع الدين</span><span>'+esc(debtTypeLabel(d.type))+'</span></div>'+
+        '<div class="ttl"><span>إجمالي الدين</span><span class="bold">'+fmt(d.totalAmount)+' '+esc(DB.settings.currency)+'</span></div>'+
+        '<div class="ttl"><span>المدفوع</span><span class="bold" style="color:var(--green);">'+fmt(d.paidAmount)+'</span></div>'+
+        '<div class="ttl"><span>المتبقي</span><span class="bold" style="color:'+(rem>0.005?'var(--red)':'var(--green)')+';">'+fmt(rem)+'</span></div>'+
+        '<div class="ttl"><span>الحالة</span><span><span class="badge '+st.cls+'">'+st.label+'</span></span></div>'+
+        (d.notes ? '<div class="ttl"><span>ملاحظات</span><span>'+esc(d.notes)+'</span></div>' : '')+
+      '</div>'+
+      '<div class="row mb8" style="justify-content:space-between;align-items:center;">'+
+        '<span class="bold">سجل الدفعات</span>'+
+        (rem>0.005 ? '<button class="btn btn-soft btn-sm" onclick="closeModal();openDebtPayment(\''+d.id+'\')">'+icon("plus",14)+' إضافة دفعة</button>' : '')+
+      '</div>'+
+      '<div class="table-wrap"><table><thead><tr><th>#</th><th>التاريخ</th><th>المبلغ</th><th>طريقة الدفع</th><th>الملاحظات</th><th>بواسطة</th></tr></thead>'+
+      '<tbody>'+(payRows || '<tr><td colspan="6" class="muted" style="text-align:center;padding:20px;">لا توجد دفعات مسجّلة بعد</td></tr>')+'</tbody></table></div>'+
+    '</div>'+
+    '<div class="modal-foot"><button class="btn btn-ghost" onclick="closeModal()">إغلاق</button></div>'
+  , true);
+}
+function openDebtPayment(id){
+  var d = DB.debts.find(function(x){ return x.id===id; });
+  if(!d) return;
+  var rem = debtRemaining(d);
+  if(rem <= 0.005){ toast("هذا الدين مدفوع بالكامل","warn"); return; }
+  var needsPartner = d.entityType === "partner";
+  openModal(
+    '<div class="modal-head"><h3>'+icon("banknote",18)+' إضافة دفعة — '+esc(d.personName||"—")+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="tot-row mb8"><span>المتبقي على الدين</span><b style="color:var(--red);">'+fmt(rem)+' '+esc(DB.settings.currency)+'</b></div>'+
+      '<div class="field"><label>مبلغ الدفعة *</label><input id="dpay-amount" type="number" min="0" step="0.5" value="'+rem.toFixed(2)+'"></div>'+
+      '<div class="field"><label>تاريخ الدفعة</label><input id="dpay-date" type="date" value="'+todayKey()+'"></div>'+
+      '<div class="field"><label>طريقة الدفع</label><select id="dpay-method"><option value="cash">نقدي</option><option value="card">كارت</option><option value="wallet">محفظة</option></select></div>'+
+      (needsPartner ? '<div class="field"><label>الحساب (مؤمن/عبدو) *</label>'+partnerSelectHTML("dpay-partner", d.partner||"")+'</div>' : '')+
+      '<div class="field"><label>ملاحظات</label><input id="dpay-note" placeholder="اختياري"></div>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="saveDebtPayment(\''+id+'\')">'+icon("check",16)+' تسجيل الدفعة</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+    '</div>'
+  );
+}
+function saveDebtPayment(id){
+  var d = DB.debts.find(function(x){ return x.id===id; });
+  if(!d) return;
+  var amount = num($("#dpay-amount").value);
+  if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
+  var rem = debtRemaining(d);
+  if(amount > rem + 0.004){ toast("المبلغ أكبر من المتبقي على الدين","err"); return; }
+  var needsPartner = d.entityType === "partner";
+  var partnerEl = $("#dpay-partner");
+  var partner = partnerEl ? partnerEl.value : "";
+  if(needsPartner && !partner){ toast("اختر الحساب (مؤمن/عبدو)","err"); return; }
+  api("POST", "/api/debts/" + id + "/payment", {
+    amount: amount, date: new Date(($("#dpay-date").value||todayKey())+"T12:00:00").getTime(),
+    paymentMethod: $("#dpay-method").value, notes: $("#dpay-note").value.trim(), partner: partner || null
+  }).then(function(r){
+    afterSync(r);
+    closeModal(); renderViewInPlace(); toast("تم تسجيل الدفعة");
+  }).catch(function(e){ toast(e.message, "err"); });
+}
+function deleteDebt(id){
+  var d = DB.debts.find(function(x){ return x.id===id; });
+  if(!d) return;
+  var pays = (DB.debtPayments||[]).filter(function(p){ return p.debtId===id; });
+  var msg = "حذف دين «"+(d.personName||"—")+"» بقيمة "+fmt(d.totalAmount)+"؟"+(pays.length?" سيتم حذف "+pays.length+" دفعة مرتبطة به وعكس أي حركات مالية متعلقة بها.":"");
+  confirmBox(msg, function(){
+    api("POST", "/api/debts/" + id + "/delete").then(function(r){ afterSync(r); renderViewInPlace(); toast("تم حذف الدين"); }).catch(function(e){ toast(e.message, "err"); });
+  }, true);
+}
+
+/* ---------- دفعات ديون العملاء/الموردين القديمة (رصيد آلي من فواتير البيع/الشراء) ----------
+   لسه مستخدمة من صفحة العملاء وصفحة المشتريات (اللي اتشالت من القائمة الجانبية بس
+   لسه شغالة). منفصلة تماماً عن نظام "الديون" اليدوي الجديد فوق. */
 function openCustomerPayment(cid){
   var c = DB.customers.find(function(x){ return x.id===cid; });
   if(!c) return;
