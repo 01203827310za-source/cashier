@@ -239,7 +239,10 @@ const ROUTE_PERMISSIONS = [
   { method:"POST", pattern:/^\/api\/debt-accounts\/[^/]+\/payments\/[^/]+\/delete$/, module:"debts", action:"payment" },
 
   { method:"POST", pattern:/^\/api\/transfers$/, module:"cash", action:"create" },
-  { method:"POST", pattern:/^\/api\/closings$/, module:"cash", action:"edit" }
+  { method:"POST", pattern:/^\/api\/closings$/, module:"cash", action:"edit" },
+
+  { method:"POST", pattern:/^\/api\/partners\/ledger$/, module:"partners", action:"create" },
+  { method:"POST", pattern:/^\/api\/partners\/ledger\/[^/]+\/delete$/, module:"partners", action:"delete" }
 ];
 function checkRoutePermission(user, method, url){
   const rule = ROUTE_PERMISSIONS.find(function(r){ return r.method === method && r.pattern.test(url); });
@@ -254,7 +257,7 @@ function checkRoutePermission(user, method, url){
 async function upsertPartnerLedger(tx, opts){
   if(!opts.referenceType || !opts.referenceId) return;
   await tx.partnerTransaction.deleteMany({ where: { referenceType: opts.referenceType, referenceId: opts.referenceId } });
-  if((opts.partner === "moamen" || opts.partner === "abdo") && Number(opts.amount) > 0){
+  if(normalizePartner(opts.partner) && Number(opts.amount) > 0){
     await tx.partnerTransaction.create({ data: {
       id: uid(), partner: opts.partner, type: opts.type, direction: opts.direction, amount: Number(opts.amount),
       referenceType: opts.referenceType, referenceId: opts.referenceId,
@@ -318,7 +321,17 @@ function debtStatusFromAmounts(totalAmount, paidAmount){
   if(paidAmount > 0.004) return "partial";
   return "unpaid";
 }
-const PARTNER_LABELS = { moamen: "مؤمن", abdo: "عبدو" };
+const PARTNER_LABELS = { moamen: "مؤمن", abdo: "عبدو", mido: "ميدو" };
+const PARTNER_IDS = ["moamen", "abdo", "mido"];
+// أي مكان بياخد partner من الـ body لازم يمرّ من هنا — بيرجّع القيمة نفسها لو
+// كانت واحدة من الشركاء التلاتة الحقيقيين، وإلا null (يشمل الحالة الفاضية/
+// "shared" الخاصة بمصروف/إيراد المحل المشترك اللي مش لازم يتخصم من حد بعينه).
+function normalizePartner(v){ return PARTNER_IDS.indexOf(v) !== -1 ? v : null; }
+const PARTNER_MANUAL_TYPE_LABELS = {
+  OPENING_BALANCE: "رصيد افتتاحي", MANUAL_ADD: "مبلغ مُضاف", OTHER_DUE: "مستحقات أخرى",
+  WITHDRAWAL: "مسحوبات", DEDUCTION: "خصم/تسوية", PARTNER_TRANSFER: "تحويل/تسوية خارجة"
+};
+function ledgerManualLabel(type){ return PARTNER_MANUAL_TYPE_LABELS[type] || type; }
 // نظام حسابات الأشخاص للديون: حساب واحد لكل اسم شخص (مطابقة على الاسم بعد trim،
 // case-insensitive)، تحته أي عدد من الفواتير، وتحت كل فاتورة أو الحساب مباشرة
 // أي عدد من الدفعات. مفيش نوع دين ولا اعتماد على Customer/Supplier، وكل دفعة
@@ -383,8 +396,8 @@ async function buildDebtPaymentPayload(input, remainingBefore){
   if(!input.date) throw httpError(400, "تاريخ الدفعة مطلوب");
   if(remainingBefore <= 0.004) throw httpError(400, "لا يوجد مبلغ متبقٍ لتحصيله");
   if(amount > remainingBefore + 0.004) throw httpError(400, "قيمة الدفعة أكبر من المبلغ المتبقي.");
-  const partner = input.partner === "abdo" ? "abdo" : (input.partner === "moamen" ? "moamen" : null);
-  if(!partner) throw httpError(400, "اختر الحساب (مؤمن/عبدو)");
+  const partner = normalizePartner(input.partner);
+  if(!partner) throw httpError(400, "اختر الحساب (مؤمن/عبدو/ميدو)");
   return {
     amount, date: Number(input.date), paymentMethod: input.paymentMethod || null,
     notes: (input.notes || "").trim() || null,
@@ -419,7 +432,8 @@ async function createDebtPayment(tx, opts){
     referenceId: paymentId,
     date: opts.payload.date,
     userId: opts.userId || null,
-    notes: "دفعة دين — " + (opts.personLabel || "")
+    notes: "دفعة دين — " + (opts.personLabel || ""),
+    paymentMethod: opts.payload.paymentMethod || null
   });
 
   if(opts.debtId) await recomputeDebtTotals(tx, opts.debtId);
@@ -677,7 +691,7 @@ const server = http.createServer(async function(req, res){
       }
 
       await upsertPartnerLedger(tx, { partner: "moamen", type: "SALE", direction: "in", amount: saleIn.total,
-        referenceType: "sale", referenceId: saleIn.id, date: saleIn.date, userId: user.id, notes: "بيع — " + saleIn.number });
+        referenceType: "sale", referenceId: saleIn.id, date: saleIn.date, userId: user.id, notes: "بيع — " + saleIn.number, paymentMethod: saleIn.paymentMethod || null });
 
       await tx.auditLog.create({ data: auditEntry(req, "بيع", "فاتورة " + saleIn.number + " — " + saleIn.total + " " + (settings.currency||"")) });
     }, { timeout: 30000 });
@@ -848,10 +862,10 @@ const server = http.createServer(async function(req, res){
         }});
 
         await upsertPartnerLedger(tx, { partner: "moamen", type: "RETURN", direction: "out", amount: returnedTotal,
-          referenceType: "return", referenceId: returnId, date: Date.now(), userId: user.id, notes: "استرجاع — " + number });
+          referenceType: "return", referenceId: returnId, date: Date.now(), userId: user.id, notes: "استرجاع — " + number, paymentMethod: refundMethod || null });
         if(type === "exchange" && replacementTotal > 0){
           await upsertPartnerLedger(tx, { partner: "moamen", type: "EXCHANGE_ADJUSTMENT", direction: "in", amount: replacementTotal,
-            referenceType: "return", referenceId: returnId + "-x", date: Date.now(), userId: user.id, notes: "استبدال (بديل) — " + number });
+            referenceType: "return", referenceId: returnId + "-x", date: Date.now(), userId: user.id, notes: "استبدال (بديل) — " + number, paymentMethod: refundMethod || null });
         }
 
         await tx.auditLog.create({ data: auditEntry(req, type === "exchange" ? "استبدال" : "استرجاع",
@@ -960,7 +974,7 @@ const server = http.createServer(async function(req, res){
           paymentMethod: orderIn.depositMethod || null, partner: "abdo", notes: "عربون عند إنشاء الطلب", userId: user.id, data: {}
         }});
         await upsertPartnerLedger(tx, { partner: "abdo", type: "ORDER_DEPOSIT", direction: "in", amount: deposit,
-          referenceType: "orderCollection", referenceId: collId, date: orderIn.date, userId: user.id, notes: "عربون — " + orderIn.number });
+          referenceType: "orderCollection", referenceId: collId, date: orderIn.date, userId: user.id, notes: "عربون — " + orderIn.number, paymentMethod: orderIn.depositMethod || null });
       }
 
       await tx.auditLog.create({ data: auditEntry(req, "أوردر جديد", orderIn.number + " — " + orderIn.customerName + " — " + orderIn.total + " " + (settings.currency||"")) });
@@ -1034,9 +1048,9 @@ const server = http.createServer(async function(req, res){
     }
 
     const amount = Number(b.amount);
-    const partner = b.partner === "abdo" ? "abdo" : (b.partner === "moamen" ? "moamen" : null);
+    const partner = normalizePartner(b.partner);
     if(!(amount > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
-    if(!partner){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
+    if(!partner){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو/ميدو)"}); return; }
     const byUser = await prisma.user.findUnique({ where: { id: b.byId || user.id } });
 
     const collId = uid();
@@ -1061,7 +1075,7 @@ const server = http.createServer(async function(req, res){
           paymentMethod: "cod", partner: partner, notes: "تحصيل COD", userId: user.id, data: {}
         }});
         await upsertPartnerLedger(tx, { partner, type: "ORDER_COLLECTION", direction: "in", amount,
-          referenceType: "orderCollection", referenceId: collId, date: payDate, userId: user.id, notes: "تحصيل COD — " + (fresh.number||"") });
+          referenceType: "orderCollection", referenceId: collId, date: payDate, userId: user.id, notes: "تحصيل COD — " + (fresh.number||""), paymentMethod: "cod" });
 
         await tx.auditLog.create({ data: auditEntry(req, "تحصيل COD", (fresh.number||"") + " — " + amount + " (" + (byUser?byUser.name:"") + ")") });
       }, { timeout: 30000 });
@@ -1078,9 +1092,9 @@ const server = http.createServer(async function(req, res){
     const id = url.split("/")[3];
     const b = await readBody(req);
     const amount = Number(b.amount);
-    const partner = b.partner === "abdo" ? "abdo" : (b.partner === "moamen" ? "moamen" : null);
+    const partner = normalizePartner(b.partner);
     if(!(amount > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
-    if(!partner){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
+    if(!partner){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو/ميدو)"}); return; }
     const order = await prisma.order.findUnique({ where: { id } });
     if(!order){ send(res, 404, {ok:false, error:"الطلب غير موجود"}); return; }
 
@@ -1103,7 +1117,7 @@ const server = http.createServer(async function(req, res){
           paymentMethod: b.paymentMethod || "cash", partner: partner, notes: (b.notes||"").trim() || null, userId: user.id, data: {}
         }});
         await upsertPartnerLedger(tx, { partner, type: "ORDER_COLLECTION", direction: "in", amount,
-          referenceType: "orderCollection", referenceId: collId, date: payDate, userId: user.id, notes: "تحصيل لاحق — " + (fresh.number||"") });
+          referenceType: "orderCollection", referenceId: collId, date: payDate, userId: user.id, notes: "تحصيل لاحق — " + (fresh.number||""), paymentMethod: b.paymentMethod || "cash" });
 
         await tx.auditLog.create({ data: auditEntry(req, "تحصيل دفعة أوردر", (fresh.number||"") + " — " + amount) });
       }, { timeout: 30000 });
@@ -1182,7 +1196,7 @@ const server = http.createServer(async function(req, res){
     const b = await readBody(req);
     const reqItems = Array.isArray(b.items) ? b.items : [];
     const reason = (b.reason||"").trim();
-    const refundPartner = b.refundPartner === "abdo" ? "abdo" : (b.refundPartner === "moamen" ? "moamen" : null);
+    const refundPartner = normalizePartner(b.refundPartner);
 
     if(!reqItems.length){ send(res, 400, {ok:false, error:"اختر صنفاً واحداً على الأقل للاستبدال"}); return; }
 
@@ -1258,7 +1272,7 @@ const server = http.createServer(async function(req, res){
 
         if(currentCollected > newTotal){
           refundAmount = currentCollected - newTotal;
-          if(!refundPartner) throw httpError(400, "هذا الاستبدال يترتب عليه استرداد مبلغ للعميل — اختر الحساب (مؤمن/عبدو) اللي هيتحمّل الاسترداد");
+          if(!refundPartner) throw httpError(400, "هذا الاستبدال يترتب عليه استرداد مبلغ للعميل — اختر الحساب (مؤمن/عبدو/ميدو) اللي هيتحمّل الاسترداد");
           newCollected = newTotal;
         }
         const remaining = Math.max(0, newTotal - newCollected);
@@ -1306,8 +1320,8 @@ const server = http.createServer(async function(req, res){
       if(!(Number(purchaseIn.total) > 0)){ send(res, 400, {ok:false, error:"إجمالي الفاتورة يجب أن يكون أكبر من صفر"}); return; }
     }
     const requestedInitialPaid = Math.max(0, Number(purchaseIn.paid) || 0);
-    if(requestedInitialPaid > 0 && purchaseIn.partner !== "moamen" && purchaseIn.partner !== "abdo"){
-      send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو) للدفعة المبدئية"}); return;
+    if(requestedInitialPaid > 0 && !normalizePartner(purchaseIn.partner)){
+      send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو/ميدو) للدفعة المبدئية"}); return;
     }
 
     try{
@@ -1362,7 +1376,7 @@ const server = http.createServer(async function(req, res){
             notes: "دفعة مبدئية عند إنشاء الفاتورة", userId: user.id, partner: purchaseIn.partner, data: {}
           }});
           await upsertPartnerLedger(tx, { partner: purchaseIn.partner, type: "PURCHASE_PAYMENT", direction: "out", amount: paid,
-            referenceType: "purchasePayment", referenceId: payId, date: purchaseIn.date, userId: user.id, notes: "دفعة مبدئية — " + purchaseIn.number });
+            referenceType: "purchasePayment", referenceId: payId, date: purchaseIn.date, userId: user.id, notes: "دفعة مبدئية — " + purchaseIn.number, paymentMethod: purchaseIn.paymentMethod || null });
         }
 
         await tx.auditLog.create({ data: auditEntry(req, type === "financial" ? "فاتورة مشتريات مالية" : "فاتورة شراء", purchaseIn.number + " — " + purchaseIn.supplierName + " — " + total + " " + (settings.currency||"")) });
@@ -1381,9 +1395,9 @@ const server = http.createServer(async function(req, res){
     const id = url.split("/")[3];
     const b = await readBody(req);
     const amount = Number(b.amount);
-    const partner = b.partner === "abdo" ? "abdo" : (b.partner === "moamen" ? "moamen" : null);
+    const partner = normalizePartner(b.partner);
     if(!(amount > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
-    if(!partner){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
+    if(!partner){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو/ميدو)"}); return; }
     const purchase = await prisma.purchase.findUnique({ where: { id } });
     if(!purchase){ send(res, 404, {ok:false, error:"فاتورة الشراء غير موجودة"}); return; }
 
@@ -1409,7 +1423,7 @@ const server = http.createServer(async function(req, res){
         }});
 
         await upsertPartnerLedger(tx, { partner, type: "PURCHASE_PAYMENT", direction: "out", amount,
-          referenceType: "purchasePayment", referenceId: paymentId, date: payDate, userId: user.id, notes: "دفعة على فاتورة — " + (fresh.number||"") });
+          referenceType: "purchasePayment", referenceId: paymentId, date: payDate, userId: user.id, notes: "دفعة على فاتورة — " + (fresh.number||""), paymentMethod: b.paymentMethod || "cash" });
 
         await tx.auditLog.create({ data: auditEntry(req, "دفعة على فاتورة شراء", (fresh.number||"") + " — " + amount + " (" + (fresh.supplierName||"") + ")") });
       }, { timeout: 30000 });
@@ -1671,7 +1685,7 @@ const server = http.createServer(async function(req, res){
         await upsertPartnerLedger(tx, {
           partner: payload.partner, type: "DEBT_PAYMENT", direction: "in", amount: payload.amount,
           referenceType: "debtPayment", referenceId: paymentId, date: payload.date, userId: existingPayment.userId || user.id,
-          notes: "دفعة دين (معدّلة) — " + account.name
+          notes: "دفعة دين (معدّلة) — " + account.name, paymentMethod: payload.paymentMethod || null
         });
         if(existingPayment.debtId) await recomputeDebtTotals(tx, existingPayment.debtId);
         await tx.auditLog.create({ data: auditEntry(req, "تعديل دفعة", account.name + " — " + payload.amount) });
@@ -1722,7 +1736,12 @@ const server = http.createServer(async function(req, res){
         if(dupe && dupe.id !== it.id){ send(res, 400, {ok:false, error:"كود الموديل \""+modelCode+"\" مستخدم بالفعل لمنتج آخر"}); return; }
       }
       if(g === "expenses" || g === "income"){
-        if(it.partner !== "moamen" && it.partner !== "abdo"){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
+        // partner هنا اختياري عمدًا: فاضي/غير معروف = مصروف أو إيراد "المحل / مشترك"
+        // (بيتسجل في المصاريف/الإيرادات العامة لكن من غير ما يخصم/يضاف لأي رصيد
+        // شريك شخصي — راجع upsertPartnerLedger اللي بيتجاهل partner غير الشركاء
+        // التلاتة الحقيقيين). لو اتبعتت قيمة partner لازم تكون واحدة من التلاتة.
+        if(it.partner && !normalizePartner(it.partner)){ send(res, 400, {ok:false, error:"الحساب غير صحيح — اختر مؤمن/عبدو/ميدو أو اتركه للمحل"}); return; }
+        it.partner = normalizePartner(it.partner);
       }
       // ما ينفعش حد يغيّر آخر مدير في النظام لكاشير — هيقفل صفحة المستخدمين
       // على الجميع بلا رجعة (نفس مبدأ منع حذف آخر مدير تحت).
@@ -1735,7 +1754,7 @@ const server = http.createServer(async function(req, res){
           await cfg.upsert(tx, it, isNew);
           if(g === "expenses"){
             await upsertPartnerLedger(tx, { partner: it.partner, type: "EXPENSE", direction: "out", amount: it.amount,
-              referenceType: "expense", referenceId: it.id, date: it.date, userId: it.userId || user.id, notes: it.note || null });
+              referenceType: "expense", referenceId: it.id, date: it.date, userId: it.userId || user.id, notes: it.note || null, paymentMethod: it.paymentMethod || null });
           } else if(g === "income"){
             await upsertPartnerLedger(tx, { partner: it.partner, type: "OTHER_INCOME", direction: "in", amount: it.amount,
               referenceType: "otherIncome", referenceId: it.id, date: it.date, userId: it.userId || user.id, notes: it.note || null });
@@ -1997,14 +2016,14 @@ const server = http.createServer(async function(req, res){
     const b = await readBody(req);
     const it = b.item || {};
     if(!(Number(it.amount) > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
-    if(it.partner !== "moamen" && it.partner !== "abdo"){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو)"}); return; }
+    if(!normalizePartner(it.partner)){ send(res, 400, {ok:false, error:"اختر الحساب (مؤمن/عبدو/ميدو)"}); return; }
     it.id = it.id || uid();
     it.date = Date.now();
     it.userId = user.id;
     await prisma.$transaction(async function(tx){
       await tx.paymentOut.create({ data: { id: it.id, supplierName: it.supplierName || null, amount: it.amount != null ? it.amount : null, date: new Date(it.date), userId: it.userId, partner: it.partner, data: it } });
       await upsertPartnerLedger(tx, { partner: it.partner, type: "PURCHASE_PAYMENT", direction: "out", amount: it.amount,
-        referenceType: "paymentOut", referenceId: it.id, date: it.date, userId: it.userId, notes: "دفعة للمورد — " + (it.supplierName||"") });
+        referenceType: "paymentOut", referenceId: it.id, date: it.date, userId: it.userId, notes: "دفعة للمورد — " + (it.supplierName||""), paymentMethod: it.paymentMethod || null });
       await tx.auditLog.create({ data: auditEntry(req, "دفع للمورد", it.supplierName + " — " + it.amount) });
     });
     await db.trimAuditLog();
@@ -2012,6 +2031,65 @@ const server = http.createServer(async function(req, res){
     send(res, 200, { ok:true, db: state });
     return;
   }
+  /* ---------- قيود يدوية على دفتر شريك (رصيد افتتاحي / مبلغ مُضاف / مستحقات أخرى /
+     مسحوبات / خصومات وتسويات) — تكمّل السجلات المرآة تلقائيًا (بيع/مصروف/إيراد...)
+     بحركات بتتسجل مباشرة على PartnerTransaction نفسه بدون جدول مصدر منفصل، لأنها
+     مش انعكاس لعملية في جدول تاني. الرصيد الافتتاحي حالة خاصة: صف واحد بالظبط لكل
+     شريك (upsert فعلي عبر referenceId ثابت = "opening-"+partner)، وباقي الأنواع كل
+     واحدة سجل مستقل قائم بذاته (referenceId = معرّفها هي). راجع partnerBalance()
+     بالواجهة — بتجمع كل الأنواع دي تلقائيًا لأنها مش بتفرّق بين type. */
+  const PARTNER_MANUAL_TYPES = {
+    OPENING_BALANCE: "in", MANUAL_ADD: "in", OTHER_DUE: "in",
+    WITHDRAWAL: "out", DEDUCTION: "out", PARTNER_TRANSFER: "out"
+  };
+  if(method === "POST" && url === "/api/partners/ledger"){
+    const b = await readBody(req);
+    const it = b.item || {};
+    const partner = normalizePartner(it.partner);
+    if(!partner){ send(res, 400, {ok:false, error:"اختر الشريك (مؤمن/عبدو/ميدو)"}); return; }
+    const type = Object.prototype.hasOwnProperty.call(PARTNER_MANUAL_TYPES, it.type) ? it.type : null;
+    if(!type){ send(res, 400, {ok:false, error:"نوع الحركة غير صحيح"}); return; }
+    const amount = Number(it.amount);
+    if(!(amount > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
+    const direction = PARTNER_MANUAL_TYPES[type];
+    const date = it.date ? new Date(it.date).getTime() : Date.now();
+    const notes = (it.notes || "").trim() || null;
+    const referenceType = type === "OPENING_BALANCE" ? "partnerOpening" : "partnerManual";
+    const referenceId = type === "OPENING_BALANCE" ? ("opening-" + partner) : uid();
+    try{
+      await prisma.$transaction(async function(tx){
+        await upsertPartnerLedger(tx, { partner, type, direction, amount,
+          referenceType, referenceId, date, userId: user.id, notes });
+        await tx.auditLog.create({ data: auditEntry(req, "قيد يدوي — " + ledgerManualLabel(type),
+          PARTNER_LABELS[partner] + " — " + amount + (notes ? (" — " + notes) : "")) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+  if(method === "POST" && /^\/api\/partners\/ledger\/[^/]+\/delete$/.test(url)){
+    const id = url.split("/")[4];
+    const existing = await prisma.partnerTransaction.findUnique({ where: { id } });
+    if(!existing){ send(res, 404, {ok:false, error:"الحركة غير موجودة"}); return; }
+    if(existing.referenceType !== "partnerManual" && existing.referenceType !== "partnerOpening"){
+      send(res, 400, {ok:false, error:"هذه الحركة مرتبطة بعملية أخرى في النظام ولا يمكن حذفها من هنا"}); return;
+    }
+    await prisma.$transaction(async function(tx){
+      await tx.partnerTransaction.delete({ where: { id } });
+      await tx.auditLog.create({ data: auditEntry(req, "حذف قيد يدوي — " + ledgerManualLabel(existing.type),
+        PARTNER_LABELS[existing.partner] + " — " + existing.amount) });
+    }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+
   if(method === "POST" && url === "/api/transfers"){
     const b = await readBody(req);
     const it = b.item || {};
