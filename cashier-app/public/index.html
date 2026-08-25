@@ -679,19 +679,25 @@ function partnerBalance(pid){
 // تفصيل الرصيد الحالي لشريك مبني بالكامل على PartnerTransaction الحقيقية —
 // نفس مصدر partnerBalance() بالظبط، بس مقسّم لبنود حسب النوع عشان يتعرض في
 // "تفاصيل الرصيد". كل بند فيه transactions عشان لو المستخدم ضغط عليه.
+// direction (اختياري): بتقيّد البند على اتجاه معين من نفس الـ type — لازمة لـ
+// PARTNER_TRANSFER لأنه النوع الوحيد اللي ممكن يكون "in" لشريك و"out" لشريك
+// تاني في نفس الوقت (تحويل واحد بين اتنين)، فمينفعش يتحدد ببند واحد زي باقي
+// الأنواع اللي دايمًا اتجاه ثابت.
 var PARTNER_BALANCE_SECTIONS = [
   { key:"opening", label:"الرصيد الافتتاحي", types:["OPENING_BALANCE"], sign:1 },
   { key:"additions", label:"المبالغ المضافة", types:["MANUAL_ADD"], sign:1 },
   { key:"revenue", label:"الإيرادات", types:["SALE","OTHER_INCOME"], sign:1 },
   { key:"otherDue", label:"مستحقات أخرى", types:["ORDER_DEPOSIT","ORDER_COLLECTION","DEBT_PAYMENT","EXCHANGE_ADJUSTMENT","OTHER_DUE"], sign:1 },
+  { key:"transfersIn", label:"التحويلات الواردة", types:["PARTNER_TRANSFER"], direction:"in", sign:1 },
   { key:"expenses", label:"المصروفات", types:["EXPENSE"], sign:-1 },
   { key:"withdrawals", label:"المسحوبات", types:["WITHDRAWAL"], sign:-1 },
-  { key:"deductions", label:"الخصومات والتسويات", types:["DEDUCTION","PARTNER_TRANSFER","PURCHASE_PAYMENT","RETURN"], sign:-1 }
+  { key:"transfersOut", label:"التحويلات الصادرة", types:["PARTNER_TRANSFER"], direction:"out", sign:-1 },
+  { key:"deductions", label:"التسويات", types:["DEDUCTION","PURCHASE_PAYMENT","RETURN"], sign:-1 }
 ];
 function partnerBalanceBreakdown(pid){
   var list = (DB.partnerTransactions||[]).filter(function(t){ return t.partner === pid; });
   var sections = PARTNER_BALANCE_SECTIONS.map(function(sec){
-    var items = list.filter(function(t){ return sec.types.indexOf(t.type) !== -1; });
+    var items = list.filter(function(t){ return sec.types.indexOf(t.type) !== -1 && (!sec.direction || t.direction===sec.direction); });
     var total = items.reduce(function(a,t){ return a + (t.direction==="in" ? (t.amount||0) : -(t.amount||0)); }, 0);
     return { key:sec.key, label:sec.label, sign:sec.sign, items:items.sort(function(a,b){ return b.date-a.date; }), total: total };
   });
@@ -5247,20 +5253,33 @@ var LEDGER_TYPE_LABELS = {
   SALE:"بيع POS", ORDER_DEPOSIT:"عربون طلب", ORDER_COLLECTION:"تحصيل طلب", PURCHASE_PAYMENT:"دفعة مورد",
   EXPENSE:"مصروف", OTHER_INCOME:"إيراد آخر", RETURN:"استرجاع", EXCHANGE_ADJUSTMENT:"فرق استبدال", DEBT_PAYMENT:"تحصيل دين",
   OPENING_BALANCE:"رصيد افتتاحي", MANUAL_ADD:"مبلغ مُضاف", OTHER_DUE:"مستحقات أخرى", WITHDRAWAL:"مسحوبات",
-  DEDUCTION:"خصم/تسوية", PARTNER_TRANSFER:"تحويل/تسوية خارجة"
+  DEDUCTION:"خصم/تسوية", PARTNER_TRANSFER:"تحويل بين الشركاء"
 };
 function ledgerTypeLabel(t){ return LEDGER_TYPE_LABELS[t] || t; }
 function ledgerTypeBadge(t){
   var map = { SALE:"badge-green", ORDER_DEPOSIT:"badge-blue", ORDER_COLLECTION:"badge-blue", PURCHASE_PAYMENT:"badge-amber",
     EXPENSE:"badge-red", OTHER_INCOME:"badge-green", RETURN:"badge-red", EXCHANGE_ADJUSTMENT:"badge-purple", DEBT_PAYMENT:"badge-green",
     OPENING_BALANCE:"badge-blue", MANUAL_ADD:"badge-green", OTHER_DUE:"badge-blue", WITHDRAWAL:"badge-red",
-    DEDUCTION:"badge-red", PARTNER_TRANSFER:"badge-gray" };
+    DEDUCTION:"badge-red", PARTNER_TRANSFER:"badge-purple" };
   return map[t] || "badge-gray";
 }
 var LEDGER_SOURCE_LABELS = { sale:"بيع POS", return:"استرجاع/استبدال", orderCollection:"طلب شحن", purchasePayment:"مشتريات",
   expense:"مصروف", otherIncome:"إيراد آخر", paymentOut:"دفعة مورد", debtPayment:"دفعة دين", orderExchange:"استبدال أوردر",
-  partnerManual:"قيد يدوي", partnerOpening:"رصيد افتتاحي" };
+  partnerManual:"قيد يدوي", partnerOpening:"رصيد افتتاحي", partnerTransfer:"تحويل بين الشركاء" };
 function ledgerSourceLabel(rt){ return LEDGER_SOURCE_LABELS[rt] || (rt||"—"); }
+// نص "من → إلى" الواضح المطلوب لعرض عملية تحويل بين الشركاء (كل قيد فيه طرفين
+// محفوظين في data وقت الإنشاء — راجع /api/partners/transfer في السيرفر).
+function partnerTransferLabel(t){
+  var d = t.data || {};
+  if(!d.fromPartner || !d.toPartner) return t.notes || ledgerTypeLabel(t.type);
+  return "تحويل بين الشركاء: " + partnerLabel(d.fromPartner) + " → " + partnerLabel(d.toPartner) + " | " + fmt(t.amount) + " " + DB.settings.currency;
+}
+// معرّف التحويل المنطقي الواحد من أي طرف من طرفيه (القيد الصادر referenceId
+// هو نفسه، والوارد referenceId+"-in") — عشان التعديل/الحذف يشتغلوا على
+// العمليتين مع بعض دايمًا مهما ضغط المستخدم على أي طرف من الاتنين.
+function partnerTransferBaseId(referenceId){
+  return (referenceId||"").replace(/-in$/, "");
+}
 function partnersLedgerWithBalance(){
   var running = {};
   PARTNERS.forEach(function(p){ running[p.id] = 0; });
@@ -5292,9 +5311,10 @@ function viewPartners(){
     PARTNERS.map(function(p){ return '<option value="'+p.id+'" '+(partnersFilter===p.id?"selected":"")+'>'+p.label+'</option>'; }).join("");
 
   var rows = list.map(function(t){
+    var isTransfer = t.type === "PARTNER_TRANSFER";
     return '<tr><td>'+dateStr(t.date)+' '+timeStr(t.date)+'</td>'+
       '<td><span class="badge '+ledgerTypeBadge(t.type)+'">'+esc(ledgerTypeLabel(t.type))+'</span> <span class="small muted">'+esc(partnerLabel(t.partner))+'</span></td>'+
-      '<td class="muted">'+esc(t.notes||"—")+'</td>'+
+      '<td class="muted">'+(isTransfer ? esc(partnerTransferLabel(t)) : esc(t.notes||"—"))+'</td>'+
       '<td class="bold" style="color:var(--green);">'+(t.direction==="in"?fmt(t.amount):"—")+'</td>'+
       '<td class="bold" style="color:var(--red);">'+(t.direction==="out"?fmt(t.amount):"—")+'</td>'+
       '<td class="bold">'+fmt(t.balanceAfter)+'</td>'+
@@ -5318,6 +5338,7 @@ function viewPartners(){
     '<input type="date" value="'+partnersFrom+'" onchange="setPartnersFrom(this.value)">'+
     '<input type="date" value="'+partnersTo+'" onchange="setPartnersTo(this.value)">'+
     ((partnersFrom||partnersTo||partnersFilter!=="all"||partnersTypeFilter!=="all") ? '<button class="btn btn-ghost" onclick="partnersFrom=\'\';partnersTo=\'\';partnersFilter=\'all\';partnersTypeFilter=\'all\';renderViewInPlace()">مسح الفلترة</button>' : '')+
+    (can("partners","create") ? '<button class="btn btn-primary" onclick="openPartnerTransferForm()">'+icon("banknote",16)+' تحويل بين الشركاء</button>' : '')+
   '</div>'+
   '<div class="stats mb16" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));">'+partnerCards+'</div>'+
   '<div class="stats mb16">'+
@@ -5330,16 +5351,24 @@ function viewPartners(){
 }
 
 /* ---------- تفاصيل رصيد شريك (مبنية بالكامل من PartnerTransaction الحقيقية) ---------- */
-function partnerLedgerRowHTML(t){
+function partnerLedgerRowHTML(t, pid){
+  var isTransfer = t.type === "PARTNER_TRANSFER";
+  var actions = "";
+  if((t.referenceType==="partnerManual"||t.referenceType==="partnerOpening") && can("partners","delete")){
+    actions = '<button class="icon-btn danger" title="حذف القيد" onclick="deletePartnerManualEntry(\''+t.id+'\',\''+t.partner+'\')">'+icon("trash",14)+'</button>';
+  } else if(t.referenceType==="partnerTransfer"){
+    var baseId = partnerTransferBaseId(t.referenceId);
+    actions = (can("partners","create") ? '<button class="icon-btn primary" title="تعديل التحويل" onclick="openPartnerTransferForm(null,\''+baseId+'\')">'+icon("edit",14)+'</button>' : '') +
+      (can("partners","delete") ? '<button class="icon-btn danger" title="حذف التحويل" onclick="deletePartnerTransfer(\''+baseId+'\',\''+(pid||t.partner)+'\')">'+icon("trash",14)+'</button>' : '');
+  }
   return '<tr><td>'+dateStr(t.date)+' '+timeStr(t.date)+'</td>'+
     '<td><span class="badge '+ledgerTypeBadge(t.type)+'">'+esc(ledgerTypeLabel(t.type))+'</span></td>'+
-    '<td class="muted">'+esc(t.notes||"—")+'</td>'+
+    '<td class="muted">'+(isTransfer ? esc(partnerTransferLabel(t)) : esc(t.notes||"—"))+'</td>'+
     '<td class="bold" style="color:'+(t.direction==="in"?"var(--green)":"var(--red)")+';">'+(t.direction==="in"?"+":"-")+fmt(t.amount)+'</td>'+
     '<td>'+esc(t.data&&t.data.paymentMethod?payMethodLabel(t.data.paymentMethod):"—")+'</td>'+
     '<td>'+esc(ledgerSourceLabel(t.referenceType))+(t.referenceId?(' <span class="muted small" dir="ltr">#'+esc(String(t.referenceId).slice(-6))+'</span>'):'')+'</td>'+
     '<td>'+esc(userById(t.userId)?userById(t.userId).name:"—")+'</td>'+
-    '<td>'+((t.referenceType==="partnerManual"||t.referenceType==="partnerOpening") && can("partners","delete") ?
-      '<button class="icon-btn danger" title="حذف القيد" onclick="deletePartnerManualEntry(\''+t.id+'\',\''+t.partner+'\')">'+icon("trash",14)+'</button>' : '')+'</td>'+
+    '<td>'+actions+'</td>'+
   '</tr>';
 }
 // نافذة تفصيل بند واحد من تفاصيل الرصيد — كل العمليات اللي كوّنت رقم البند ده
@@ -5348,7 +5377,7 @@ function openPartnerCategoryDetail(pid, key){
   var b = partnerBalanceBreakdown(pid);
   var sec = b.sections.find(function(s){ return s.key===key; });
   if(!sec) return;
-  var rows = sec.items.map(partnerLedgerRowHTML).join("");
+  var rows = sec.items.map(function(t){ return partnerLedgerRowHTML(t, pid); }).join("");
   openModal(
     '<div class="modal-head"><h3>'+esc(sec.label)+' — '+esc(partnerLabel(pid))+'</h3><button class="icon-btn" onclick="openPartnerBalanceDetail(\''+pid+'\')">'+icon("x",20)+'</button></div>'+
     '<div class="modal-body">'+
@@ -5375,6 +5404,7 @@ function openPartnerBalanceDetail(pid){
       '<button class="btn btn-soft btn-sm" onclick="openPartnerManualEntryForm(\''+pid+'\',\'OTHER_DUE\')">مستحقات أخرى</button>'+
       '<button class="btn btn-soft-red btn-sm" onclick="openPartnerManualEntryForm(\''+pid+'\',\'WITHDRAWAL\')">تسجيل مسحوبات</button>'+
       '<button class="btn btn-soft-red btn-sm" onclick="openPartnerManualEntryForm(\''+pid+'\',\'DEDUCTION\')">خصم/تسوية</button>'+
+      '<button class="btn btn-soft btn-sm" onclick="openPartnerTransferForm(\''+pid+'\')">'+icon("banknote",14)+' تحويل لشريك آخر</button>'+
     '</div>' : '';
   openModal(
     '<div class="modal-head"><h3>'+icon("card",18)+' تفاصيل الرصيد — '+esc(partnerLabel(pid))+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
@@ -5429,6 +5459,68 @@ function deletePartnerManualEntry(id, pid){
       afterSync(r);
       toast("تم الحذف");
       openPartnerBalanceDetail(pid);
+    }).catch(function(e){ toast(e.message, "err"); });
+  }, true);
+}
+// ---------- تحويل بين الشركاء (قيدين مرتبطين — صادر من طرف ووارد للتاني، دايمًا
+// مع بعض في نفس المعاملة على السيرفر) — راجع /api/partners/transfer.
+// fromPid: تعبئة مبدئية لحقل "من" لو اتفتحت النافذة من كارت شريك بعينه.
+// editBaseId: لو موجود، بيفتح النموذج في وضع تعديل تحويل قائم (بياخد بياناته
+// من القيد "الصادر" اللي referenceId بتاعه = editBaseId).
+function openPartnerTransferForm(fromPid, editBaseId){
+  var editing = editBaseId ? (DB.partnerTransactions||[]).find(function(t){ return t.referenceType==="partnerTransfer" && t.referenceId===editBaseId && t.direction==="out"; }) : null;
+  var d = editing ? (editing.data||{}) : {};
+  var from = editing ? (d.fromPartner||editing.partner) : (fromPid||"");
+  var to = editing ? (d.toPartner||"") : "";
+  var amount = editing ? editing.amount : "";
+  var dateVal = editing ? dayKey(editing.date) : todayKey();
+  var notes = editing ? (d.description!=null ? d.description : (editing.notes||"")) : "";
+  function opts(sel){ return '<option value="">اختر...</option>' + PARTNERS.map(function(p){ return '<option value="'+p.id+'"'+(sel===p.id?' selected':'')+'>'+p.label+'</option>'; }).join(''); }
+  openModal(
+    '<div class="modal-head"><h3>'+icon("banknote",18)+' '+(editing?"تعديل تحويل بين الشركاء":"تحويل بين الشركاء")+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="form-grid">'+
+        '<div class="field"><label>من (الشريك المُرسِل) *</label><select id="pt-from">'+opts(from)+'</select></div>'+
+        '<div class="field"><label>إلى (الشريك المُستلِم) *</label><select id="pt-to">'+opts(to)+'</select></div>'+
+        '<div class="field"><label>المبلغ *</label><input id="pt-amount" type="number" min="0" step="0.5" value="'+(amount||"")+'"></div>'+
+        '<div class="field"><label>التاريخ</label><input id="pt-date" type="date" value="'+dateVal+'"></div>'+
+        '<div class="field full"><label>وصف/ملاحظات</label><input id="pt-notes" value="'+esc(notes)+'" placeholder="اختياري"></div>'+
+      '</div>'+
+      '<p class="muted small mt8">هيتم خصم المبلغ من رصيد المُرسِل وإضافته لرصيد المُستلِم — إجمالي أرصدة الشركاء مايتغيرش، ومش بيُحتسب كإيراد أو مصروف في التقارير المالية.</p>'+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="savePartnerTransfer('+(editing?('\''+editBaseId+'\''):'null')+')">حفظ</button>'+
+      '<button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>'+
+    '</div>',
+    true
+  );
+}
+function savePartnerTransfer(id){
+  var from = $("#pt-from").value;
+  var to = $("#pt-to").value;
+  var amount = num($("#pt-amount").value);
+  if(!from || !to){ toast("اختر الشريك المُرسِل والمُستلِم","err"); return; }
+  if(from === to){ toast("لا يمكن التحويل لنفس الشريك","err"); return; }
+  if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
+  var item = {
+    id: id || uid(), fromPartner: from, toPartner: to, amount: amount,
+    date: new Date(($("#pt-date").value||todayKey())+"T12:00:00").getTime(),
+    description: $("#pt-notes").value.trim()
+  };
+  api("POST", "/api/partners/transfer", { item: item }).then(function(r){
+    afterSync(r);
+    closeModal();
+    renderViewInPlace();
+    toast(id ? "تم تعديل التحويل" : "تم تسجيل التحويل");
+  }).catch(function(e){ toast(e.message, "err"); });
+}
+function deletePartnerTransfer(baseId){
+  confirmBox("حذف هذا التحويل؟ سيتم عكس أثره على رصيد الطرفين فوراً.", function(){
+    api("POST", "/api/partners/transfer/" + baseId + "/delete").then(function(r){
+      afterSync(r);
+      closeModal();
+      renderViewInPlace();
+      toast("تم حذف التحويل");
     }).catch(function(e){ toast(e.message, "err"); });
   }, true);
 }
