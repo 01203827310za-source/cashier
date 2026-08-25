@@ -898,7 +898,10 @@ function payOutPaidBy(p){ return p.paidBy || p.userId; }
 function payInReceivedBy(p){ return p.receivedBy || p.userId; }
 function incomeReceivedBy(i){ return i.receivedBy || i.userId; }
 
-/* الرصيد الجاري لكل شخص (كل الفلوس اللي معاه) */
+/* الرصيد الجاري لكل شخص (كل الفلوس اللي معاه) — لازم يشمل نفس بنود dayMovements
+   بالظبط (بما فيها أثر الاسترجاع/الاستبدال النقدي) وإلا الرصيد التراكمي
+   (كل التاريخ) ميطابقش مجموع "الصافي" اليومي، ويظهر رقم أعلى من الحقيقي بمقدار
+   أي مبالغ استرجاع/استبدال نقدي كان المفروض تتخصم. */
 function userCashBalance(userId){
   var b = 0;
   activeSalesList(DB.sales).forEach(function(s){ if(s.paymentMethod==="cash" && saleCashBy(s)===userId) b += s.total; });
@@ -908,6 +911,11 @@ function userCashBalance(userId){
   (DB.transfers||[]).forEach(function(t){ if(t.toId===userId) b += t.amount; if(t.fromId===userId) b -= t.amount; });
   DB.expenses.forEach(function(e){ if(e.paymentMethod==="cash" && expensePaidBy(e)===userId) b -= e.amount; });
   (DB.paymentsOut||[]).forEach(function(p){ if((p.paymentMethod||"cash")==="cash" && payOutPaidBy(p)===userId) b -= p.amount; });
+  (DB.returns||[]).forEach(function(r){
+    if(isReturnCancelled(r) || r.refundMethod !== "cash" || r.userId !== userId) return;
+    if(r.type === "exchange") b += (r.difference||0); // العميل دفع فرق كاش زيادة (+) أو المحل رجّع فرق (-)
+    else b -= (r.returnedTotal||0);
+  });
   return b;
 }
 /* حركات شخص في يوم معين */
