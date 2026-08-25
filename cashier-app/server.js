@@ -242,7 +242,9 @@ const ROUTE_PERMISSIONS = [
   { method:"POST", pattern:/^\/api\/closings$/, module:"cash", action:"edit" },
 
   { method:"POST", pattern:/^\/api\/partners\/ledger$/, module:"partners", action:"create" },
-  { method:"POST", pattern:/^\/api\/partners\/ledger\/[^/]+\/delete$/, module:"partners", action:"delete" }
+  { method:"POST", pattern:/^\/api\/partners\/ledger\/[^/]+\/delete$/, module:"partners", action:"delete" },
+  { method:"POST", pattern:/^\/api\/partners\/transfer$/, module:"partners", action:"create" },
+  { method:"POST", pattern:/^\/api\/partners\/transfer\/[^/]+\/delete$/, module:"partners", action:"delete" }
 ];
 function checkRoutePermission(user, method, url){
   const rule = ROUTE_PERMISSIONS.find(function(r){ return r.method === method && r.pattern.test(url); });
@@ -329,7 +331,7 @@ const PARTNER_IDS = ["moamen", "abdo", "mido"];
 function normalizePartner(v){ return PARTNER_IDS.indexOf(v) !== -1 ? v : null; }
 const PARTNER_MANUAL_TYPE_LABELS = {
   OPENING_BALANCE: "رصيد افتتاحي", MANUAL_ADD: "مبلغ مُضاف", OTHER_DUE: "مستحقات أخرى",
-  WITHDRAWAL: "مسحوبات", DEDUCTION: "خصم/تسوية", PARTNER_TRANSFER: "تحويل/تسوية خارجة"
+  WITHDRAWAL: "مسحوبات", DEDUCTION: "خصم/تسوية"
 };
 function ledgerManualLabel(type){ return PARTNER_MANUAL_TYPE_LABELS[type] || type; }
 // نظام حسابات الأشخاص للديون: حساب واحد لكل اسم شخص (مطابقة على الاسم بعد trim،
@@ -2038,9 +2040,12 @@ const server = http.createServer(async function(req, res){
      شريك (upsert فعلي عبر referenceId ثابت = "opening-"+partner)، وباقي الأنواع كل
      واحدة سجل مستقل قائم بذاته (referenceId = معرّفها هي). راجع partnerBalance()
      بالواجهة — بتجمع كل الأنواع دي تلقائيًا لأنها مش بتفرّق بين type. */
+  // PARTNER_TRANSFER عمدًا مش موجود هنا — تحويل بين شريكين لازم يكون قيدين
+  // مرتبطين (صادر من واحد ووارد للتاني) مع بعض في نفس المعاملة، مش قيد واحد
+  // بجانب واحد زي باقي الأنواع دي. راجع /api/partners/transfer تحت.
   const PARTNER_MANUAL_TYPES = {
     OPENING_BALANCE: "in", MANUAL_ADD: "in", OTHER_DUE: "in",
-    WITHDRAWAL: "out", DEDUCTION: "out", PARTNER_TRANSFER: "out"
+    WITHDRAWAL: "out", DEDUCTION: "out"
   };
   if(method === "POST" && url === "/api/partners/ledger"){
     const b = await readBody(req);
@@ -2083,6 +2088,64 @@ const server = http.createServer(async function(req, res){
       await tx.partnerTransaction.delete({ where: { id } });
       await tx.auditLog.create({ data: auditEntry(req, "حذف قيد يدوي — " + ledgerManualLabel(existing.type),
         PARTNER_LABELS[existing.partner] + " — " + existing.amount) });
+    }, { timeout: 30000 });
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+
+  /* ---------- تحويل بين الشركاء — قيدين مرتبطين (صادر من طرف ووارد للتاني) بمعرّف
+     منطقي واحد: القيد الصادر referenceId = id نفسه، والوارد referenceId = id+"-in"
+     (نفس مبدأ RETURN/EXCHANGE_ADJUSTMENT — "id"/"id-x"). الاتنين بيتسجلوا مع بعض
+     جوه نفس الـ$transaction، وupsertPartnerLedger بيحذف-ثم-يعيد الإنشاء بنفس
+     referenceId في كل تعديل — يعني التعديل بيعكس الأثر القديم قبل ما يطبّق الجديد
+     تلقائيًا، ومفيش قيد يتيتم أو يتكرر. مش قيد Expense/OtherIncome ولا بيتلمس منهم،
+     فمش بيدخل في أي حساب إيراد/مصروف عام (viewFinance/viewReports). إجمالي أرصدة
+     الشركاء بيفضل ثابت دايمًا: نفس المبلغ "out" عند طرف و"in" عند التاني بالظبط. */
+  if(method === "POST" && url === "/api/partners/transfer"){
+    const b = await readBody(req);
+    const it = b.item || {};
+    const fromPartner = normalizePartner(it.fromPartner);
+    const toPartner = normalizePartner(it.toPartner);
+    if(!fromPartner || !toPartner){ send(res, 400, {ok:false, error:"اختر الشريك المُرسِل والمُستلِم (مؤمن/عبدو/ميدو)"}); return; }
+    if(fromPartner === toPartner){ send(res, 400, {ok:false, error:"لا يمكن التحويل لنفس الشريك"}); return; }
+    const amount = Number(it.amount);
+    if(!(amount > 0)){ send(res, 400, {ok:false, error:"أدخل مبلغاً صحيحاً"}); return; }
+    const date = it.date ? new Date(it.date).getTime() : Date.now();
+    const description = (it.description || "").trim() || null;
+    const id = (it.id || uid()).toString();
+    const notes = "تحويل بين الشركاء: " + PARTNER_LABELS[fromPartner] + " → " + PARTNER_LABELS[toPartner] + (description ? (" — " + description) : "");
+    try{
+      await prisma.$transaction(async function(tx){
+        await upsertPartnerLedger(tx, { partner: fromPartner, type: "PARTNER_TRANSFER", direction: "out", amount,
+          referenceType: "partnerTransfer", referenceId: id, date, userId: user.id, notes,
+          fromPartner, toPartner, description });
+        await upsertPartnerLedger(tx, { partner: toPartner, type: "PARTNER_TRANSFER", direction: "in", amount,
+          referenceType: "partnerTransfer", referenceId: id + "-in", date, userId: user.id, notes,
+          fromPartner, toPartner, description });
+        await tx.auditLog.create({ data: auditEntry(req, "تحويل بين الشركاء",
+          PARTNER_LABELS[fromPartner] + " → " + PARTNER_LABELS[toPartner] + " — " + amount) });
+      }, { timeout: 30000 });
+    }catch(err){
+      if(err && err.httpStatus){ send(res, err.httpStatus, { ok:false, error: err.message }); return; }
+      throw err;
+    }
+    await db.trimAuditLog();
+    const state = await db.buildStateFromDB();
+    send(res, 200, { ok:true, db: state });
+    return;
+  }
+  if(method === "POST" && /^\/api\/partners\/transfer\/[^/]+\/delete$/.test(url)){
+    const rawId = url.split("/")[4];
+    const id = rawId.replace(/-in$/, "");
+    const rows = await prisma.partnerTransaction.findMany({ where: { referenceType: "partnerTransfer", referenceId: { in: [id, id + "-in"] } } });
+    if(!rows.length){ send(res, 404, {ok:false, error:"التحويل غير موجود"}); return; }
+    const out = rows.find(function(r){ return r.direction === "out"; }) || rows[0];
+    await prisma.$transaction(async function(tx){
+      await tx.partnerTransaction.deleteMany({ where: { referenceType: "partnerTransfer", referenceId: { in: [id, id + "-in"] } } });
+      await tx.auditLog.create({ data: auditEntry(req, "حذف تحويل بين الشركاء",
+        PARTNER_LABELS[out.partner] + " — " + out.amount) });
     }, { timeout: 30000 });
     await db.trimAuditLog();
     const state = await db.buildStateFromDB();
