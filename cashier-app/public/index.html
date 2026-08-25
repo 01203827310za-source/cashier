@@ -662,16 +662,41 @@ function migrateDB(){
 }
 
 /* ---------- حسابات الشركاء (مؤمن/عبدو) ---------- */
-var PARTNERS = [ {id:"moamen", label:"مؤمن"}, {id:"abdo", label:"عبدو"} ];
+var PARTNERS = [ {id:"moamen", label:"مؤمن"}, {id:"abdo", label:"عبدو"}, {id:"mido", label:"ميدو"} ];
 function partnerLabel(id){ var p = PARTNERS.find(function(x){ return x.id === id; }); return p ? p.label : (id || "—"); }
-function partnerSelectHTML(id, val){
-  return '<select id="'+id+'"><option value="">اختر الحساب...</option>' +
+// includeShared: يضيف اختيار "المحل / مشترك" (قيمته فاضية) — لمصروف/إيراد عام
+// مش خاص بشريك بعينه، مش هيتخصم/يتضاف من رصيد حد (راجع upsertPartnerLedger).
+function partnerSelectHTML(id, val, includeShared){
+  return '<select id="'+id+'"><option value="">'+(includeShared?"اختر الحساب...":"اختر الحساب...")+'</option>' +
     PARTNERS.map(function(p){ return '<option value="'+p.id+'"'+(val===p.id?' selected':'')+'>'+p.label+'</option>'; }).join('') +
+    (includeShared ? '<option value="shared"'+(val==="shared"?' selected':'')+'>المحل / مشترك (لا يخصم من رصيد شخصي)</option>' : '') +
     '</select>';
 }
 function partnerBalance(pid){
   return (DB.partnerTransactions||[]).filter(function(t){ return t.partner === pid; })
     .reduce(function(a,t){ return a + (t.direction==="in" ? (t.amount||0) : -(t.amount||0)); }, 0);
+}
+// تفصيل الرصيد الحالي لشريك مبني بالكامل على PartnerTransaction الحقيقية —
+// نفس مصدر partnerBalance() بالظبط، بس مقسّم لبنود حسب النوع عشان يتعرض في
+// "تفاصيل الرصيد". كل بند فيه transactions عشان لو المستخدم ضغط عليه.
+var PARTNER_BALANCE_SECTIONS = [
+  { key:"opening", label:"الرصيد الافتتاحي", types:["OPENING_BALANCE"], sign:1 },
+  { key:"additions", label:"المبالغ المضافة", types:["MANUAL_ADD"], sign:1 },
+  { key:"revenue", label:"الإيرادات", types:["SALE","OTHER_INCOME"], sign:1 },
+  { key:"otherDue", label:"مستحقات أخرى", types:["ORDER_DEPOSIT","ORDER_COLLECTION","DEBT_PAYMENT","EXCHANGE_ADJUSTMENT","OTHER_DUE"], sign:1 },
+  { key:"expenses", label:"المصروفات", types:["EXPENSE"], sign:-1 },
+  { key:"withdrawals", label:"المسحوبات", types:["WITHDRAWAL"], sign:-1 },
+  { key:"deductions", label:"الخصومات والتسويات", types:["DEDUCTION","PARTNER_TRANSFER","PURCHASE_PAYMENT","RETURN"], sign:-1 }
+];
+function partnerBalanceBreakdown(pid){
+  var list = (DB.partnerTransactions||[]).filter(function(t){ return t.partner === pid; });
+  var sections = PARTNER_BALANCE_SECTIONS.map(function(sec){
+    var items = list.filter(function(t){ return sec.types.indexOf(t.type) !== -1; });
+    var total = items.reduce(function(a,t){ return a + (t.direction==="in" ? (t.amount||0) : -(t.amount||0)); }, 0);
+    return { key:sec.key, label:sec.label, sign:sec.sign, items:items.sort(function(a,b){ return b.date-a.date; }), total: total };
+  });
+  var balance = sections.reduce(function(a,s){ return a+s.total; }, 0);
+  return { sections: sections, balance: balance };
 }
 
 /* ---------- الحالة العامة ---------- */
@@ -967,7 +992,7 @@ var PERMISSION_MODULES = [
   { id:"finance", label:"الحسابات (أرباح/خسائر)", actions:[
     {id:"view",label:"عرض"},{id:"create",label:"إضافة"},{id:"edit",label:"تعديل"},{id:"delete",label:"حذف"}
   ]},
-  { id:"partners", label:"حسابات الشركاء", actions:[{id:"view",label:"عرض"}] },
+  { id:"partners", label:"حسابات الشركاء", actions:[{id:"view",label:"عرض"},{id:"create",label:"إضافة قيد يدوي"},{id:"delete",label:"حذف قيد يدوي"}] },
   { id:"assets", label:"الأصول والديون", actions:[{id:"view",label:"عرض"}] },
   { id:"reports", label:"التقارير", actions:[{id:"view",label:"عرض"}] },
   { id:"audit", label:"سجل الحركات", actions:[{id:"view",label:"عرض"}] },
@@ -1264,6 +1289,7 @@ function viewDashboard(){
       '<div class="stats mb16">'+
         statCard("card","var(--primary)", fmt(partnerBalance("moamen")), "رصيد مؤمن")+
         statCard("card","#0891b2", fmt(partnerBalance("abdo")), "رصيد عبدو")+
+        statCard("card","#a855f7", fmt(partnerBalance("mido")), "رصيد ميدو")+
       '</div>'+
       '<div class="stats">'+
         statCard("chart","var(--green)", fmt(totalIncome), "إجمالي الإيرادات")+
@@ -1676,12 +1702,82 @@ function receiptHTML(sale){
     '<div class="barcode">*'+esc(sale.number)+'*</div>'+
   '</div>';
 }
+// الفاتورة "الفعلية" بعد احتساب أي مرتجعات نشطة عليها — من غير ما نلمس صفوف
+// Sale/SaleItem الأصلية في قاعدة البيانات ولا نحذف أي بيانات (نفس مصدر
+// saleReturnedTotal/saleItemReturnedQty بالظبط، فمفيش رقمين مختلفين لنفس الفاتورة
+// في أي مكان بالنظام). الخصم الفعلي بيتحسب عكسيًا من الصافي عشان يفضل
+// effectiveSubtotal - effectiveDiscount === effectiveTotal بالظبط زي ما مطلوب
+// (الإجمالي النهائي = إجمالي الأصناف - الخصم).
+function saleEffectiveView(sale){
+  var items = sale.items.map(function(it){
+    var returnedQty = sale.id ? saleItemReturnedQty(it.id) : 0;
+    var remainingQty = Math.max(0, (it.qty||0) - returnedQty);
+    return { it: it, returnedQty: returnedQty, remainingQty: remainingQty, lineTotal: remainingQty * (it.price||0) };
+  });
+  var effectiveSubtotal = items.reduce(function(a,x){ return a+x.lineTotal; }, 0);
+  var returnedTotal = sale.id ? saleReturnedTotal(sale.id) : 0;
+  var effectiveTotal = Math.max(0, (sale.total||0) - returnedTotal);
+  var effectiveDiscount = Math.max(0, effectiveSubtotal - effectiveTotal);
+  return { items: items, effectiveSubtotal: effectiveSubtotal, effectiveDiscount: effectiveDiscount, effectiveTotal: effectiveTotal, returnedTotal: returnedTotal };
+}
+// سجل المرتجعات/الاستبدالات المرتبطة بهذه الفاتورة — بالترتيب الزمني، مع قيمة
+// الفاتورة قبل/بعد كل عملية (نفس فكرة "كانت بقيمة X، تم إرجاع Y، أصبحت Z"
+// المطلوبة، من غير ما نسجّل أي عملية مالية إضافية — البيانات دي كلها معروضة من
+// SaleReturn/SaleReturnItem الموجودين بالفعل).
+function saleReturnHistoryHTML(sale){
+  var list = (DB.returns||[]).filter(function(r){ return r.saleId===sale.id; }).sort(function(a,b){ return a.date-b.date; });
+  if(!list.length) return "";
+  var running = sale.total||0;
+  var rows = list.map(function(r){
+    var cancelled = isReturnCancelled(r);
+    var before = running;
+    var net = (r.returnedTotal||0) - (r.replacementTotal||0);
+    if(!cancelled) running = Math.max(0, running - net);
+    var after = cancelled ? before : running;
+    var itemsTxt = (r.items||[]).map(function(it){ return esc(it.size||it.color?((it.qty||0)+"× "+[it.size,it.color].filter(Boolean).join("/")):(it.qty||0)+"×"); }).join("، ");
+    return '<div class="tot-row" style="align-items:flex-start;'+(cancelled?'opacity:.55;':'')+'">'+
+      '<span>'+dateStr(r.date)+' '+timeStr(r.date)+' — '+(r.type==="exchange"?"استبدال":"استرجاع")+' '+esc(r.number||"")+
+        (cancelled?' <span class="badge badge-gray">ملغي</span>':'')+
+        '<div class="small muted">بواسطة '+esc(userById(r.userId)?userById(r.userId).name:"—")+(itemsTxt?(' — '+itemsTxt):'')+'</div>'+
+      '</span>'+
+      '<span class="small" style="text-align:left;white-space:nowrap;">'+fmt(before)+' ← '+fmt(after)+'</span>'+
+    '</div>';
+  }).join("");
+  return '<div class="card mt8" style="background:#f8fafc;padding:12px;">'+
+    '<div class="bold small mb8">'+icon("history",14)+' سجل المرتجعات على هذه الفاتورة</div>'+rows+'</div>';
+}
+function saleInvoiceDetailHTML(sale){
+  if(!sale.id) return "";
+  var ev = saleEffectiveView(sale);
+  if(ev.returnedTotal <= 0.004) return "";
+  var remainingItems = ev.items.filter(function(x){ return x.remainingQty > 0; });
+  var removedItems = ev.items.filter(function(x){ return x.remainingQty <= 0; });
+  var rows = remainingItems.map(function(x){
+    var it = x.it;
+    var opt = [it.size, it.color].filter(Boolean).join(" / ");
+    return '<tr>'+
+      '<td>'+esc(it.name||"")+(opt?'<div class="small muted">'+esc(opt)+'</div>':'')+
+        (x.returnedQty>0 ? '<div class="small" style="color:var(--red);">أُرجع '+x.returnedQty+' من '+(it.qty||0)+'</div>' : '')+'</td>'+
+      '<td class="bold" style="text-align:center;">'+x.remainingQty+'</td>'+
+      '<td class="bold" style="text-align:left;">'+fmt(x.lineTotal)+'</td>'+
+    '</tr>';
+  }).join("");
+  return '<div class="card mb8"><h3 style="font-size:14px;">'+icon("box",15)+' الفاتورة بعد المرتجع</h3>'+
+    '<div class="table-wrap"><table><thead><tr><th>الصنف</th><th style="text-align:center;">الكمية الحالية</th><th style="text-align:left;">الإجمالي</th></tr></thead>'+
+    '<tbody>'+(rows||'<tr><td colspan="3" class="muted" style="text-align:center;padding:12px;">تم إرجاع كل أصناف الفاتورة</td></tr>')+'</tbody></table></div>'+
+    (removedItems.length ? '<p class="small muted mb8">أصناف أُزيلت من الفاتورة (أُرجعت بالكامل): '+removedItems.map(function(x){ return esc(x.it.name||""); }).join("، ")+'</p>' : '')+
+    '<div class="tot-row"><span>إجمالي الأصناف (بعد المرتجع)</span><span>'+fmt(ev.effectiveSubtotal)+'</span></div>'+
+    (ev.effectiveDiscount>0.004 ? '<div class="tot-row"><span>الخصم</span><span>-'+fmt(ev.effectiveDiscount)+'</span></div>' : '')+
+    '<div class="tot-row grand" style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px;"><span>الإجمالي الحالي للفاتورة</span><span>'+fmt(ev.effectiveTotal)+' '+esc(DB.settings.currency)+'</span></div>'+
+  '</div>'+saleReturnHistoryHTML(sale);
+}
 function showReceipt(sale){
   setPrintPageSize("80mm");
   $("#print-area").innerHTML = receiptHTML(sale);
   openModal(
     '<div class="modal-head"><h3>'+icon("print",18)+' فاتورة '+esc(sale.number)+saleStatusBadgeHTML(sale)+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
     '<div class="modal-body" style="background:#f1f5f9;padding:20px;">'+
+      saleInvoiceDetailHTML(sale)+
       '<div style="background:#fff;border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,.08);max-width:320px;margin:0 auto;">'+receiptHTML(sale)+'</div>'+
     '</div>'+
     '<div class="modal-foot">'+
@@ -2799,9 +2895,13 @@ function returnModalHTML(){
       else if(totals.difference < -0.004) diffLine = '<div class="ttl bold" style="color:var(--green);"><span>المبلغ المستحق للعميل</span><span>'+fmt(-totals.difference)+' '+esc(DB.settings.currency)+'</span></div>';
       else diffLine = '<div class="ttl bold"><span>الفرق</span><span>لا يوجد فرق</span></div>';
     }
+    var effBefore = saleEffectiveView(sale).effectiveTotal;
+    var effAfter = Math.max(0, effBefore - totals.returnedTotal + totals.replacementTotal);
     var summary = '<div class="card mt16" style="background:#f8fafc;padding:12px;">'+
       '<div class="ttl"><span>قيمة الاسترجاع</span><span class="bold">'+fmt(totals.returnedTotal)+' '+esc(DB.settings.currency)+'</span></div>'+
       (returnDraft.type==="exchange" ? '<div class="ttl"><span>قيمة المنتج البديل</span><span class="bold">'+fmt(totals.replacementTotal)+' '+esc(DB.settings.currency)+'</span></div>'+diffLine : '')+
+      '<div class="ttl"><span>الإجمالي الحالي للفاتورة (قبل هذه العملية)</span><span class="bold">'+fmt(effBefore)+'</span></div>'+
+      '<div class="ttl bold" style="font-size:15px;"><span>إجمالي الفاتورة بعد هذه العملية</span><span style="color:var(--primary);">'+fmt(effAfter)+' '+esc(DB.settings.currency)+'</span></div>'+
     '</div>';
 
     var refundNeeded = returnDraft.type==="return" ? totals.returnedTotal>0.004 : Math.abs(totals.difference)>0.004;
@@ -4171,7 +4271,7 @@ function viewExpenses(){
     return '<tr><td>'+dateStr(e.date)+'</td><td><span class="badge badge-gray">'+esc(e.category||"أخرى")+'</span></td>'+
       '<td class="muted">'+esc(e.note||"—")+'</td>'+
       '<td>'+payMethodLabel(e.paymentMethod)+'</td>'+
-      '<td>'+(e.partner?partnerLabel(e.partner):'—')+'</td>'+
+      '<td>'+(e.partner?partnerLabel(e.partner):'<span class="muted small">المحل / مشترك</span>')+'</td>'+
       '<td class="bold" style="color:var(--red);">- '+fmt(e.amount)+'</td>'+
       '<td>'+(can("expenses","delete") ? '<button class="icon-btn danger" onclick="deleteExpense(\''+e.id+'\')">'+icon("trash",16)+'</button>' : '')+'</td></tr>';
   }).join("");
@@ -4208,7 +4308,7 @@ function openExpenseForm(){
           '<option value="cash">نقدي</option><option value="card">كارت</option><option value="wallet">محفظة</option>'+
         '</select></div>'+
         '<div class="field"><label>من دفع (لو نقدي)</label><select id="ex-paidby">'+userOptionsHTML(currentUser()?currentUser().id:"", false)+'</select></div>'+
-        '<div class="field"><label>الحساب (مؤمن/عبدو) *</label>'+partnerSelectHTML("ex-partner", "")+'</div>'+
+        '<div class="field"><label>الحساب (مؤمن/عبدو/ميدو/المحل) *</label>'+partnerSelectHTML("ex-partner", "", true)+'</div>'+
         '<div class="field full"><label>البيان / ملاحظات</label><input id="ex-note" placeholder="مثال: إيجار شهر أغسطس"></div>'+
       '</div>'+
     '</div>'+
@@ -4220,9 +4320,10 @@ function openExpenseForm(){
 }
 function saveExpense(){
   var amount = num($("#ex-amount").value);
-  var partner = $("#ex-partner").value;
+  var partnerSel = $("#ex-partner").value;
   if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
-  if(!partner){ toast("اختر الحساب (مؤمن/عبدو)","err"); return; }
+  if(!partnerSel){ toast("اختر الحساب (مؤمن/عبدو/ميدو) أو المحل/مشترك","err"); return; }
+  var partner = partnerSel === "shared" ? "" : partnerSel;
   var item = {
     id:uid(), date:new Date(($("#ex-date").value||todayKey())+"T12:00:00").getTime(),
     category:$("#ex-cat").value, amount:amount, note:$("#ex-note").value.trim(),
@@ -4934,7 +5035,7 @@ function viewFinance(){
     return '<div class="tot-row"><span>'+lbl+'</span><span class="bold '+(cls||"")+'">'+(sign==="+"?"+ ":"")+fmt(val)+'</span></div>';
   }
   var incomeRows = incomes.map(function(i){
-    return '<tr><td>'+dateStr(i.date)+'</td><td class="muted">'+esc(i.note||"—")+'</td><td>'+(i.partner?partnerLabel(i.partner):'—')+'</td><td class="bold" style="color:var(--green);">+ '+fmt(i.amount)+'</td>'+
+    return '<tr><td>'+dateStr(i.date)+'</td><td class="muted">'+esc(i.note||"—")+'</td><td>'+(i.partner?partnerLabel(i.partner):'<span class="muted small">المحل / مشترك</span>')+'</td><td class="bold" style="color:var(--green);">+ '+fmt(i.amount)+'</td>'+
       '<td>'+(can("finance","delete") ? '<button class="icon-btn danger" onclick="deleteIncome(\''+i.id+'\')">'+icon("trash",16)+'</button>' : '')+'</td></tr>';
   }).join("");
 
@@ -4972,7 +5073,7 @@ function openIncomeForm(){
       '<div class="field"><label>المبلغ *</label><input id="inc-amount" type="number" min="0" step="0.5" value=""></div>'+
       '<div class="field"><label>التاريخ</label><input id="inc-date" type="date" value="'+todayKey()+'"></div>'+
       '<div class="field"><label>من استلم الفلوس</label><select id="inc-by">'+userOptionsHTML(currentUser()?currentUser().id:"", false)+'</select></div>'+
-      '<div class="field"><label>الحساب (مؤمن/عبدو) *</label>'+partnerSelectHTML("inc-partner", "")+'</div>'+
+      '<div class="field"><label>الحساب (مؤمن/عبدو/ميدو/المحل) *</label>'+partnerSelectHTML("inc-partner", "", true)+'</div>'+
       '<div class="field"><label>البيان</label><input id="inc-note" placeholder="مثال: بيع أكياس/إيراد إضافي"></div>'+
     '</div>'+
     '<div class="modal-foot">'+
@@ -4983,9 +5084,10 @@ function openIncomeForm(){
 }
 function saveIncome(){
   var amount = num($("#inc-amount").value);
-  var partner = $("#inc-partner").value;
+  var partnerSel = $("#inc-partner").value;
   if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
-  if(!partner){ toast("اختر الحساب (مؤمن/عبدو)","err"); return; }
+  if(!partnerSel){ toast("اختر الحساب (مؤمن/عبدو/ميدو) أو المحل/مشترك","err"); return; }
+  var partner = partnerSel === "shared" ? "" : partnerSel;
   var item = {id:uid(), date:new Date(($("#inc-date").value||todayKey())+"T12:00:00").getTime(), amount:amount, note:$("#inc-note").value.trim(), receivedBy:($("#inc-by")?$("#inc-by").value:null)||currentUser().id, userId:currentUser().id, partner:partner};
   api("POST", "/api/income", { item: item }).then(function(r){
     afterSync(r);
@@ -5139,21 +5241,29 @@ function viewAudit(){
 /* ============================================================
    حسابات الشركاء (مؤمن/عبدو)
    ============================================================ */
-var LEDGER_TYPES = ["SALE","ORDER_DEPOSIT","ORDER_COLLECTION","PURCHASE_PAYMENT","EXPENSE","OTHER_INCOME","RETURN","EXCHANGE_ADJUSTMENT","PARTNER_TRANSFER"];
+var LEDGER_TYPES = ["SALE","ORDER_DEPOSIT","ORDER_COLLECTION","PURCHASE_PAYMENT","EXPENSE","OTHER_INCOME","RETURN","EXCHANGE_ADJUSTMENT",
+  "DEBT_PAYMENT","OPENING_BALANCE","MANUAL_ADD","OTHER_DUE","WITHDRAWAL","DEDUCTION","PARTNER_TRANSFER"];
 var LEDGER_TYPE_LABELS = {
   SALE:"بيع POS", ORDER_DEPOSIT:"عربون طلب", ORDER_COLLECTION:"تحصيل طلب", PURCHASE_PAYMENT:"دفعة مورد",
-  EXPENSE:"مصروف", OTHER_INCOME:"إيراد آخر", RETURN:"استرجاع", EXCHANGE_ADJUSTMENT:"فرق استبدال", PARTNER_TRANSFER:"تحويل بين الشركاء"
+  EXPENSE:"مصروف", OTHER_INCOME:"إيراد آخر", RETURN:"استرجاع", EXCHANGE_ADJUSTMENT:"فرق استبدال", DEBT_PAYMENT:"تحصيل دين",
+  OPENING_BALANCE:"رصيد افتتاحي", MANUAL_ADD:"مبلغ مُضاف", OTHER_DUE:"مستحقات أخرى", WITHDRAWAL:"مسحوبات",
+  DEDUCTION:"خصم/تسوية", PARTNER_TRANSFER:"تحويل/تسوية خارجة"
 };
 function ledgerTypeLabel(t){ return LEDGER_TYPE_LABELS[t] || t; }
 function ledgerTypeBadge(t){
   var map = { SALE:"badge-green", ORDER_DEPOSIT:"badge-blue", ORDER_COLLECTION:"badge-blue", PURCHASE_PAYMENT:"badge-amber",
-    EXPENSE:"badge-red", OTHER_INCOME:"badge-green", RETURN:"badge-red", EXCHANGE_ADJUSTMENT:"badge-purple", PARTNER_TRANSFER:"badge-gray" };
+    EXPENSE:"badge-red", OTHER_INCOME:"badge-green", RETURN:"badge-red", EXCHANGE_ADJUSTMENT:"badge-purple", DEBT_PAYMENT:"badge-green",
+    OPENING_BALANCE:"badge-blue", MANUAL_ADD:"badge-green", OTHER_DUE:"badge-blue", WITHDRAWAL:"badge-red",
+    DEDUCTION:"badge-red", PARTNER_TRANSFER:"badge-gray" };
   return map[t] || "badge-gray";
 }
-var LEDGER_SOURCE_LABELS = { sale:"بيع POS", return:"استرجاع/استبدال", orderCollection:"طلب شحن", purchasePayment:"مشتريات", expense:"مصروف", otherIncome:"إيراد آخر", paymentOut:"دفعة مورد" };
+var LEDGER_SOURCE_LABELS = { sale:"بيع POS", return:"استرجاع/استبدال", orderCollection:"طلب شحن", purchasePayment:"مشتريات",
+  expense:"مصروف", otherIncome:"إيراد آخر", paymentOut:"دفعة مورد", debtPayment:"دفعة دين", orderExchange:"استبدال أوردر",
+  partnerManual:"قيد يدوي", partnerOpening:"رصيد افتتاحي" };
 function ledgerSourceLabel(rt){ return LEDGER_SOURCE_LABELS[rt] || (rt||"—"); }
 function partnersLedgerWithBalance(){
-  var running = {moamen:0, abdo:0};
+  var running = {};
+  PARTNERS.forEach(function(p){ running[p.id] = 0; });
   return (DB.partnerTransactions||[]).slice().sort(function(a,b){ return a.date-b.date; }).map(function(t){
     running[t.partner] = (running[t.partner]||0) + (t.direction==="in"?(t.amount||0):-(t.amount||0));
     return Object.assign({}, t, { balanceAfter: running[t.partner] });
@@ -5192,6 +5302,16 @@ function viewPartners(){
       '<td>'+esc(userById(t.userId)?userById(t.userId).name:"—")+'</td></tr>';
   }).join("");
 
+  var partnerCards = PARTNERS.map(function(p){
+    var bal = partnerBalance(p.id);
+    return '<div class="card" style="text-align:center;">'+
+      '<div class="ic" style="background:var(--primary);width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;margin:0 auto 10px;">'+icon("card",20)+'</div>'+
+      '<div class="bold" style="font-size:20px;color:'+(bal<0?"var(--red)":"var(--primary)")+';">'+(bal<0?"- ":"")+fmt(Math.abs(bal))+' '+esc(DB.settings.currency)+'</div>'+
+      '<div class="muted small mt8">الرصيد الجاري معاه — '+esc(p.label)+'</div>'+
+      '<button class="btn btn-soft btn-sm mt8" style="width:100%;" onclick="openPartnerBalanceDetail(\''+p.id+'\')">'+icon("history",14)+' تفاصيل الرصيد</button>'+
+    '</div>';
+  }).join('');
+
   return '<div class="filterbar">'+
     '<select onchange="setPartnersFilter(this.value)">'+partnerOpts+'</select>'+
     '<select onchange="setPartnersTypeFilter(this.value)">'+typeOpts+'</select>'+
@@ -5199,15 +5319,118 @@ function viewPartners(){
     '<input type="date" value="'+partnersTo+'" onchange="setPartnersTo(this.value)">'+
     ((partnersFrom||partnersTo||partnersFilter!=="all"||partnersTypeFilter!=="all") ? '<button class="btn btn-ghost" onclick="partnersFrom=\'\';partnersTo=\'\';partnersFilter=\'all\';partnersTypeFilter=\'all\';renderViewInPlace()">مسح الفلترة</button>' : '')+
   '</div>'+
+  '<div class="stats mb16" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));">'+partnerCards+'</div>'+
   '<div class="stats mb16">'+
-    statCard("card","var(--primary)", fmt(partnerBalance("moamen")), "رصيد مؤمن")+
-    statCard("card","#0891b2", fmt(partnerBalance("abdo")), "رصيد عبدو")+
     statCard("chart","var(--green)", fmt(incomeTotal), "إجمالي الإيراد (حسب الفلترة الحالية)")+
     statCard("coins","var(--red)", fmt(expenseTotalF), "إجمالي المصروف (حسب الفلترة الحالية)")+
   '</div>'+
   '<div class="card"><h3>'+icon("history",17)+' سجل حركات الشركاء ('+list.length+')</h3>'+
     '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>نوع العملية</th><th>البيان</th><th>الإيراد</th><th>المصروف</th><th>الرصيد بعد العملية</th><th>المصدر</th><th>المستخدم</th></tr></thead>'+
     '<tbody>'+(rows || '<tr><td colspan="8" class="muted" style="text-align:center;padding:30px;">لا توجد حركات</td></tr>')+'</tbody></table></div></div>';
+}
+
+/* ---------- تفاصيل رصيد شريك (مبنية بالكامل من PartnerTransaction الحقيقية) ---------- */
+function partnerLedgerRowHTML(t){
+  return '<tr><td>'+dateStr(t.date)+' '+timeStr(t.date)+'</td>'+
+    '<td><span class="badge '+ledgerTypeBadge(t.type)+'">'+esc(ledgerTypeLabel(t.type))+'</span></td>'+
+    '<td class="muted">'+esc(t.notes||"—")+'</td>'+
+    '<td class="bold" style="color:'+(t.direction==="in"?"var(--green)":"var(--red)")+';">'+(t.direction==="in"?"+":"-")+fmt(t.amount)+'</td>'+
+    '<td>'+esc(t.data&&t.data.paymentMethod?payMethodLabel(t.data.paymentMethod):"—")+'</td>'+
+    '<td>'+esc(ledgerSourceLabel(t.referenceType))+(t.referenceId?(' <span class="muted small" dir="ltr">#'+esc(String(t.referenceId).slice(-6))+'</span>'):'')+'</td>'+
+    '<td>'+esc(userById(t.userId)?userById(t.userId).name:"—")+'</td>'+
+    '<td>'+((t.referenceType==="partnerManual"||t.referenceType==="partnerOpening") && can("partners","delete") ?
+      '<button class="icon-btn danger" title="حذف القيد" onclick="deletePartnerManualEntry(\''+t.id+'\',\''+t.partner+'\')">'+icon("trash",14)+'</button>' : '')+'</td>'+
+  '</tr>';
+}
+// نافذة تفصيل بند واحد من تفاصيل الرصيد — كل العمليات اللي كوّنت رقم البند ده
+// (تاريخ/وصف/مبلغ/طريقة دفع/ملاحظات/مرجع)، مع إمكانية حذف أي قيد يدوي منها.
+function openPartnerCategoryDetail(pid, key){
+  var b = partnerBalanceBreakdown(pid);
+  var sec = b.sections.find(function(s){ return s.key===key; });
+  if(!sec) return;
+  var rows = sec.items.map(partnerLedgerRowHTML).join("");
+  openModal(
+    '<div class="modal-head"><h3>'+esc(sec.label)+' — '+esc(partnerLabel(pid))+'</h3><button class="icon-btn" onclick="openPartnerBalanceDetail(\''+pid+'\')">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="tot-row grand mb8"><span>إجمالي البند</span><span>'+fmt(sec.total)+' '+esc(DB.settings.currency)+'</span></div>'+
+      '<div class="table-wrap"><table><thead><tr><th>التاريخ</th><th>النوع</th><th>الوصف/الملاحظات</th><th>المبلغ</th><th>طريقة الدفع</th><th>رقم العملية</th><th>المستخدم</th><th></th></tr></thead>'+
+      '<tbody>'+(rows || '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px;">لا توجد عمليات في هذا البند</td></tr>')+'</tbody></table></div>'+
+    '</div>'+
+    '<div class="modal-foot"><button class="btn btn-ghost" onclick="openPartnerBalanceDetail(\''+pid+'\')">'+icon("return",16)+' رجوع لتفاصيل الرصيد</button></div>',
+    true
+  );
+}
+function openPartnerBalanceDetail(pid){
+  var b = partnerBalanceBreakdown(pid);
+  var rows = b.sections.map(function(s){
+    return '<div class="tot-row" style="cursor:pointer;" onclick="openPartnerCategoryDetail(\''+pid+'\',\''+s.key+'\')">'+
+      '<span>'+(s.sign>0?"+ ":"- ")+esc(s.label)+' <span class="muted small">('+s.items.length+')</span></span>'+
+      '<span class="bold" style="color:'+(s.sign>0?"var(--green)":"var(--red)")+';">'+(s.sign>0?"+":"-")+fmt(Math.abs(s.total))+'</span>'+
+    '</div>';
+  }).join("");
+  var addBtns = can("partners","create") ?
+    '<div class="row mt16" style="flex-wrap:wrap;gap:8px;">'+
+      '<button class="btn btn-soft btn-sm" onclick="openPartnerManualEntryForm(\''+pid+'\',\'OPENING_BALANCE\')">تعيين رصيد افتتاحي</button>'+
+      '<button class="btn btn-soft btn-sm" onclick="openPartnerManualEntryForm(\''+pid+'\',\'MANUAL_ADD\')">إضافة مبلغ</button>'+
+      '<button class="btn btn-soft btn-sm" onclick="openPartnerManualEntryForm(\''+pid+'\',\'OTHER_DUE\')">مستحقات أخرى</button>'+
+      '<button class="btn btn-soft-red btn-sm" onclick="openPartnerManualEntryForm(\''+pid+'\',\'WITHDRAWAL\')">تسجيل مسحوبات</button>'+
+      '<button class="btn btn-soft-red btn-sm" onclick="openPartnerManualEntryForm(\''+pid+'\',\'DEDUCTION\')">خصم/تسوية</button>'+
+    '</div>' : '';
+  openModal(
+    '<div class="modal-head"><h3>'+icon("card",18)+' تفاصيل الرصيد — '+esc(partnerLabel(pid))+'</h3><button class="icon-btn" onclick="closeModal()">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      rows+
+      '<div class="tot-row grand" style="border-top:1px solid var(--border);margin-top:8px;padding-top:8px;font-size:16px;"><span>الرصيد الحالي</span><span style="color:'+(b.balance<0?"var(--red)":"var(--primary)")+';">'+(b.balance<0?"- ":"")+fmt(Math.abs(b.balance))+' '+esc(DB.settings.currency)+'</span></div>'+
+      '<p class="muted small mt8">اضغط على أي بند لعرض العمليات التفصيلية اللي كوّنت رقمه.</p>'+
+      addBtns+
+    '</div>'+
+    '<div class="modal-foot"><button class="btn btn-ghost" onclick="closeModal()">إغلاق</button></div>',
+    true
+  );
+}
+var PARTNER_MANUAL_ENTRY_LABELS = {
+  OPENING_BALANCE:"تعيين رصيد افتتاحي", MANUAL_ADD:"إضافة مبلغ للشريك", OTHER_DUE:"تسجيل مستحقات أخرى",
+  WITHDRAWAL:"تسجيل مسحوبات", DEDUCTION:"تسجيل خصم/تسوية"
+};
+function openPartnerManualEntryForm(pid, type){
+  var label = PARTNER_MANUAL_ENTRY_LABELS[type] || type;
+  openModal(
+    '<div class="modal-head"><h3>'+esc(label)+' — '+esc(partnerLabel(pid))+'</h3><button class="icon-btn" onclick="openPartnerBalanceDetail(\''+pid+'\')">'+icon("x",20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<div class="field"><label>المبلغ *</label><input id="pm-amount" type="number" min="0" step="0.5" value=""></div>'+
+      '<div class="field"><label>التاريخ</label><input id="pm-date" type="date" value="'+todayKey()+'"></div>'+
+      '<div class="field"><label>ملاحظات</label><input id="pm-notes" placeholder="اختياري"></div>'+
+      (type==="OPENING_BALANCE" ? '<p class="muted small">تسجيل رصيد افتتاحي جديد لهذا الشريك بيستبدل أي رصيد افتتاحي سابق له (قيمة واحدة فقط لكل شريك).</p>' : '')+
+    '</div>'+
+    '<div class="modal-foot">'+
+      '<button class="btn btn-primary" onclick="savePartnerManualEntry(\''+pid+'\',\''+type+'\')">حفظ</button>'+
+      '<button class="btn btn-ghost" onclick="openPartnerBalanceDetail(\''+pid+'\')">إلغاء</button>'+
+    '</div>',
+    true
+  );
+}
+function savePartnerManualEntry(pid, type){
+  var amount = num($("#pm-amount").value);
+  if(amount <= 0){ toast("أدخل مبلغاً صحيحاً","err"); return; }
+  var item = {
+    partner: pid, type: type, amount: amount,
+    date: new Date(($("#pm-date").value||todayKey())+"T12:00:00").getTime(),
+    notes: $("#pm-notes").value.trim()
+  };
+  api("POST", "/api/partners/ledger", { item: item }).then(function(r){
+    afterSync(r);
+    toast("تم الحفظ");
+    openPartnerBalanceDetail(pid);
+  }).catch(function(e){ toast(e.message, "err"); });
+}
+function deletePartnerManualEntry(id, pid){
+  confirmBox("حذف هذا القيد؟ سيتم تحديث رصيد الشريك فوراً.", function(){
+    api("POST", "/api/partners/ledger/" + id + "/delete").then(function(r){
+      afterSync(r);
+      toast("تم الحذف");
+      openPartnerBalanceDetail(pid);
+    }).catch(function(e){ toast(e.message, "err"); });
+  }, true);
 }
 
 /* ============================================================

@@ -200,7 +200,7 @@ async function buildStateFromDB(){
   state.partnerTransactions = (await prisma.partnerTransaction.findMany({ orderBy: { date: 'asc' } })).map(t => ({
     id: t.id, partner: t.partner, type: t.type, direction: t.direction, amount: t.amount,
     referenceType: t.referenceType, referenceId: t.referenceId, date: t.date ? t.date.getTime() : null,
-    userId: t.userId, notes: t.notes
+    userId: t.userId, notes: t.notes, data: t.data || null
   }));
 
   // Ensure arrays exist for compatibility
